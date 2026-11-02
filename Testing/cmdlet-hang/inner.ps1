@@ -32,8 +32,8 @@ $bodies = @{
 }
 $bodies['Mixed'] = $bodies['Utility'] + '; ' + $bodies['Management'] + '; ' + $bodies['FileIO'] + '; ' + $bodies['Core']
 
-# Positive control: a known hang (README rule 3, the original project's
-# dump-confirmed deadlock), to prove this rig can see one. Worker 0 builds a
+# Positive control: a known hang (README rule 2, a deadlock confirmed
+# from a memory dump), to prove this rig can see one. Worker 0 builds a
 # Lazy whose factory is a scriptblock delegate that itself hands another
 # scriptblock delegate to AddOrUpdate, and publishes it. Then every worker
 # forces .Value on 200 of them, in different orders, so a factory often runs

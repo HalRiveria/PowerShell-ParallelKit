@@ -62,7 +62,7 @@ Wrap any of them in `Invoke-PkRun { ... }` to get graceful Ctrl+C. (For `Invoke-
 
 For running PowerShell code in parallel, most of these are fine and some are simpler. ParallelKit is mainly about running external programs, and about what happens when a run is stopped partway through.
 
-- **PowerShell 7's `ForEach-Object -Parallel`.** The easy answer for plain parallel PowerShell code if you can use PowerShell 7. ParallelKit was built for scripts and machines stuck on 5.1, though it runs on 7 too, where it still adds the external-program handling and graceful Ctrl+C.
+- **PowerShell 7's `ForEach-Object -Parallel`.** The easy answer for plain parallel PowerShell code if you can use PowerShell 7. ParallelKit was built for scripts and machines stuck on 5.1, though it runs on 7 too, where it still adds the external-program handling and graceful Ctrl+C. `ForEach-Object -Parallel` also refuses a scriptblock passed by `$using:`, rather than letting it run where it isn't safe.
 - **`Start-Job`.** Built in, but each job is a whole new `powershell.exe` process, so every job costs noticeable startup time and memory, and what it returns comes back as serialized copies (properties only, no methods). 5.1's `Start-Job` has no throttle either, so you write the wait-for-a-free-slot loop yourself. Fine for a handful of long jobs, poor for thousands of short ones.
 - **ThreadJob (`Start-ThreadJob`).** Runs jobs as runspaces in the same process, with a `-ThrottleLimit`. On 5.1 it's the best fit for plain parallel scriptblocks, if you can install a module from the PowerShell Gallery (`Microsoft.PowerShell.ThreadJob`; it ships with PowerShell 7, not 5.1).
 - **PoshRSJob (`Start-RSJob`).** A community module from the Gallery, also runspace-based, with a `-Throttle` limit and a job-style interface. It hasn't had a release since 2018, it can report a job as Completed before its output is ready (run `Wait-RSJob` before `Receive-RSJob`), and it's hit harder than ThreadJob by the [scriptblock problem](#faq). Where both are an option, ThreadJob is the better pick.
@@ -267,7 +267,7 @@ Callbacks: a plain `{ ... }` callback sees your variables and functions from whe
 
 `Invoke-PkProcessWithTimeout` and `Start-PkProcess` also take `-WorkingDirectory`.
 
-All four are safe in worker code.
+All of these are safe in worker code.
 
 ## Messages
 
@@ -299,7 +299,8 @@ Three things to know:
 - **Your script carries on after an abort.** The engines return with `Aborted = $true` and the rest of your script runs. If an abort should end it, say so: `if ($batch.Aborted) { exit 1 }`.
 
 `Invoke-PkRun` also turns off the console's QuickEdit mode for the length of the run (`-DisableQuickEdit $false` to opt out). With QuickEdit on in the classic console window, one stray click starts a text selection, and the script freezes at its next console write until the selection is cleared. That looks exactly like a hang. It's turned back on afterwards if it was on before.
-Other pieces: `Request-PkAbort` triggers the same abort from code. `Test-PkAbortSignal` asks whether one is under way. `Register-PkCancellationSource` adds your own `CancellationTokenSource` to the set an abort cancels (a `-Cts` you pass to `Invoke-PkRunspaceJobs` is added automatically; a `-CancelToken` you pass to the dispatcher isn't cancelled by an abort, but the dispatcher stops either way). `Get-PkAbortTriggerLabel` says which kind of abort it was.
+
+Other pieces: `Request-PkAbort` triggers the same abort from code. `Test-PkAbortSignal` asks whether one is under way. `Register-PkCancellationSource` adds your own `CancellationTokenSource` to the set an abort cancels, and `Unregister-PkCancellationSource` takes it back out (a `-Cts` you pass to `Invoke-PkRunspaceJobs` is added automatically; a `-CancelToken` you pass to the dispatcher isn't cancelled by an abort, but the dispatcher stops either way). `Get-PkAbortTriggerLabel` says which kind of abort it was.
 
 ## Choosing limits
 
@@ -327,14 +328,14 @@ Other pieces: `Request-PkAbort` triggers the same abort from code. `Test-PkAbort
 powershell -NoProfile -File .\ParallelKit.Harness.ps1
 ```
 
-It uses real runspaces and real child processes (`cmd.exe`, `ping.exe`), with nothing mocked, so it takes about a minute. It prints a `[PASS]`/`[FAIL]` line per check and exits 0 only if everything passed. A few checks send real Ctrl+C, Ctrl+Break and window-close events to child PowerShell processes in hidden consoles of their own, never to yours. Where a machine can't deliver those, they print `[SKIP]` with the reason instead; set `PK_HARNESS_NO_SKIP=1` to count skips as failures. A few `message handler failed` lines in the output are expected: some checks break the message handler on purpose to test the fallback.
+It uses real runspaces and real child processes (`cmd.exe`, `ping.exe`), with nothing mocked, so it takes about two minutes. It prints a `[PASS]`/`[FAIL]` line per check and exits 0 only if everything passed. A few checks send real Ctrl+C, Ctrl+Break and window-close events to child PowerShell processes in hidden consoles of their own, never to yours. Where a machine can't deliver those, they print `[SKIP]` with the reason instead; set `PK_HARNESS_NO_SKIP=1` to count skips as failures. A few `message handler failed` lines in the output are expected: some checks break the message handler on purpose to test the fallback.
 
 GitHub runs the same harness on Windows PowerShell 5.1 and on PowerShell 7 for every pull request and every change to `main`.
 
 `Testing/` holds the longer stress tests and checks behind some of what this README says. They aren't part of the test suite and aren't needed to use the kit:
 
 - `Testing/cmdlet-hang/` stresses the kit's worker code, for the [two rules](#the-two-rules-for-worker-code).
-- `Testing/third-party/` asks the same question of ThreadJob and PoshRSJob. `results/matrix.log` holds the results behind the FAQ answer, from ThreadJob 2.2.0 and PoshRSJob 1.7.4.4. To run it yourself, save the modules first, in PowerShell 7.4 or later (which has `Save-PSResource`), then run `matrix.ps1`:
+- `Testing/third-party/` asks the same question of ThreadJob and PoshRSJob. `results/matrix.log` holds the results behind the FAQ answer, from `Microsoft.PowerShell.ThreadJob` 2.2.0 (the `ThreadJob` package below brings it along) and PoshRSJob 1.7.4.4. To run it yourself, save the modules first, in PowerShell 7.4 or later (which has `Save-PSResource`), then run `matrix.ps1`:
 
   ```powershell
   New-Item -ItemType Directory -Force .\Testing\third-party\modules
@@ -352,7 +353,16 @@ Yes. What a worker can't do is run a scriptblock that came from another runspace
 
 **Do ThreadJob and PoshRSJob have the same scriptblock problem?**
 
-Yes, both. Neither one rebuilds or refuses a scriptblock you pass to a job (by `-ArgumentList` or `$using:`), so it still runs against your script's session state, just from the job's thread. In tests with 8 jobs, a scriptblock passed as a job value crashed PowerShell or broke the calling script (its own functions vanished mid-run) whenever the script was doing anything else at the same time. ThreadJob only got away with it when the script did nothing but sit in `Wait-Job` until the jobs finished. PoshRSJob never did, since `Start-RSJob` is itself PowerShell code that's still running while the first jobs start. A delegate made in your script was handed back to your script's thread to run. With ThreadJob that gave wrong results in some runs while the script was busy, and a deadlock in nearly every run while it waited in `Wait-Job`. With PoshRSJob it failed every time. Passed as text and rebuilt in the job, the same code ran clean every time. So [the two rules](#the-two-rules-for-worker-code) apply to them as well; they just don't check for you. The test scripts and results are in [`Testing/third-party`](Testing/third-party).
+Yes, both. Neither one rebuilds or refuses a scriptblock you pass to a job (by `-ArgumentList` or `$using:`), so it still runs against your script's session state, just from the job's thread. [The two rules](#the-two-rules-for-worker-code) apply to them as well; they just don't check for you. `ForEach-Object -Parallel` does refuse a `$using:` scriptblock, and in [PowerShell issue #12378](https://github.com/PowerShell/PowerShell/issues/12378) a PowerShell team member wrote of that check: "this should also be disallowed for Start-ThreadJob."
+
+<details>
+<summary>What the tests showed</summary>
+
+In tests with 8 jobs, a scriptblock passed as a job value crashed PowerShell or broke the calling script (its own functions vanished mid-run) in nearly every run where the script was doing anything else at the same time. ThreadJob only got away with it when the script did nothing but sit in `Wait-Job` until the jobs finished. PoshRSJob never did, since `Start-RSJob` is itself PowerShell code that's still running while the first jobs start. A delegate made in your script was handed back to your script's thread to run. With ThreadJob that gave wrong results in some runs while the script was busy, and a deadlock in nearly every run while it waited in `Wait-Job`. With PoshRSJob it failed every time. Passed as text and rebuilt in the job, the same code ran clean every time.
+
+The test scripts and results are in [`Testing/third-party`](Testing/third-party).
+
+</details>
 
 **Does it work in PowerShell 7, or on Linux or macOS?**
 
@@ -392,7 +402,7 @@ No. Programs start without a window, in a hidden console of their own, so Ctrl+C
 
 **Was this written by AI?**
 
-It was built with Claude Code, as the top of this page says. The worker rules and abort behaviour come from hangs and bugs reproduced in real runs of the original project, and the test harness runs real processes and runspaces, with nothing mocked, on every change.
+It was built with Claude Code, as the top of this page says. The worker rules and abort behaviour come from hangs and bugs reproduced in real runs, and the test harness runs real processes and runspaces, with nothing mocked, on every change.
 
 ## Bugs and questions
 
