@@ -2218,6 +2218,45 @@ try { $null = Invoke-PkProcessWithTimeout -FilePath $cmdExe -Arguments '/c cd' -
 $injected = $global:pkHarnessInjected
 Remove-Variable -Name pkHarnessInjected -Scope Global
 Test-Assert (-not $injected) "a path with a curly quote stays a path when it's looked up in the caller's session"
+
+# \tools and C:tools depend on a current drive and folder: PowerShell's, not
+# the process's. (Only a real test when the process's folder is on another
+# drive, which it is on GitHub's runners and usually elsewhere.)
+Reset-Harness
+$windows = $env:SystemRoot
+$noDriveDir = $windows.Substring(2) + '\System32'
+$expectDir = Join-Path $windows 'System32'
+$incompleteResult = @{}
+Push-Location -LiteralPath $windows
+try {
+    foreach ($case in @(@{ Name = 'no drive'; Path = $noDriveDir }, @{ Name = 'drive with no folder'; Path = ($windows.Substring(0, 2) + 'System32') })) {
+        try { $incompleteResult[$case.Name] = (Invoke-PkProcessWithTimeout -FilePath $cmdExe -Arguments '/c cd' -WorkingDirectory $case.Path).Stdout.Trim() } catch { $incompleteResult[$case.Name] = [string]$_ }
+    }
+    Push-Location -LiteralPath 'HKLM:\'
+    try { $incompleteResult['from the registry'] = (Invoke-PkProcessWithTimeout -FilePath $cmdExe -Arguments '/c cd' -WorkingDirectory $noDriveDir).Stdout.Trim() } catch { $incompleteResult['from the registry'] = [string]$_ }
+    finally { Pop-Location }
+    $fileNoDrive = $null
+    try { $fileNoDrive = (Invoke-PkProcessWithTimeout -FilePath ($windows.Substring(2) + '\System32\cmd.exe') -Arguments '/c exit 5').ExitCode } catch { $fileNoDrive = [string]$_ }
+} finally { Pop-Location }
+$wrongDirs = @($incompleteResult.Keys | Where-Object { $incompleteResult[$_] -ine $expectDir } | ForEach-Object { $_ + '=' + $incompleteResult[$_] })
+Test-Assert ($wrongDirs.Count -eq 0) ("a WorkingDirectory that depends on a current drive or folder follows PowerShell's location, not the process's (wrong: " + ($wrongDirs -join ', ') + ")")
+Test-Assert ($fileNoDrive -eq 5) ("and so does a FilePath with no drive (" + $fileNoDrive + ")")
+
+# A non-terminating error in a worker that finishes during an abort's drain
+# is reported, the same as one that finishes in the main loop.
+Reset-Harness
+$poll = @{ Count = 0 }
+$softOut = [System.Collections.Generic.List[object]]::new()
+$softRun = Invoke-PkRunspaceJobs -MaxParallel 2 -JobParams (New-JobList -Jobs @(@{ Id = 1 }, @{ Id = 2 })) -WorkerScript {
+    param([int]$Id)
+    for ($i = 0; $i -lt 100; $i++) { if (Test-PkCancelRequested) { break }; [System.Threading.Thread]::Sleep(50) }
+    [System.Threading.Thread]::Sleep(500)
+    Write-Error ("soft drain " + $Id)
+    return $Id
+} -PollCallback { $poll.Count++; if ($poll.Count -eq 3) { Request-PkAbort } }.GetNewClosure() -ResultHandler { param($r) $softOut.Add($r) }.GetNewClosure()
+$softMessages = @($script:messages | Where-Object { $_.Level -eq 'Error' -and $_.Message -like 'Runspace error: soft drain*' }).Count
+Test-Assert ($softRun.Aborted -and $softRun.CrashedCount -eq 0 -and $softOut.Count -eq 2 -and $softMessages -eq 2) ("a non-terminating error during an abort's drain is reported (messages " + $softMessages + ", results " + $softOut.Count + ")")
+Reset-Harness
 Write-Host ""
 
 Set-PkMessageHandler -Handler $null
