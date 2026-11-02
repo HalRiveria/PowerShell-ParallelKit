@@ -181,7 +181,7 @@ Each worker runs in its own runspace: a separate PowerShell session inside the s
 - Each job starts in your current location (the real folder, if you're on a `New-PSDrive` drive), in a fresh scope. A folder change or a variable one job makes, preference variables like `$ErrorActionPreference` included, doesn't carry over to the next job. Relative paths in .NET calls such as `[System.IO.File]::ReadAllText('x.txt')` still go by the process's working directory, as they do outside workers, so give .NET full paths.
 - Whatever the worker returns is handed to `-ResultHandler` on the main thread, once per object returned.
 - `-NextJobProvider { ... }` can replace `-JobParams` to produce jobs lazily: it's called on the main thread for the next job hashtable, and returns `$null` when there are no more.
-- `-PollCallback { ... }` runs on the main thread on every loop pass, for progress display and the like.
+- `-PollCallback { ... }` runs on the main thread on every loop pass, for progress display and the like. That's at least every 0.1 s, and can be many times more often when jobs finish quickly, so keep it cheap.
 - `-JobCrashedHandler { param($err, $job) ... }` is told when a worker throws, including while an abort waits for running workers, with the job hashtable that crashed. Leave `$job` out of `param()` if you don't need it. `$err.Exception.InnerException` is the worker's own error. That job's result handler isn't called, and anything the worker output before throwing is lost. If the handler itself throws, that's reported as a message and the run carries on.
 - Only an error that stops the worker counts as a crash: `throw`, a cmdlet with `-ErrorAction Stop`, or any error once the worker sets `$ErrorActionPreference = 'Stop'`. A non-terminating error (a locked file in `Get-FileHash`, a `Write-Error`), or an exception from a .NET method such as `[System.IO.File]::ReadAllText(...)`, only ends that one statement. It's printed as `Runspace error: ...`, and whatever the worker returned still goes to `-ResultHandler` as if it had worked. Workers start with PowerShell's default preferences and no strict mode, whatever your script uses. To catch every failure and know which input it came from, have the worker return its own error object:
 
@@ -241,13 +241,13 @@ All of these callbacks run on whichever thread called the dispatcher: the main t
 - Groups are pulled lazily, at most `-MaxQueueAhead` (default 3) ahead.
 - A group can be any value: a hashtable, a path, a name. Each job gets its group as `$job.Group`.
 - The dispatcher keeps its state on the job hashtables. Don't use these names for your own job fields: `GroupKey`, `SlotReleased`, `Proc`, `StdoutTask`, `StderrTask`, `Stopwatch`. (`Group` is yours if you set it yourself.)
-- To retry a job or add follow-up work, enqueue job hashtables onto `$pending` inside `-JobFinalize`. They join the same group, and the group isn't complete until they've all finished.
+- To retry a job or add follow-up work, enqueue job hashtables onto `$pending` inside `-JobFinalize`. They join the same group, and the group isn't complete until they've all finished. A retry can start within milliseconds of the failure, so cap the number of retries, and don't count on the gap for something like a locked file to clear.
 - Supply `-JobStarter { param($job) ... }` to start jobs yourself. It must set `$job.Proc` and should return the job. A starter that is just `Start-PkProcess ...` works too: its result is folded into your job. Throw to report a job that couldn't start.
 - Whatever your callbacks output is thrown away, apart from the return values listed here. They can't corrupt the dispatcher's result by accident.
 - `-MaxConcurrent` can be a `SemaphoreSlim` shared by several dispatchers that must stay under one combined limit. It works inside workers, so two runspace jobs can each run a dispatcher against one shared budget.
-- `-GroupReleaseCheck { param($group) }` makes a group with zero jobs keep its queue-ahead slot until the check returns true. Use it to stop one dispatcher racing ahead of another that it's paired with. The dispatcher doesn't return until every held group has been released, unless the run is cancelled or aborted.
+- `-GroupReleaseCheck { param($group) }` makes a group with zero jobs keep its queue-ahead slot until the check returns true. Use it to stop one dispatcher racing ahead of another that it's paired with. The dispatcher doesn't return until every held group has been released, unless the run is cancelled or aborted. It runs on every loop pass, so keep it cheap.
 - `-JobPollCompleted { param($job) }` replaces the default "has the process exited" check. Use it for a custom starter whose job isn't a plain process, or to give each job a time limit (see "Limits").
-- `-AbortPollCallback { param($runningJobs) }` runs on every loop pass, with the jobs currently running.
+- `-AbortPollCallback { param($runningJobs) }` runs on every loop pass, with the jobs currently running. That's about every 50 ms, and can be many times more often when programs finish quickly, so keep it cheap.
 - `-CancelToken` stops the dispatcher when cancelled. An abort stops it either way, without cancelling your token.
 - An exception from one of your callbacks stops the dispatcher: running processes are killed and the exception is rethrown.
 - Returns an object with `GroupResults`, `Aborted`, `ForceKilledCount` and `JobStarterFailedCount`. `GroupResults` holds one object with `GroupInfo`, `Completed` and `Aborted` per group, where `GroupInfo` is the group value.
@@ -306,7 +306,7 @@ Other pieces: `Request-PkAbort` triggers the same abort from code. `Test-PkAbort
 
 - **`-MaxConcurrent` for programs.** For programs that use one CPU core each, start at `[Environment]::ProcessorCount`. Many encoders (image, video, compression) already use several cores per file, so fewer copies at once is often as fast and uses less memory. Programs that mostly wait on disk or network can go higher. Try a few values on real work; the best number depends on the tool.
 - **`-MaxParallel` for runspace jobs.** Same idea: the core count for CPU-heavy PowerShell work. Each runspace costs some memory and startup time, so very high values rarely help.
-- **Several dispatchers at once** (for example, one per runspace job) should share one `SemaphoreSlim` as `-MaxConcurrent`, so their combined total stays under the limit you picked.
+- **Several dispatchers at once** (for example, one per runspace job) should share one `SemaphoreSlim` as `-MaxConcurrent`, so their combined total stays under the limit you picked. They take turns: each pauses up to 50 ms after a program finishes so the others can get the free slot, which costs very short programs some speed compared with a dispatcher of their own.
 
 ## Limits
 

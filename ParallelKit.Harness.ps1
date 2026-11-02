@@ -2259,6 +2259,104 @@ Test-Assert ($softRun.Aborted -and $softRun.CrashedCount -eq 0 -and $softOut.Cou
 Reset-Harness
 Write-Host ""
 
+# ==============================================================================
+Write-Host "=== AB: a finished job's slot is refilled without waiting out a sleep ===" -ForegroundColor Cyan
+
+# Timing, so up to three tries: a busy machine can only make a run slower, and
+# polling can't get under its floor however idle the machine is.
+# Two 50 ms sleeps per program at -MaxConcurrent 1 can't average under 100 ms.
+$bestPerProgram = [double]::MaxValue
+for ($try = 0; $try -lt 3 -and $bestPerProgram -ge 90; $try++) {
+    $shortCommands = foreach ($i in 1..30) { @{ FilePath = $cmdExe; Arguments = '/d /c exit 0' } }
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $shortBatch = Invoke-PkProcessBatch -Commands $shortCommands -MaxConcurrent 1
+    $sw.Stop()
+    $bestPerProgram = [Math]::Min($bestPerProgram, $sw.Elapsed.TotalMilliseconds / 30)
+}
+Test-Assert ($shortBatch.Results.Count -eq 30) "every short program has a result"
+Test-Assert ($bestPerProgram -lt 90) ("short programs aren't held back by the poll (best average " + [int]$bestPerProgram + " ms each)")
+
+# The same floor for runspace jobs: one 100 ms sleep per 20 ms worker.
+$bestPerJob = [double]::MaxValue
+for ($try = 0; $try -lt 3 -and $bestPerJob -ge 70; $try++) {
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $null = Invoke-PkRunspaceJobs -MaxParallel 1 -JobParams (New-JobList -Jobs @(foreach ($i in 1..20) { @{ Id = $i } })) -WorkerScript {
+        param([int]$Id)
+        $spin = [System.Diagnostics.Stopwatch]::StartNew()
+        while ($spin.ElapsedMilliseconds -lt 20) { }
+    } -ResultHandler { param($r) }
+    $sw.Stop()
+    $bestPerJob = [Math]::Min($bestPerJob, $sw.Elapsed.TotalMilliseconds / 20)
+}
+Test-Assert ($bestPerJob -lt 70) ("short workers aren't held back by the poll (best average " + [int]$bestPerJob + " ms each)")
+
+# A -JobPollCompleted that keeps saying "not done" after a process exits must
+# not leave that process's signalled handle in the wait, or the loop spins:
+# first while the second program still runs, then with both exited.
+$spinState = @{ Given = $false; Polls = 0 }
+$spinRun = Invoke-PkProcessDispatch -MaxConcurrent 2 `
+    -GroupProvider { if ($spinState.Given) { return $null }; $spinState.Given = $true; return 'g' }.GetNewClosure() `
+    -JobBuilder { param($g) @{ FilePath = $cmdExe; Arguments = '/d /c exit 0' }, @{ FilePath = $pingExe; Arguments = '-n 2 127.0.0.1' } }.GetNewClosure() `
+    -JobPollCompleted { param($job) $spinState.Polls++; $job['Proc'].HasExited -and $job['Stopwatch'].Elapsed.TotalMilliseconds -gt 2000 }.GetNewClosure() `
+    -JobFinalize { param($job, $q) $null = Complete-PkProcess -Job $job }
+Test-Assert ($spinRun.GroupResults.Count -eq 1 -and $spinState.Polls -lt 500) ("a lagging -JobPollCompleted doesn't spin the loop (" + $spinState.Polls + " polls in 2 s)")
+
+# More running programs than one wait can hold.
+$wideCommands = foreach ($i in 1..70) { @{ FilePath = $pingExe; Arguments = '-n 2 127.0.0.1' } }
+$wide = Invoke-PkProcessBatch -Commands $wideCommands -MaxConcurrent 70
+$wideOk = @($wide.Results | Where-Object { $_.ExitCode -eq 0 }).Count
+Test-Assert ($wideOk -eq 70) "70 programs at once all finish ($wideOk ok)"
+$wideRun = Invoke-PkRunspaceJobs -MaxParallel 70 -JobParams (New-JobList -Jobs @(foreach ($i in 1..70) { @{ Id = $i } })) -WorkerScript {
+    param([int]$Id)
+    [System.Threading.Thread]::Sleep(500)
+    return $Id
+} -ResultHandler { param($r) }
+Test-Assert ($wideRun.Aborted -eq $false -and $wideRun.CrashedCount -eq 0) "70 runspace jobs at once all finish"
+
+# A starter whose .Proc isn't a Process still gets waited on and finished.
+$fakeState = @{ Given = $false; Finished = 0; Started = [System.Diagnostics.Stopwatch]::StartNew() }
+$fakeRun = Invoke-PkProcessDispatch -MaxConcurrent 2 `
+    -GroupProvider { if ($fakeState.Given) { return $null }; $fakeState.Given = $true; return 'g' }.GetNewClosure() `
+    -JobBuilder { param($g) @{ Fake = 1 }, @{ FilePath = $pingExe; Arguments = '-n 2 127.0.0.1' } }.GetNewClosure() `
+    -JobStarter { param($job) if ($job['Fake']) { $job['Proc'] = 'not a process' } else { $s = Start-PkProcess -FilePath $job['FilePath'] -Arguments $job['Arguments']; foreach ($k in $s.Keys) { $job[$k] = $s[$k] } }; return $job } `
+    -JobPollCompleted { param($job) if ($job['Fake']) { $fakeState.Started.ElapsedMilliseconds -gt 300 } else { $job['Proc'].HasExited } }.GetNewClosure() `
+    -JobFinalize { param($job, $q) $fakeState.Finished++; if (-not $job['Fake']) { $null = Complete-PkProcess -Job $job } }.GetNewClosure() `
+    -JobAbortCleanup { param($job) }
+Test-Assert ($fakeState.Finished -eq 2 -and $fakeRun.JobStarterFailedCount -eq 0) "a job whose .Proc isn't a process doesn't stop the wait ($($fakeState.Finished) finished)"
+
+# Dispatchers sharing a budget take turns: one with a queue must not retake each
+# slot it frees before the other has seen it free. A starts first, so every run
+# of A's would come before B's first if A held on to the slot.
+$turnBudget = [System.Threading.SemaphoreSlim]::new(1, 1)
+$turnLog = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
+$turnJobs = New-JobList -Jobs @(
+    @{ Tag = 'A'; DelayMs = 0; Budget = $turnBudget; Log = $turnLog; Exe = $cmdExe },
+    @{ Tag = 'B'; DelayMs = 300; Budget = $turnBudget; Log = $turnLog; Exe = $cmdExe })
+$null = Invoke-PkRunspaceJobs -MaxParallel 2 -JobParams $turnJobs -ResultHandler { param($r) } -WorkerScript {
+    param([string]$Tag, [int]$DelayMs, [System.Threading.SemaphoreSlim]$Budget, $Log, [string]$Exe)
+    [System.Threading.Thread]::Sleep($DelayMs)
+    $feed = @{ Given = $false }
+    $null = Invoke-PkProcessDispatch -MaxConcurrent $Budget `
+        -GroupProvider { if ($feed.Given) { return $null }; $feed.Given = $true; return 'g' }.GetNewClosure() `
+        -JobBuilder { param($g) foreach ($i in 1..30) { @{ FilePath = $Exe; Arguments = '/d /c ping -n 1 127.0.0.1 >nul' } } }.GetNewClosure() `
+        -JobFinalize { param($job, $q) $null = Complete-PkProcess -Job $job; $Log.Enqueue($Tag) }.GetNewClosure()
+}
+$turnOrder = -join $turnLog.ToArray()
+$turnBudget.Dispose()
+$turnFirstB = $turnOrder.IndexOf('B')
+Test-Assert ($turnOrder.Length -eq 60 -and $turnFirstB -ge 0 -and $turnFirstB -lt 15) ("dispatchers sharing a budget take turns ($turnFirstB of A's ran before B's first: $turnOrder)")
+
+# The same loop inside a worker, where the wait helper is a plain copy.
+$workerWait = [System.Collections.Generic.List[object]]::new()
+$null = Invoke-PkRunspaceJobs -MaxParallel 1 -JobParams (New-JobList -Jobs @(@{ CmdExe = $cmdExe })) -WorkerScript {
+    param([string]$CmdExe)
+    $inner = Invoke-PkProcessBatch -Commands @(@{ FilePath = $CmdExe; Arguments = '/d /c exit 0' }, @{ FilePath = $CmdExe; Arguments = '/d /c ping -n 2 127.0.0.1 >nul' }) -MaxConcurrent 2
+    return @($inner.Results | Where-Object { $_.ExitCode -eq 0 }).Count
+} -ResultHandler { param($r) $workerWait.Add($r) }.GetNewClosure()
+Test-Assert ($workerWait.Count -eq 1 -and $workerWait[0] -eq 2) "a batch inside a worker waits and finishes (results: $($workerWait -join ','))"
+Reset-Harness
+Write-Host ""
+
 Set-PkMessageHandler -Handler $null
 Reset-PkAbortState
 

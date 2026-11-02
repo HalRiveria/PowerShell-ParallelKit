@@ -971,6 +971,7 @@ function Wait-PkProcess {
         [Parameter(Mandatory)]
         [int]$TimeoutMs
     )
+    # Same handle wrapping as Wait-PkRunningJobs.
     $waitHandle = [System.Threading.ManualResetEvent]::new($false)
     $origHandle = $waitHandle.SafeWaitHandle
     $waitHandle.SafeWaitHandle = [Microsoft.Win32.SafeHandles.SafeWaitHandle]::new($Process.Handle, $false)
@@ -980,6 +981,50 @@ function Wait-PkProcess {
         $waitHandle.SafeWaitHandle = $origHandle
         $waitHandle.Dispose()
     }
+}
+
+function Wait-PkRunningJobs {
+    # The dispatch loop's pause: until a running program exits, the token is
+    # cancelled, or TimeoutMs passes. Only programs that haven't exited are waited
+    # on: a -JobPollCompleted can keep saying "not done" after the exit, and the
+    # signalled handle would make every wait return at once and spin a core.
+    # A job with no real process, or past the 63 handles WaitAny can hold on an STA
+    # thread (one of them the token), is only noticed when the time is up. With
+    # nothing to wait on, a plain sleep. Same handle wrapping as Wait-PkProcess.
+    param(
+        [System.Collections.Generic.List[hashtable]]$Jobs,
+        [System.Threading.CancellationToken]$CancelToken,
+        [int]$TimeoutMs
+    )
+    $waits = [System.Collections.Generic.List[System.Threading.WaitHandle]]::new()
+    $origHandles = [System.Collections.Generic.List[object]]::new()
+    try {
+        foreach ($job in $Jobs) {
+            if ($waits.Count -ge 62) { break }
+            $proc = $job['Proc']
+            if ($proc -isnot [System.Diagnostics.Process] -or $proc.HasExited) { continue }
+            $procHandle = $proc.Handle
+            $waitHandle = [System.Threading.ManualResetEvent]::new($false)
+            $origHandle = $waitHandle.SafeWaitHandle
+            $waitHandle.SafeWaitHandle = [Microsoft.Win32.SafeHandles.SafeWaitHandle]::new($procHandle, $false)
+            $waits.Add($waitHandle)
+            $origHandles.Add($origHandle)
+        }
+        if ($waits.Count -gt 0) {
+            $waits.Add($CancelToken.WaitHandle)
+            $null = [System.Threading.WaitHandle]::WaitAny($waits.ToArray(), $TimeoutMs)
+            return
+        }
+    } catch {
+        # A process that can't be read or waited on (a starter's own, say) is
+        # the job's -JobPollCompleted to deal with; here it just means sleeping.
+    } finally {
+        for ($i = 0; $i -lt $origHandles.Count; $i++) {
+            $waits[$i].SafeWaitHandle = $origHandles[$i]
+            $waits[$i].Dispose()
+        }
+    }
+    [System.Threading.Thread]::Sleep($TimeoutMs)
 }
 
 function Complete-PkProcess {
@@ -1145,7 +1190,7 @@ function Invoke-PkProcessDispatch {
     # How many groups to pull ahead of the ones running (default 3).
     # .PARAMETER GroupReleaseCheck
     # { param($group) } returning $true to release a zero-job group's queue-ahead
-    # slot; until then it holds the slot.
+    # slot; until then it holds the slot. Runs on every loop pass, so keep it cheap.
     # .OUTPUTS
     # An object with GroupResults, Aborted, ForceKilledCount and
     # JobStarterFailedCount. Each group result has GroupInfo (the group), Completed
@@ -1492,9 +1537,16 @@ function Invoke-PkProcessDispatchCore {
                 $pkStillRunning.Add($pkJob)
             }
         }
+        # A job that finished freed a slot: go straight round and refill it.
+        # Not on a shared budget, where a sibling dispatcher only looks for a
+        # free slot every 50 ms: refilling at once took every slot until this
+        # dispatcher's queue ran out, and the sibling got none.
+        # The wait's 50 ms cap is how soon an abort flag or a sibling's released
+        # slot is noticed, neither of which wakes it.
+        $pkAnyFinished = ($pkStillRunning.Count -lt $pkRunning.Count)
         $pkRunning = $pkStillRunning
 
-        [System.Threading.Thread]::Sleep(50)
+        if ($pkIsSharedBudget -or -not $pkAnyFinished) { Wait-PkRunningJobs -Jobs $pkRunning -CancelToken $pkCancelToken -TimeoutMs 50 }
     }
     } catch {
         # Best-effort teardown on the way out; the original error is rethrown.
@@ -1831,7 +1883,7 @@ function Invoke-PkProcessBatch {
 function Get-PkWorkerSafeFunctionNames {
     # Kit functions every worker runspace gets automatically.
     return @('Write-PkMessage', 'Test-PkAbortSignal', 'Test-PkCancelRequested', 'Initialize-PkThreadPool', 'Stop-PkProcessTree', 'Stop-PkJobProcesses', 'Resolve-PkEncoding',
-             'Start-PkProcess', 'Wait-PkProcess', 'Complete-PkProcess', 'Invoke-PkProcessWithTimeout',
+             'Start-PkProcess', 'Wait-PkProcess', 'Wait-PkRunningJobs', 'Complete-PkProcess', 'Invoke-PkProcessWithTimeout',
              'Invoke-PkProcessDispatch', 'Invoke-PkProcessDispatchCore', 'Invoke-PkProcessBatch',
              'Register-PkCancellationSource', 'Unregister-PkCancellationSource', 'New-PkBatchResult', 'ConvertTo-PkArgumentString', 'Get-PkForceStopReason', 'Resolve-PkFileSystemPath', 'Add-PkDispatchGroupJobs', 'Start-PkProcessCore')
 }
@@ -2252,7 +2304,19 @@ function Invoke-PkRunspaceJobs {
                 }
             }
             $handles = $stillPending
-            if ($handles.Count -gt 0 -and ($scanExhausted -or $handles.Count -ge $MaxParallel)) { [System.Threading.Thread]::Sleep(100) }
+            if ($handles.Count -gt 0 -and ($scanExhausted -or $handles.Count -ge $MaxParallel)) {
+                # Until a worker finishes or the token is cancelled. The 100 ms cap
+                # keeps worker messages, -PollCallback and the abort flag moving.
+                # WaitAny holds 63 handles at most on an STA thread, one of them the
+                # token; a worker past that is only noticed when the time is up.
+                $workerWaits = [System.Collections.Generic.List[System.Threading.WaitHandle]]::new()
+                foreach ($h in $handles) {
+                    if ($workerWaits.Count -ge 62) { break }
+                    $workerWaits.Add($h.Handle.AsyncWaitHandle)
+                }
+                $workerWaits.Add($Cts.Token.WaitHandle)
+                $null = [System.Threading.WaitHandle]::WaitAny($workerWaits.ToArray(), 100)
+            }
         }
 
         if ($Cts.Token.IsCancellationRequested) {
