@@ -64,8 +64,8 @@ For running PowerShell code in parallel, most of these are fine and some are sim
 
 - **PowerShell 7's `ForEach-Object -Parallel`.** The easy answer for plain parallel PowerShell code if you can use PowerShell 7. ParallelKit was built for scripts and machines stuck on 5.1, though it runs on 7 too, where it still adds the external-program handling and graceful Ctrl+C.
 - **`Start-Job`.** Built in, but each job is a whole new `powershell.exe` process, so every job costs noticeable startup time and memory, and what it returns comes back as serialized copies (properties only, no methods). 5.1's `Start-Job` has no throttle either, so you write the wait-for-a-free-slot loop yourself. Fine for a handful of long jobs, poor for thousands of short ones.
-- **ThreadJob (`Start-ThreadJob`).** Runs jobs as runspaces in the same process, with a `-ThrottleLimit`. On 5.1 it's the best fit for plain parallel scriptblocks, if you can install a module from the PowerShell Gallery (it ships with PowerShell 7, not 5.1).
-- **PoshRSJob (`Start-RSJob`).** A community module from the Gallery, also runspace-based, with a `-Throttle` limit and a job-style interface. For this purpose it has the same strengths and gaps as ThreadJob.
+- **ThreadJob (`Start-ThreadJob`).** Runs jobs as runspaces in the same process, with a `-ThrottleLimit`. On 5.1 it's the best fit for plain parallel scriptblocks, if you can install a module from the PowerShell Gallery (`Microsoft.PowerShell.ThreadJob`; it ships with PowerShell 7, not 5.1).
+- **PoshRSJob (`Start-RSJob`).** A community module from the Gallery, also runspace-based, with a `-Throttle` limit and a job-style interface. It hasn't had a release since 2018, it can report a job as Completed before its output is ready (run `Wait-RSJob` before `Receive-RSJob`), and it's hit harder than ThreadJob by the [scriptblock problem](#faq). Where both are an option, ThreadJob is the better pick.
 - **A runspace pool by hand** (`[runspacefactory]::CreateRunspacePool`). That's what `Invoke-PkRunspaceJobs` is built on. It works, but you end up writing the polling loop, error collection, cancellation and cleanup yourself, which is most of what this file is.
 - **Workflows (`foreach -parallel`).** Still in 5.1, but they use a restricted version of the language, start slowly, and were dropped from PowerShell 6 and later. Not worth starting anything new on.
 - **`Start-Process` in a loop.** Starts programs without waiting, but can only send their output to files, and the throttling and waiting are up to you. Using `System.Diagnostics.Process` directly gets output into memory, but reading stdout and then stderr the simple way deadlocks once a program fills the pipe you aren't reading. The kit reads both in the background.
@@ -331,6 +331,19 @@ It uses real runspaces and real child processes (`cmd.exe`, `ping.exe`), with no
 
 GitHub runs the same harness on Windows PowerShell 5.1 and on PowerShell 7 for every pull request and every change to `main`.
 
+`Testing/` holds the longer stress tests and checks behind some of what this README says. They aren't part of the test suite and aren't needed to use the kit:
+
+- `Testing/cmdlet-hang/` stresses the kit's worker code, for the [two rules](#the-two-rules-for-worker-code).
+- `Testing/third-party/` asks the same question of ThreadJob and PoshRSJob. `results/matrix.log` holds the results behind the FAQ answer, from ThreadJob 2.2.0 and PoshRSJob 1.7.4.4. To run it yourself, save the modules first, then run `matrix.ps1`:
+
+  ```powershell
+  New-Item -ItemType Directory -Force .\Testing\third-party\modules
+  Save-PSResource -Name ThreadJob, PoshRSJob -Path .\Testing\third-party\modules
+  powershell -NoProfile -File .\Testing\third-party\matrix.ps1
+  ```
+
+- `Testing/hosts/check-host.ps1` checks the kit in a host you choose, such as an editor's terminal or a scheduled task.
+
 ## FAQ
 
 **Can I use cmdlets in worker code?**
@@ -339,7 +352,7 @@ Yes. What a worker can't do is run a scriptblock that came from another runspace
 
 **Do ThreadJob and PoshRSJob have the same scriptblock problem?**
 
-It hasn't been tested with them. The cause is in PowerShell itself, not in this kit: a scriptblock stays tied to the runspace that made it. So any runspace-based tool that lets a scriptblock cross from one runspace to another can hit it. This kit refuses to launch when it sees one.
+Yes, both. Neither one rebuilds or refuses a scriptblock you pass to a job (by `-ArgumentList` or `$using:`), so it still runs against your script's session state, just from the job's thread. In tests with 8 jobs, a scriptblock passed as a job value crashed PowerShell or broke the calling script (its own functions vanished mid-run) whenever the script was doing anything else at the same time. ThreadJob only got away with it when the script did nothing but sit in `Wait-Job` until the jobs finished. PoshRSJob never did, since `Start-RSJob` is itself PowerShell code that's still running while the first jobs start. A delegate made in your script was handed back to your script's thread to run: wrong results while the script was busy, and a deadlock in nearly every run while it waited in `Wait-Job`. Passed as text and rebuilt in the job, the same code ran clean every time. So [the two rules](#the-two-rules-for-worker-code) apply to them as well; they just don't check for you. The test scripts and results are in [`Testing/third-party`](Testing/third-party).
 
 **Does it work in PowerShell 7, or on Linux or macOS?**
 

@@ -1,0 +1,49 @@
+powershell-ThreadJob-JobValue-Args-Busy: wrong=20 of 20 trials (19s). 
+powershell-ThreadJob-JobValue-Using-Busy: wrong=20 of 20 trials (19s). 
+powershell-ThreadJob-Delegate-Args-Busy: ok=19 wrong=1 of 20 trials (43s). iteration errors=2: wrong result '' | wrong result '' || ok iterations 15998 of 16000
+powershell-ThreadJob-Delegate-Using-Busy: ok=19 wrong=1 of 20 trials (44s). iteration errors=1: wrong result '' || ok iterations 15999 of 16000
+powershell-ThreadJob-TextJobValue-Args-Busy: ok=20 of 20 trials (23s). 
+powershell-ThreadJob-TextDelegate-Args-Busy: ok=20 of 20 trials (33s). 
+powershell-ThreadJob-JobValue-Args-Wait: ok=20 of 20 trials (23s). 
+powershell-ThreadJob-JobValue-Using-Wait: ok=20 of 20 trials (22s). 
+powershell-ThreadJob-Delegate-Args-Wait: timeout=19 wrong=1 of 20 trials (333s). timeout: 8 jobs still running after 45s
+powershell-ThreadJob-Delegate-Using-Wait: timeout=19 wrong=1 of 20 trials (334s). 
+powershell-ThreadJob-TextJobValue-Args-Wait: ok=20 of 20 trials (22s). 
+powershell-ThreadJob-TextDelegate-Args-Wait: ok=20 of 20 trials (28s). 
+powershell-RSJob-JobValue-Args-Busy: wrong=20 of 20 trials (22s). 
+powershell-RSJob-JobValue-Using-Busy: wrong=20 of 20 trials (22s). 
+powershell-RSJob-Delegate-Args-Busy: wrong=20 of 20 trials (26s). exception: CommandNotFoundException: The term 'Increment' is not recognized as the name of a cmdlet, function, script file, or operable program. Check the spelling of the name, or if a path was included, verify that the path is correct and try again. @ At H:\_Projects\ParallelKit\Testing\third-party\inner.ps1:98 char:36
+powershell-RSJob-Delegate-Using-Busy: wrong=20 of 20 trials (26s). exception: CommandNotFoundException: The term 'Increment' is not recognized as the name of a cmdlet, function, script file, or operable program. Check the spelling of the name, or if a path was included, verify that the path is correct and try again. @ At H:\_Projects\ParallelKit\Testing\third-party\inner.ps1:99 char:20
+powershell-RSJob-TextJobValue-Args-Busy: ok=20 of 20 trials (26s). 
+powershell-RSJob-TextDelegate-Args-Busy: ok=20 of 20 trials (31s). 
+powershell-RSJob-JobValue-Args-Wait: wrong=20 of 20 trials (22s). 
+powershell-RSJob-JobValue-Using-Wait: wrong=20 of 20 trials (22s). exception: RuntimeException: Start-RSJob : The value of the using variable '$using:Case' cannot be retrieved because it has not been set in the local session. @ At H:\_Projects\ParallelKit\Testing\third-party\modules\PoshRSJob\1.7.4.4\Public\Start-RSJob.ps1:464 char:33
+powershell-RSJob-Delegate-Args-Wait: wrong=20 of 20 trials (26s). exception: CommandNotFoundException: The term 'Increment' is not recognized as the name of a cmdlet, function, script file, or operable program. Check the spelling of the name, or if a path was included, verify that the path is correct and try again. @ At H:\_Projects\ParallelKit\Testing\third-party\inner.ps1:98 char:36
+powershell-RSJob-Delegate-Using-Wait: wrong=20 of 20 trials (27s). exception: CommandNotFoundException: The term 'Increment' is not recognized as the name of a cmdlet, function, script file, or operable program. Check the spelling of the name, or if a path was included, verify that the path is correct and try again. @ At H:\_Projects\ParallelKit\Testing\third-party\inner.ps1:99 char:20
+powershell-RSJob-TextJobValue-Args-Wait: ok=20 of 20 trials (26s). 
+powershell-RSJob-TextDelegate-Args-Wait: ok=20 of 20 trials (32s). 
+pwsh-ThreadJob-JobValue-Args-Busy: wrong=20 of 20 trials (5s). 
+pwsh-ThreadJob-JobValue-Using-Busy: wrong=20 of 20 trials (4s). 
+pwsh-ThreadJob-Delegate-Args-Busy: hang=1 ok=11 wrong=8 of 20 trials (178s). iteration errors=1: wrong result '' || ok iterations 15999 of 16000
+pwsh-ThreadJob-Delegate-Using-Busy: ok=10 wrong=10 of 20 trials (166s). iteration errors=1: wrong result '' || ok iterations 15999 of 16000
+pwsh-ThreadJob-TextJobValue-Args-Busy: ok=20 of 20 trials (5s). 
+pwsh-ThreadJob-TextDelegate-Args-Busy: ok=20 of 20 trials (10s). 
+pwsh-ThreadJob-JobValue-Args-Wait: ok=20 of 20 trials (5s). 
+pwsh-ThreadJob-JobValue-Using-Wait: ok=20 of 20 trials (5s). 
+pwsh-ThreadJob-Delegate-Args-Wait: hang=1 timeout=17 wrong=2 of 20 trials (318s). timeout: 8 jobs still running after 45s
+pwsh-ThreadJob-Delegate-Using-Wait: hang=1 timeout=19 of 20 trials (318s). timeout: 8 jobs still running after 45s
+pwsh-ThreadJob-TextJobValue-Args-Wait: ok=20 of 20 trials (5s). 
+pwsh-ThreadJob-TextDelegate-Args-Wait: ok=20 of 20 trials (10s). 
+pwsh-RSJob-JobValue-Args-Busy: wrong=20 of 20 trials (6s). 
+pwsh-RSJob-JobValue-Using-Busy: wrong=20 of 20 trials (6s). exception: RuntimeException: Start-RSJob : The value of the using variable '$using:Case' cannot be retrieved because it has not been set in the local session. @ At H:\_Projects\ParallelKit\Testing\third-party\modules\PoshRSJob\1.7.4.4\Public\Start-RSJob.ps1:464 char:33
+pwsh-RSJob-Delegate-Args-Busy: wrong=20 of 20 trials (9s). exception: PSArgumentException: Cannot find type [RSRunspacePool]: verify that the assembly containing this type is loaded. @ At H:\_Projects\ParallelKit\Testing\third-party\modules\PoshRSJob\1.7.4.4\Public\Start-RSJob.ps1:525 char:30
+pwsh-RSJob-Delegate-Using-Busy: wrong=20 of 20 trials (10s). exception: PSArgumentException: Cannot find type [RSRunspacePool]: verify that the assembly containing this type is loaded. @ At H:\_Projects\ParallelKit\Testing\third-party\modules\PoshRSJob\1.7.4.4\Public\Start-RSJob.ps1:525 char:30
+pwsh-RSJob-TextJobValue-Args-Busy: ok=20 of 20 trials (7s). 
+pwsh-RSJob-TextDelegate-Args-Busy: ok=20 of 20 trials (13s). 
+pwsh-RSJob-JobValue-Args-Wait: wrong=20 of 20 trials (6s). 
+pwsh-RSJob-JobValue-Using-Wait: wrong=20 of 20 trials (6s). 
+pwsh-RSJob-Delegate-Args-Wait: wrong=20 of 20 trials (9s). exception: PSArgumentException: Cannot find type [RSRunspacePool]: verify that the assembly containing this type is loaded. @ At H:\_Projects\ParallelKit\Testing\third-party\modules\PoshRSJob\1.7.4.4\Public\Start-RSJob.ps1:525 char:30
+pwsh-RSJob-Delegate-Using-Wait: wrong=20 of 20 trials (10s). exception: PSArgumentException: Cannot find type [RSRunspacePool]: verify that the assembly containing this type is loaded. @ At H:\_Projects\ParallelKit\Testing\third-party\modules\PoshRSJob\1.7.4.4\Public\Start-RSJob.ps1:525 char:30
+pwsh-RSJob-TextJobValue-Args-Wait: ok=20 of 20 trials (8s). 
+pwsh-RSJob-TextDelegate-Args-Wait: ok=20 of 20 trials (13s). 
+MATRIX DONE
