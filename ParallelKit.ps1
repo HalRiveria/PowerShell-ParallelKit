@@ -1,7 +1,7 @@
 # ParallelKit - parallel runspace jobs, bounded external-process dispatch, and
 # graceful Ctrl+C/window-close handling for Windows PowerShell 5.1.
 #
-# Version 2.1 - https://github.com/HalRiveria/PowerShell-ParallelKit
+# Version 2.2 - https://github.com/HalRiveria/PowerShell-ParallelKit
 # Copyright (c) 2026 HalRiveria. MIT License: keep this notice with any copy;
 # the full text is in LICENSE in the repository.
 #
@@ -482,16 +482,6 @@ function Initialize-ParallelKit {
     return [pscustomobject][ordered]@{ AbortHandler = $handlerOk; ChildProcessJob = $jobOk; ThreadPool = $poolOk }
 }
 
-function Set-PkRunActive {
-    param([Parameter(Mandatory)][bool]$Active)
-    [PkConsoleCtrl]::RunActive = $Active
-}
-
-function Set-PkConsoleQuickEdit {
-    param([Parameter(Mandatory)][bool]$Enabled)
-    return [PkConsoleQuickEdit]::SetEnabled($Enabled)
-}
-
 function Register-PkCancellationSource {
     # .SYNOPSIS
     # Adds your own CancellationTokenSource to the set an abort cancels.
@@ -620,13 +610,6 @@ function Complete-PkAbortDrain {
     # Releases the native handler thread. Idempotent; safe on a run that was
     # never aborted.
     try { [PkConsoleCtrl]::DrainComplete.Set() } catch { }   # nothing useful to do if the event itself is broken
-}
-
-function Test-PkOwnAbortException {
-    # True when an exception is just the fallout of our own abort.
-    param([Parameter(Mandatory)][System.Management.Automation.ErrorRecord]$ErrorRecord)
-    $exType = $ErrorRecord.Exception.GetType().FullName
-    return ((Test-PkAbortSignal) -and ($exType -like '*PipelineStoppedException*' -or $exType -like '*OperationCanceled*'))
 }
 
 function Invoke-PkRun {
@@ -770,7 +753,9 @@ function Resolve-PkFileSystemPath {
     # the current location is HKLM:, say) is taken relative to $Here, the
     # last file-system location.
     param([string]$Path, [string]$Here, [System.Management.Automation.SessionState]$CallerState)
-    if ([System.IO.Path]::IsPathRooted($Path)) { return $Path }
+    # Only a complete path goes straight through. \tools and C:tools depend on
+    # a current drive and folder, which are PowerShell's here, not the process's.
+    if ($Path -match '^([A-Za-z]:[\\/]|[\\/]{2})') { return $Path }
     $lookupFailed = $false
     try {
         $provider = $null
@@ -798,6 +783,9 @@ function Resolve-PkFileSystemPath {
         $hit = @($ExecutionContext.InvokeCommand.InvokeScript($CallerState, [scriptblock]::Create($text), @()))
         if ($hit.Count -gt 0) { return [string]$hit[0] }
     }
+    # \tools while the current location is HKLM:, say: the root of that last
+    # file-system location's drive, not the process's.
+    if ($Path -match '^[\\/]') { return [System.IO.Path]::Combine([System.IO.Path]::GetPathRoot($Here), $Path.TrimStart('\', '/')) }
     # Not a path PowerShell can read (an unknown drive, say): this folder is the best guess.
     return [System.IO.Path]::Combine($Here, $Path)
 }
@@ -888,9 +876,9 @@ function Start-PkProcessCore {
         } elseif ($null -ne $here) {
             $psi.WorkingDirectory = $here
         }
-        # Only a path with a folder in it: a bare name is left to Windows'
-        # own search, which looks on PATH.
-        if ($null -ne $here -and ($FilePath.Contains('\') -or $FilePath.Contains('/'))) {
+        # Only a path with a folder or drive in it: a bare name is left to
+        # Windows' own search, which looks on PATH.
+        if ($null -ne $here -and ($FilePath.Contains('\') -or $FilePath.Contains('/') -or $FilePath.Contains(':'))) {
             $psi.FileName = Resolve-PkFileSystemPath -Path $FilePath -Here $here -CallerState $CallerState
         }
         $proc = [System.Diagnostics.Process]::Start($psi)
@@ -1907,6 +1895,10 @@ function Receive-PkCompletedHandles {
             $pkWorkerOutput = $null
             try {
                 $pkWorkerOutput = $h.PS.EndInvoke($h.Handle)
+                # Same report as Invoke-PkRunspaceJobs' main loop.
+                if ($h.PS.HadErrors) {
+                    foreach ($e in $h.PS.Streams.Error) { Invoke-PkMessageHandler -Message ("Runspace error: " + $e.ToString()) -Level Error }
+                }
             } catch {
                 Add-PkCrashedJob -PkOutcome $Outcome -PkJob $h['Job'] -PkError $_ -PkHandler $JobCrashedHandler -PkWhen " during abort drain"
             } finally {
@@ -2241,6 +2233,7 @@ function Invoke-PkRunspaceJobs {
                     $pkWorkerOutput = $null
                     try {
                         $pkWorkerOutput = $h.PS.EndInvoke($h.Handle)
+                        # Same report as Receive-PkCompletedHandles.
                         if ($h.PS.HadErrors) {
                             foreach ($e in $h.PS.Streams.Error) { Invoke-PkMessageHandler -Message ("Runspace error: " + $e.ToString()) -Level Error }
                         }
@@ -2372,16 +2365,15 @@ function Get-PkCommandKind {
     # module on $env:PSModulePath, and the check runs on every
     # Invoke-PkRunspaceJobs call.
     param([System.Management.Automation.FunctionInfo]$Fn)
-    $fn = $Fn
-    if ($null -eq $fn) { return 'Other' }
-    if ([string]::IsNullOrEmpty($fn.ModuleName)) { return 'Function' }
+    if ($null -eq $Fn) { return 'Other' }
+    if ([string]::IsNullOrEmpty($Fn.ModuleName)) { return 'Function' }
     # The kit's own: a worker gets only the worker-safe ones, so treat the
     # rest like a function of yours (needs listing), as before the kit was a module.
-    if ($fn.ModuleName -eq 'ParallelKit') { return 'Function' }
+    if ($Fn.ModuleName -eq 'ParallelKit') { return 'Function' }
     # A module function (Get-FileHash, say) autoloads in a worker like a
     # cmdlet does - but only if the module can be found by name. One imported
     # by path from elsewhere can't.
-    if ($null -ne (Get-Module -ListAvailable -Name $fn.ModuleName -ErrorAction SilentlyContinue | Select-Object -First 1)) { return 'Other' }
+    if ($null -ne (Get-Module -ListAvailable -Name $Fn.ModuleName -ErrorAction SilentlyContinue | Select-Object -First 1)) { return 'Other' }
     return 'UnloadableModuleFunction'
 }
 
