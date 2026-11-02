@@ -956,13 +956,13 @@ function Stop-PkJobProcesses {
 function Get-PkJobTimeLimit {
     # A dispatcher job's time limit in seconds: its own TimeoutSeconds key if it
     # has one, else the default. 0 = no limit. Throws on a bad key.
-    param([hashtable]$Job, [int]$DefaultTimeoutSeconds = 0)
+    param([hashtable]$Job, [double]$DefaultTimeoutSeconds = 0)
     $value = $Job['TimeoutSeconds']
-    if ($null -eq $value) { return [double]$DefaultTimeoutSeconds }
+    if ($null -eq $value) { return $DefaultTimeoutSeconds }
     $limit = 0.0
     $parsed = [double]::TryParse([string]$value, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$limit)
     if (-not $parsed -or [double]::IsNaN($limit) -or [double]::IsInfinity($limit) -or $limit -lt 0) {
-        throw ("the job's TimeoutSeconds must be a number of seconds, 0 (no limit) or more (got '" + $value + "').")
+        throw ("TimeoutSeconds must be a number of seconds, 0 (no limit) or more (got '" + $value + "').")
     }
     return $limit
 }
@@ -976,7 +976,14 @@ function Stop-PkTimedOutJob {
     $proc = $Job['Proc']
     $clock = $Job['Stopwatch']
     if ($proc -isnot [System.Diagnostics.Process] -or $clock -isnot [System.Diagnostics.Stopwatch]) { return }
-    if ($proc.HasExited -or $clock.Elapsed.TotalSeconds -lt $Job['TimeLimit']) { return }
+    try {
+        if ($proc.HasExited -or $clock.Elapsed.TotalSeconds -lt $Job['TimeLimit']) { return }
+    } catch {
+        # A process that can't be read (a starter's own, say) can't be timed.
+        # That's no reason to stop every other job, which a throw here would do.
+        $Job['TimeLimit'] = 0
+        return
+    }
     # Only flagged if this call did the killing: a program that exited on its
     # own right at the deadline didn't time out. One try only: this runs every
     # pass, and a program that can't be killed would start a taskkill each time.
@@ -1254,7 +1261,7 @@ function Invoke-PkProcessDispatch {
         [int]$AbortTimeoutSeconds = 60,
         [int]$MaxQueueAhead = 3,
         [scriptblock]$GroupReleaseCheck = $null,
-        [int]$TimeoutSeconds = 0
+        [double]$TimeoutSeconds = 0
     )
     # pk-prefixed, parameters included: inside a worker runspace the kit isn't
     # a module, so a callback without .GetNewClosure() sees this frame's
@@ -1284,6 +1291,7 @@ function Invoke-PkProcessDispatch {
         $pkMaxConcurrent = $pkMaxConcurrentInt
     }
     if ($pkMaxQueueAhead -lt 1) { throw "Invoke-PkProcessDispatch: -MaxQueueAhead must be at least 1." }
+    # Invoke-PkProcessBatch has the same check, so its error names the batch.
     if ($pkTimeoutSeconds -lt 0) { throw "Invoke-PkProcessDispatch: -TimeoutSeconds must be 0 (no limit) or more." }
 
     # Two pool threads per running process for its output reads - make sure
@@ -1408,7 +1416,7 @@ function Invoke-PkProcessDispatchCore {
         [int]$MaxQueueAhead,
         [scriptblock]$GroupReleaseCheck,
         [bool]$RequireProc = $false,
-        [int]$TimeoutSeconds = 0
+        [double]$TimeoutSeconds = 0
     )
     # pk-prefixed, parameters included: inside a worker runspace the kit isn't
     # a module, so a callback without .GetNewClosure() sees this frame's
@@ -1671,11 +1679,11 @@ function Invoke-PkProcessDispatchCore {
             # A window-close can exit the loop above before a single poll, and
             # a job can finish in the last 250ms before the deadline. One more
             # pass so a finished job is never thrown away as "force-stopped".
-            # (keep in sync with the two blocks above)
+            # (keep in sync with the two blocks above, except the time limit:
+            # whatever is still running is force-stopped together just below)
             if ($pkRunning.Count -gt 0) {
                 $pkStillWaiting = [System.Collections.Generic.List[hashtable]]::new()
                 foreach ($pkJob in $pkRunning) {
-                    if ($pkJob['TimeLimit'] -gt 0) { Stop-PkTimedOutJob -Job $pkJob }
                     if (& $pkJobPollCompleted $pkJob) {
                         $pkPendingBefore = $pkPending.Count
                         $null = & $pkJobFinalize $pkJob $pkPending
@@ -1837,7 +1845,7 @@ function Invoke-PkProcessBatch {
         [int]$MaxConcurrent = 4,
         [scriptblock]$OnComplete = $null,
         [int]$AbortTimeoutSeconds = 60,
-        [int]$TimeoutSeconds = 0,
+        [double]$TimeoutSeconds = 0,
         $OutputEncoding = $null
     )
     # pk-prefixed, parameters included: inside a worker runspace the kit isn't
@@ -1853,6 +1861,7 @@ function Invoke-PkProcessBatch {
 
     # Checked once here, so a bad name fails the call instead of every command.
     $null = Resolve-PkEncoding -Encoding $pkOutputEncoding
+    # Invoke-PkProcessDispatch has the same check; this one names the batch.
     if ($pkTimeoutSeconds -lt 0) { throw "Invoke-PkProcessBatch: -TimeoutSeconds must be 0 (no limit) or more." }
 
     $pkResults = [System.Collections.Generic.List[object]]::new()

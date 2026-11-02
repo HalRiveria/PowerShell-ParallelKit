@@ -2435,6 +2435,41 @@ $limitRun = Invoke-LimitGroup -Jobs @(@{ Name = 'custom' }) -Extra @{
 $custom = Get-LimitEntry $limitRun 'custom'
 Test-Assert ($null -eq $limitRun.Problem -and $null -ne $limitRun.Result -and $custom.Count -eq 1 -and $custom[0].TimedOut -eq $false -and $custom[0].At -ge 1.7) ("a job whose .Proc isn't a process isn't timed (problem: " + $limitRun.Problem + ")")
 
+# A process that can't be read isn't timed, and doesn't stop the other jobs.
+$unreadableClock = [System.Diagnostics.Stopwatch]::StartNew()
+$limitRun = Invoke-LimitGroup -Jobs @(@{ Name = 'unreadable' }, @{ Name = 'other'; FilePath = $pingExe; Arguments = '-n 2 127.0.0.1' }) -Extra @{
+    TimeoutSeconds = 0.2
+    JobStarter = {
+        param($job)
+        $s = Start-PkProcess -FilePath $cmdExe -Arguments '/c exit 0'
+        if ($job['Name'] -eq 'unreadable') { $null = $s.Proc.WaitForExit(5000); $s.Proc.Dispose(); $job['Proc'] = $s.Proc; return $job }
+        $s = Start-PkProcess -FilePath $job['FilePath'] -Arguments $job['Arguments']
+        foreach ($k in $s.Keys) { $job[$k] = $s[$k] }
+        return $job
+    }.GetNewClosure()
+    JobPollCompleted = { param($job) if ($job['Name'] -eq 'unreadable') { return ($unreadableClock.Elapsed.TotalSeconds -ge 1) }; return $job['Proc'].HasExited }.GetNewClosure()
+    JobFinalize = { param($job, $q) if ($job['Name'] -ne 'unreadable') { $null = Complete-PkProcess -Job $job } }
+}
+Test-Assert ($null -eq $limitRun.Problem -and $null -ne $limitRun.Result -and $limitRun.Result.JobStarterFailedCount -eq 0) ("a process that can't be read doesn't stop the run (problem: " + $limitRun.Problem + ")")
+
+# Fractional, and under 0.5 s: not rounded to 0, which would mean no limit.
+$limitRun = Invoke-LimitGroup -Extra @{ TimeoutSeconds = 0.4 } -Jobs @(@{ Name = 'fraction'; FilePath = $pingExe; Arguments = '-n 30 127.0.0.1' })
+$fraction = Get-LimitEntry $limitRun 'fraction'
+Test-Assert ($fraction.Count -eq 1 -and $fraction[0].TimedOut -eq $true -and $fraction[0].At -lt 5) "a fractional -TimeoutSeconds isn't rounded away"
+$fractionBatch = Invoke-PkProcessBatch -TimeoutSeconds 0.4 -Commands @(@{ FilePath = $pingExe; Arguments = '-n 30 127.0.0.1' })
+Test-Assert ($fractionBatch.Results[0].TimedOut -eq $true) "and neither is the batch's"
+
+# On the main thread too, a plain callback reads the caller's $TimeoutSeconds:
+# reading the kit's 0 here would finish the job at once.
+$TimeoutSeconds = 1.5
+$limitRun = Invoke-LimitGroup -Jobs @(@{ Name = 'plain'; FilePath = $cmdExe; Arguments = '/c exit 0' }) -Extra @{
+    TimeoutSeconds = 30
+    JobPollCompleted = { param($job) $job['Proc'].HasExited -and $job['Stopwatch'].Elapsed.TotalSeconds -ge $TimeoutSeconds }
+}
+Remove-Variable -Name TimeoutSeconds
+$plain = Get-LimitEntry $limitRun 'plain'
+Test-Assert ($plain.Count -eq 1 -and $plain[0].At -ge 1.4 -and $plain[0].At -lt 10) ("a plain -JobPollCompleted reads the caller's `$TimeoutSeconds, not the dispatcher's (finished at " + $(if ($plain.Count) { [Math]::Round($plain[0].At, 1) }) + " s)")
+
 # A bad key fails that job's start, before anything runs.
 Reset-Harness
 $limitRun = Invoke-LimitGroup -Jobs @(
