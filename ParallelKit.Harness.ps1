@@ -2210,6 +2210,14 @@ Test-Assert ($fnDrive.FileText -like 'pk-fn ran in *') ("and so does a FilePath 
 $noDrive = $null
 try { $null = Invoke-PkProcessWithTimeout -FilePath $cmdExe -Arguments '/c cd' -WorkingDirectory 'PkNoSuchDrive:\x' } catch { $noDrive = [string]$_ }
 Test-Assert ($noDrive -like '*could not start*') "a drive that doesn't exist anywhere still fails with a clear start error"
+# PowerShell treats curly quotes as string delimiters too, so a path can't be
+# allowed to end the literal it's embedded in when looked up in the caller's session.
+$curly = [string][char]0x2019
+$global:pkHarnessInjected = $false
+try { $null = Invoke-PkProcessWithTimeout -FilePath $cmdExe -Arguments '/c cd' -WorkingDirectory ('PkNoDrive' + $curly + '); $global:pkHarnessInjected = $true; (' + $curly + ':\x') } catch { $null = $_ }   # failing to start is expected here; only the flag matters
+$injected = $global:pkHarnessInjected
+Remove-Variable -Name pkHarnessInjected -Scope Global
+Test-Assert (-not $injected) "a path with a curly quote stays a path when it's looked up in the caller's session"
 Write-Host ""
 
 Set-PkMessageHandler -Handler $null

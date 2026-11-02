@@ -794,7 +794,7 @@ function Resolve-PkFileSystemPath {
     } catch { }
 }
 '@
-        $text = $text.Replace('__PATH__', $q + $Path.Replace($q, $q + $q) + $q)
+        $text = $text.Replace('__PATH__', $q + [System.Management.Automation.Language.CodeGeneration]::EscapeSingleQuotedStringContent($Path) + $q)
         $hit = @($ExecutionContext.InvokeCommand.InvokeScript($CallerState, [scriptblock]::Create($text), @()))
         if ($hit.Count -gt 0) { return [string]$hit[0] }
     }
@@ -2332,7 +2332,7 @@ function Get-PkCallerFunction {
     $names = @($Name | Where-Object { -not [string]::IsNullOrEmpty($_) })
     if ($names.Count -eq 0) { return $found }
     $q = [string][char]39
-    $quoted = foreach ($n in $names) { $q + $n.Replace($q, $q + $q) + $q }
+    $quoted = foreach ($n in $names) { $q + [System.Management.Automation.Language.CodeGeneration]::EscapeSingleQuotedStringContent($n) + $q }
     $follow = '$false'
     if ($FollowAlias) { $follow = '$true' }
     $text = @'
