@@ -334,7 +334,7 @@ GitHub runs the same harness on Windows PowerShell 5.1 and on PowerShell 7 for e
 `Testing/` holds the longer stress tests and checks behind some of what this README says. They aren't part of the test suite and aren't needed to use the kit:
 
 - `Testing/cmdlet-hang/` stresses the kit's worker code, for the [two rules](#the-two-rules-for-worker-code).
-- `Testing/third-party/` asks the same question of ThreadJob and PoshRSJob. `results/matrix.log` holds the results behind the FAQ answer, from ThreadJob 2.2.0 and PoshRSJob 1.7.4.4. To run it yourself, save the modules first, then run `matrix.ps1`:
+- `Testing/third-party/` asks the same question of ThreadJob and PoshRSJob. `results/matrix.log` holds the results behind the FAQ answer, from ThreadJob 2.2.0 and PoshRSJob 1.7.4.4. To run it yourself, save the modules first, in PowerShell 7.4 or later (which has `Save-PSResource`), then run `matrix.ps1`:
 
   ```powershell
   New-Item -ItemType Directory -Force .\Testing\third-party\modules
@@ -352,7 +352,7 @@ Yes. What a worker can't do is run a scriptblock that came from another runspace
 
 **Do ThreadJob and PoshRSJob have the same scriptblock problem?**
 
-Yes, both. Neither one rebuilds or refuses a scriptblock you pass to a job (by `-ArgumentList` or `$using:`), so it still runs against your script's session state, just from the job's thread. In tests with 8 jobs, a scriptblock passed as a job value crashed PowerShell or broke the calling script (its own functions vanished mid-run) whenever the script was doing anything else at the same time. ThreadJob only got away with it when the script did nothing but sit in `Wait-Job` until the jobs finished. PoshRSJob never did, since `Start-RSJob` is itself PowerShell code that's still running while the first jobs start. A delegate made in your script was handed back to your script's thread to run: wrong results while the script was busy, and a deadlock in nearly every run while it waited in `Wait-Job`. Passed as text and rebuilt in the job, the same code ran clean every time. So [the two rules](#the-two-rules-for-worker-code) apply to them as well; they just don't check for you. The test scripts and results are in [`Testing/third-party`](Testing/third-party).
+Yes, both. Neither one rebuilds or refuses a scriptblock you pass to a job (by `-ArgumentList` or `$using:`), so it still runs against your script's session state, just from the job's thread. In tests with 8 jobs, a scriptblock passed as a job value crashed PowerShell or broke the calling script (its own functions vanished mid-run) whenever the script was doing anything else at the same time. ThreadJob only got away with it when the script did nothing but sit in `Wait-Job` until the jobs finished. PoshRSJob never did, since `Start-RSJob` is itself PowerShell code that's still running while the first jobs start. A delegate made in your script was handed back to your script's thread to run. With ThreadJob that gave wrong results in some runs while the script was busy, and a deadlock in nearly every run while it waited in `Wait-Job`. With PoshRSJob it failed every time. Passed as text and rebuilt in the job, the same code ran clean every time. So [the two rules](#the-two-rules-for-worker-code) apply to them as well; they just don't check for you. The test scripts and results are in [`Testing/third-party`](Testing/third-party).
 
 **Does it work in PowerShell 7, or on Linux or macOS?**
 
