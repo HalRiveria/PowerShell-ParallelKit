@@ -2324,6 +2324,28 @@ $fakeRun = Invoke-PkProcessDispatch -MaxConcurrent 2 `
     -JobAbortCleanup { param($job) }
 Test-Assert ($fakeState.Finished -eq 2 -and $fakeRun.JobStarterFailedCount -eq 0) "a job whose .Proc isn't a process doesn't stop the wait ($($fakeState.Finished) finished)"
 
+# Dispatchers sharing a budget take turns: one with a queue must not retake each
+# slot it frees before the other has seen it free. A starts first, so every run
+# of A's would come before B's first if A held on to the slot.
+$turnBudget = [System.Threading.SemaphoreSlim]::new(1, 1)
+$turnLog = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
+$turnJobs = New-JobList -Jobs @(
+    @{ Tag = 'A'; DelayMs = 0; Budget = $turnBudget; Log = $turnLog; Exe = $cmdExe },
+    @{ Tag = 'B'; DelayMs = 300; Budget = $turnBudget; Log = $turnLog; Exe = $cmdExe })
+$null = Invoke-PkRunspaceJobs -MaxParallel 2 -JobParams $turnJobs -ResultHandler { param($r) } -WorkerScript {
+    param([string]$Tag, [int]$DelayMs, [System.Threading.SemaphoreSlim]$Budget, $Log, [string]$Exe)
+    [System.Threading.Thread]::Sleep($DelayMs)
+    $feed = @{ Given = $false }
+    $null = Invoke-PkProcessDispatch -MaxConcurrent $Budget `
+        -GroupProvider { if ($feed.Given) { return $null }; $feed.Given = $true; return 'g' }.GetNewClosure() `
+        -JobBuilder { param($g) foreach ($i in 1..30) { @{ FilePath = $Exe; Arguments = '/d /c ping -n 1 127.0.0.1 >nul' } } }.GetNewClosure() `
+        -JobFinalize { param($job, $q) $null = Complete-PkProcess -Job $job; $Log.Enqueue($Tag) }.GetNewClosure()
+}
+$turnOrder = -join $turnLog.ToArray()
+$turnBudget.Dispose()
+$turnFirstB = $turnOrder.IndexOf('B')
+Test-Assert ($turnOrder.Length -eq 60 -and $turnFirstB -ge 0 -and $turnFirstB -lt 15) ("dispatchers sharing a budget take turns ($turnFirstB of A's ran before B's first: $turnOrder)")
+
 # The same loop inside a worker, where the wait helper is a plain copy.
 $workerWait = [System.Collections.Generic.List[object]]::new()
 $null = Invoke-PkRunspaceJobs -MaxParallel 1 -JobParams (New-JobList -Jobs @(@{ CmdExe = $cmdExe })) -WorkerScript {
