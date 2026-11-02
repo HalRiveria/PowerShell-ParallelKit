@@ -2109,6 +2109,117 @@ Test-Assert ($modOut -match 'module private=105') ("a module's private function 
 Test-Assert ($modOut -match 'kit modules=1') "loading the kit a second time leaves one ParallelKit module, not two"
 Write-Host ""
 
+# ==============================================================================
+Write-Host "=== AA: callbacks inside a worker, and drives made inside a function ===" -ForegroundColor Cyan
+# Inside a worker the kit's functions are plain copies, not a module, so only
+# their pk-prefixed names keep them out of a closure-less callback's way.
+Reset-Harness
+$workerOut = [System.Collections.Generic.List[object]]::new()
+$null = Invoke-PkRunspaceJobs -MaxParallel 1 -JobParams (New-JobList -Jobs @(@{ CmdExe = $cmdExe })) -ResultHandler { param($r) $workerOut.Add($r) }.GetNewClosure() -WorkerScript {
+    param($CmdExe)
+    # Every variable name visible from where this runs, up the scope chain.
+    $probe = {
+        $probeSeen = @{}
+        for ($probeScope = 1; $probeScope -lt 40; $probeScope++) {
+            try { foreach ($probeVar in (Get-Variable -Scope $probeScope -ErrorAction Stop)) { $probeSeen[$probeVar.Name] = $true } } catch { break }
+        }
+        ,@($probeSeen.Keys)
+    }
+    $baseline = & $probe
+    $results = [System.Collections.Generic.List[object]]::new()
+    $state = @{ Count = 0 }
+    $TimeoutSeconds = 99
+    $running = 'my running'
+    $seenBy = @{}
+    $batch = Invoke-PkProcessBatch -Commands @(@{ FilePath = $CmdExe; Arguments = '/c exit 0' }, @{ FilePath = $CmdExe; Arguments = '/c exit 0' }) -OnComplete {
+        param($cbCommand, $cbResult)
+        $results.Add('mine')
+        $state.Count++
+        $seenBy.Timeout = $TimeoutSeconds
+        $seenBy.OnComplete = & $probe
+    }
+    $feed = @{ Given = $false }
+    $null = Invoke-PkProcessDispatch -MaxConcurrent 1 `
+        -GroupProvider { if ($feed.Given) { return $null }; $feed.Given = $true; $seenBy.Provider = & $probe; return 'g' } `
+        -JobBuilder { param($cbGroup) $seenBy.Builder = & $probe; return @(@{ FilePath = $CmdExe; Arguments = '/c exit 0' }) } `
+        -JobFinalize { param($cbJob, $cbPending) $null = Complete-PkProcess -Job $cbJob; $seenBy.Running = $running; $seenBy.Finalize = & $probe }
+    # What a function's frame adds by itself, on top of what was already visible.
+    $automatic = @('args', 'input', 'MyInvocation', 'PSBoundParameters', 'PSCmdlet', 'PSCommandPath', 'PSScriptRoot', 'foreach', 'switch', 'this', '_', 'cbCommand', 'cbResult', 'cbGroup', 'cbJob', 'cbPending', 'probeSeen', 'probeScope', 'probeVar')
+    $extra = @{}
+    foreach ($where in 'OnComplete', 'Provider', 'Builder', 'Finalize') {
+        foreach ($n in $seenBy[$where]) {
+            if ($baseline -notcontains $n -and $automatic -notcontains $n -and $n -notlike 'pk*' -and @('results', 'state', 'TimeoutSeconds', 'running', 'seenBy', 'batch', 'feed', 'probe', 'baseline', 'automatic', 'extra') -notcontains $n) { $extra[$n] = $true }
+        }
+    }
+    [pscustomobject]@{
+        BatchResults = $batch.Results.Count
+        Foreign      = @($batch.Results | Where-Object { $_ -isnot [System.Management.Automation.PSCustomObject] }).Count
+        Mine         = $results.Count
+        State        = $state.Count
+        Timeout      = $seenBy.Timeout
+        Running      = $seenBy.Running
+        Extra        = (@($extra.Keys | Sort-Object) -join ', ')
+    }
+}
+$wr = $workerOut[0]
+Test-Assert ($null -ne $wr -and $wr.BatchResults -eq 2 -and $wr.Foreign -eq 0 -and $wr.Mine -eq 2 -and $wr.State -eq 2) ("in a worker, a plain -OnComplete's `$results/`$state are the worker's, not the batch's (batch results " + $wr.BatchResults + ", worker's " + $wr.Mine + "/" + $wr.State + ")")
+Test-Assert ($wr.Timeout -eq 99 -and $wr.Running -eq 'my running') ("in a worker, plain callbacks read the worker's `$TimeoutSeconds and `$running (" + $wr.Timeout + ", " + $wr.Running + ")")
+Test-Assert ($wr.Extra -eq '') ("in a worker, no kit variable without the pk prefix is visible to a plain callback (found: " + $wr.Extra + ")")
+
+# A drive made with New-PSDrive inside a function is only visible from there.
+Reset-Harness
+$driveDir = Join-Path $env:TEMP ("pk-harness-fndrive-" + $PID)
+$null = New-Item -ItemType Directory -Force -Path (Join-Path $driveDir 'sub')
+Push-Location -LiteralPath $driveDir
+$driveDir = (Get-Location).ProviderPath   # the long form; %TEMP% can be an 8.3 path
+Pop-Location
+[System.IO.File]::WriteAllText((Join-Path $driveDir 'pk-fn.cmd'), "@echo pk-fn ran in %CD%`r`n")
+function Test-HarnessFunctionDrive {
+    param([string]$Root)
+    $null = New-PSDrive -Name PkFnDrive -PSProvider FileSystem -Root $Root
+    $sub = Join-Path $Root 'sub'
+    $wrong = [System.Collections.Generic.List[string]]::new()
+    $check = {
+        param($what, $got)
+        if (([string]$got).Trim() -ine $sub) { $wrong.Add($what + '=' + ([string]$got).Trim()) }
+    }
+    try { & $check 'timeout' (Invoke-PkProcessWithTimeout -FilePath $cmdExe -Arguments '/c cd' -WorkingDirectory 'PkFnDrive:\sub').Stdout } catch { $wrong.Add('timeout threw') }
+    try {
+        $started = Start-PkProcess -FilePath $cmdExe -Arguments '/c cd' -WorkingDirectory 'PkFnDrive:\sub'
+        $null = Wait-PkProcess -Process $started['Proc'] -TimeoutMs 10000
+        & $check 'start' (Complete-PkProcess -Job $started -Dispose $true).Stdout
+    } catch { $wrong.Add('start threw') }
+    $batch = Invoke-PkProcessBatch -Commands @(@{ FilePath = $cmdExe; Arguments = '/c cd'; WorkingDirectory = 'PkFnDrive:\sub' })
+    & $check 'batch' $batch.Results[0].Stdout
+    $inRun = Invoke-PkRun { Invoke-PkProcessBatch -Commands @(@{ FilePath = $cmdExe; Arguments = '/c cd'; WorkingDirectory = 'PkFnDrive:\sub' }) }
+    & $check 'batch in Invoke-PkRun' $inRun.Results[0].Stdout
+    $feed = @{ Given = $false }
+    $out = @{ Text = $null }
+    $null = Invoke-PkProcessDispatch -MaxConcurrent 1 `
+        -GroupProvider { if ($feed.Given) { return $null }; $feed.Given = $true; return 'g' } `
+        -JobBuilder { param($g) return @(@{ FilePath = $cmdExe; Arguments = '/c cd'; WorkingDirectory = 'PkFnDrive:\sub' }) } `
+        -JobFinalize { param($j, $p) $out.Text = (Complete-PkProcess -Job $j).Stdout }
+    & $check 'dispatch' $out.Text
+    $fileText = $null
+    try { $fileText = (Invoke-PkProcessWithTimeout -FilePath 'PkFnDrive:\pk-fn.cmd').Stdout.Trim() } catch { $fileText = [string]$_ }
+    return [pscustomobject]@{ Wrong = ($wrong -join ', '); FileText = $fileText }
+}
+try { $fnDrive = Test-HarnessFunctionDrive -Root $driveDir } finally { Remove-Item -LiteralPath $driveDir -Recurse -Force -ErrorAction SilentlyContinue }
+Test-Assert ($fnDrive.Wrong -eq '') ("a WorkingDirectory on a drive made inside the calling function works from every entry point (wrong: " + $fnDrive.Wrong + ")")
+Test-Assert ($fnDrive.FileText -like 'pk-fn ran in *') ("and so does a FilePath on that drive (" + $fnDrive.FileText + ")")
+$noDrive = $null
+try { $null = Invoke-PkProcessWithTimeout -FilePath $cmdExe -Arguments '/c cd' -WorkingDirectory 'PkNoSuchDrive:\x' } catch { $noDrive = [string]$_ }
+Test-Assert ($noDrive -like '*could not start*') "a drive that doesn't exist anywhere still fails with a clear start error"
+# PowerShell treats curly quotes as string delimiters too, so a path can't be
+# allowed to end the literal it's embedded in when looked up in the caller's session.
+$curly = [string][char]0x2019
+$global:pkHarnessInjected = $false
+try { $null = Invoke-PkProcessWithTimeout -FilePath $cmdExe -Arguments '/c cd' -WorkingDirectory ('PkNoDrive' + $curly + '); $global:pkHarnessInjected = $true; (' + $curly + ':\x') } catch { $null = $_ }   # failing to start is expected here; only the flag matters
+$injected = $global:pkHarnessInjected
+Remove-Variable -Name pkHarnessInjected -Scope Global
+Test-Assert (-not $injected) "a path with a curly quote stays a path when it's looked up in the caller's session"
+Write-Host ""
+
 Set-PkMessageHandler -Handler $null
 Reset-PkAbortState
 
