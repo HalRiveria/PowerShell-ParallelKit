@@ -682,9 +682,11 @@ function ConvertTo-PkArgumentString {
     # An argument with a space, tab, newline or quote is wrapped in quotes, its
     # quotes become \", and backslashes are doubled where they come before a quote.
     # These are the C runtime's rules, which most Windows programs use; cmd.exe /c
-    # parses its own way.
+    # parses its own way. The kit's -Arguments and Arguments values do this
+    # themselves when given a list.
     # .PARAMETER Arguments
-    # The arguments, in order.
+    # The arguments, in order. A $null one is left out; an empty string is passed
+    # as "".
     # .OUTPUTS
     # [string]
     # .EXAMPLE
@@ -695,13 +697,17 @@ function ConvertTo-PkArgumentString {
     # .NET Framework's ProcessStartInfo has no ArgumentList, hence this.
     param(
         [Parameter(Mandatory, Position = 0)]
+        [AllowNull()]
         [AllowEmptyCollection()]
         [AllowEmptyString()]
-        [string[]]$Arguments
+        # Not [string[]]: binding an array held in a variable to that turns a
+        # $null element into '' before it can be left out.
+        [object[]]$Arguments
     )
     $parts = [System.Collections.Generic.List[string]]::new()
-    foreach ($arg in $Arguments) {
-        if ($null -eq $arg) { $arg = '' }
+    foreach ($item in $Arguments) {
+        if ($null -eq $item) { continue }
+        $arg = [string]$item
         if ($arg.Length -gt 0 -and $arg.IndexOfAny([char[]]@(' ', "`t", "`n", "`v", '"')) -lt 0) {
             $parts.Add($arg)
             continue
@@ -727,6 +733,20 @@ function ConvertTo-PkArgumentString {
         $parts.Add($sb.ToString())
     }
     return ($parts -join ' ')
+}
+
+function Resolve-PkArguments {
+    # -Arguments / Arguments as given -> the command line. A string is used as
+    # written; a list is quoted one argument per element, so a path with a space
+    # stays whole (a plain [string] cast would join it with spaces, or $OFS).
+    param($Arguments)
+    if ($null -eq $Arguments) { return '' }
+    if ($Arguments -is [string]) { return $Arguments }
+    if ($Arguments -is [System.Collections.IDictionary]) {
+        throw ("Arguments must be one string or a list of arguments (got a " + $Arguments.GetType().Name + ").")
+    }
+    if ($Arguments -is [System.Collections.IEnumerable]) { return (ConvertTo-PkArgumentString -Arguments @($Arguments)) }
+    return [string]$Arguments
 }
 
 function Resolve-PkEncoding {
@@ -804,7 +824,8 @@ function Start-PkProcess {
     # drives like Data:\ or ~ work. A bare name (tool.exe) is found the way Windows
     # finds programs, mostly on PATH.
     # .PARAMETER Arguments
-    # Its command line as one string (see ConvertTo-PkArgumentString).
+    # Its command line: one string, passed exactly as written, or a list, each
+    # element one argument, quoted for you (see ConvertTo-PkArgumentString).
     # .PARAMETER WorkingDirectory
     # Where to run it. Default: your current location. Read as PowerShell reads
     # paths, so a relative path is relative to your current location, and drives
@@ -817,7 +838,7 @@ function Start-PkProcess {
     param(
         [Parameter(Mandatory)]
         [string]$FilePath,
-        [string]$Arguments = "",
+        $Arguments = "",
         [string]$WorkingDirectory = "",
         $OutputEncoding = $null
     )
@@ -833,12 +854,13 @@ function Start-PkProcessCore {
     param(
         [Parameter(Mandatory)]
         [string]$FilePath,
-        [string]$Arguments = "",
+        $Arguments = "",
         [string]$WorkingDirectory = "",
         $OutputEncoding = $null,
         [System.Management.Automation.SessionState]$CallerState
     )
     $encoding = Resolve-PkEncoding -Encoding $OutputEncoding
+    $commandLine = Resolve-PkArguments -Arguments $Arguments
     # Self-starting: a caller who never ran Initialize-ParallelKit still
     # gets children that die with the script, and output reads that
     # aren't starved of threads. Both are cheap no-ops once done.
@@ -847,7 +869,7 @@ function Start-PkProcessCore {
 
     $psi = [System.Diagnostics.ProcessStartInfo]::new()
     $psi.FileName               = $FilePath
-    $psi.Arguments              = $Arguments
+    $psi.Arguments              = $commandLine
     $psi.UseShellExecute        = $false
     if ($null -ne $encoding) {
         $psi.StandardOutputEncoding = $encoding
@@ -1116,7 +1138,8 @@ function Invoke-PkProcessWithTimeout {
     # .PARAMETER FilePath
     # The program to run.
     # .PARAMETER Arguments
-    # Its command line as one string (see ConvertTo-PkArgumentString).
+    # Its command line: one string, passed exactly as written, or a list, each
+    # element one argument, quoted for you (see ConvertTo-PkArgumentString).
     # .PARAMETER TimeoutMs
     # The time limit in milliseconds (default 60000).
     # .PARAMETER StreamTimeoutMs
@@ -1135,7 +1158,7 @@ function Invoke-PkProcessWithTimeout {
     param(
         [Parameter(Mandatory)]
         [string]$FilePath,
-        [string]$Arguments = "",
+        $Arguments = "",
         [int]$TimeoutMs = 60000,
         [int]$StreamTimeoutMs = 15000,
         [string]$WorkingDirectory = "",
@@ -1187,10 +1210,11 @@ function Invoke-PkProcessDispatch {
     #
     # The dispatcher keeps its own state on each job hashtable. Don't use these keys
     # for anything else: GroupKey, SlotReleased, Proc, StdoutTask, StderrTask,
-    # Stopwatch, TimeLimit, TimedOut. It also sets Group to the job's group, unless
-    # the job already has a Group of its own. The default starter reads FilePath,
-    # Arguments, WorkingDirectory and OutputEncoding from the job. A job's
-    # TimeoutSeconds key overrides -TimeoutSeconds.
+    # Stopwatch, TimeLimit, TimedOut, StartFailureReported. It also sets Group to
+    # the job's group, unless the job already has a Group of its own. The default
+    # starter reads FilePath, Arguments (a string as written, or a list quoted one
+    # argument per element), WorkingDirectory and OutputEncoding from the job. A
+    # job's TimeoutSeconds key overrides -TimeoutSeconds.
     # .PARAMETER GroupProvider
     # { } returning the next group, or $null when there are no more.
     # .PARAMETER JobBuilder
@@ -1300,7 +1324,7 @@ function Invoke-PkProcessDispatch {
         $pkCallerState = $PSCmdlet.SessionState
         $pkJobStarter = {
             param($pkJob)
-            $pkStarted = Start-PkProcessCore -CallerState $pkCallerState -FilePath $pkJob['FilePath'] -Arguments ([string]$pkJob['Arguments']) -WorkingDirectory ([string]$pkJob['WorkingDirectory']) -OutputEncoding $pkJob['OutputEncoding']
+            $pkStarted = Start-PkProcessCore -CallerState $pkCallerState -FilePath $pkJob['FilePath'] -Arguments $pkJob['Arguments'] -WorkingDirectory ([string]$pkJob['WorkingDirectory']) -OutputEncoding $pkJob['OutputEncoding']
             $pkJob['Proc'] = $pkStarted.Proc; $pkJob['StdoutTask'] = $pkStarted.StdoutTask; $pkJob['StderrTask'] = $pkStarted.StderrTask
             $pkJob['Stopwatch'] = $pkStarted.Stopwatch
             return $pkJob
@@ -1925,7 +1949,7 @@ function Invoke-PkProcessBatch {
                 & $pkReportStartFailure $pkC $_
                 continue
             }
-            $pkJobs.Add(@{ FilePath = $pkC['FilePath']; Arguments = [string]$pkC['Arguments']; WorkingDirectory = [string]$pkC['WorkingDirectory']; OutputEncoding = $pkEncoding; TimeoutSeconds = $pkC['TimeoutSeconds']; Command = $pkC })
+            $pkJobs.Add(@{ FilePath = $pkC['FilePath']; Arguments = $pkC['Arguments']; WorkingDirectory = [string]$pkC['WorkingDirectory']; OutputEncoding = $pkEncoding; TimeoutSeconds = $pkC['TimeoutSeconds']; Command = $pkC })
         }
         return $pkJobs
     }.GetNewClosure()
@@ -1984,7 +2008,7 @@ function Get-PkWorkerSafeFunctionNames {
     return @('Write-PkMessage', 'Test-PkAbortSignal', 'Test-PkCancelRequested', 'Initialize-PkThreadPool', 'Stop-PkProcessTree', 'Stop-PkJobProcesses', 'Resolve-PkEncoding',
              'Start-PkProcess', 'Wait-PkProcess', 'Wait-PkRunningJobs', 'Complete-PkProcess', 'Invoke-PkProcessWithTimeout',
              'Invoke-PkProcessDispatch', 'Invoke-PkProcessDispatchCore', 'Invoke-PkProcessBatch',
-             'Register-PkCancellationSource', 'Unregister-PkCancellationSource', 'New-PkBatchResult', 'ConvertTo-PkArgumentString', 'Get-PkForceStopReason', 'Resolve-PkFileSystemPath', 'Add-PkDispatchGroupJobs', 'Start-PkProcessCore', 'Get-PkJobTimeLimit', 'Stop-PkTimedOutJob', 'Get-PkStartFailureCause')
+             'Register-PkCancellationSource', 'Unregister-PkCancellationSource', 'New-PkBatchResult', 'ConvertTo-PkArgumentString', 'Get-PkForceStopReason', 'Resolve-PkFileSystemPath', 'Add-PkDispatchGroupJobs', 'Start-PkProcessCore', 'Get-PkJobTimeLimit', 'Stop-PkTimedOutJob', 'Get-PkStartFailureCause', 'Resolve-PkArguments')
 }
 
 function Get-PkHandlerParamCount {

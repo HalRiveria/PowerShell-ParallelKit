@@ -121,7 +121,7 @@ $batch = Invoke-PkRun { Invoke-PkProcessBatch @batchParams }
 
 Long parameter lists in these examples use splatting (`@batchParams`) instead of trailing backticks: it's easier to read, and a stray space after a backtick can't break it.
 
-Each command is a hashtable with `FilePath`, `Arguments` and optionally `WorkingDirectory`, plus any keys of your own. `Arguments` is passed to the program as one string, exactly as written. `ConvertTo-PkArgumentString @(...)` builds that string from a list, quoting each argument so the program gets exactly that list back, spaces, quotes and trailing backslashes included. It follows the rules most Windows programs use; `cmd.exe /c` parses its own way. Programs run hidden, with their output captured.
+Each command is a hashtable with `FilePath`, `Arguments` and optionally `WorkingDirectory`, plus any keys of your own. `Arguments` is either one string, passed to the program exactly as written, or a list, where each element is one argument: `Arguments = @($in, $out)` works with spaces in the paths. A list is quoted the way `ConvertTo-PkArgumentString @(...)` quotes it, so the program gets exactly that list back, spaces, quotes and trailing backslashes included, and `$null` elements are left out. Quotes inside an element are passed on as quote characters, so don't pre-quote list elements. It follows the rules most Windows programs use; `cmd.exe /c` parses its own way, so give it one string. Programs run hidden, with their output captured.
 
 Programs run in your current location (`Get-Location`) unless a command says otherwise, and a relative `WorkingDirectory`, or a `FilePath` with a folder in it like `.\tools\cjxl.exe`, is relative to that location too. Drives PowerShell knows, like `~` or one made with `New-PSDrive`, work in both. A bare name like `cjxl.exe` is found the way Windows finds programs, mostly on `PATH`. A `.bat` or `.cmd` program can't run in a network-share (`\\server\share`) folder: `cmd.exe` falls back to `C:\Windows` there, so give such commands a local `WorkingDirectory`.
 
@@ -260,7 +260,7 @@ Callbacks: a plain `{ ... }` callback sees your variables and functions from whe
 | Function | Use |
 |---|---|
 | `Invoke-PkProcessWithTimeout -FilePath -Arguments -TimeoutMs` | Run one program and wait, with a hard time limit (default 60s). Returns an object with `ExitCode`, `Stdout`, `Stderr`, `StreamTimedOut` and `StreamError`. If it overruns, or the run is aborted, the program is killed and this **throws**; add `-IgnoreAbort` for a cleanup step that must finish anyway. |
-| `ConvertTo-PkArgumentString @(args)` | Join a list of arguments into one correctly quoted command line, for any `-Arguments` / `Arguments` value. |
+| `ConvertTo-PkArgumentString @(args)` | Join a list of arguments into one correctly quoted command line. `-Arguments` / `Arguments` also take the list directly and quote it the same way. |
 | `Start-PkProcess -FilePath -Arguments` | Start one hidden, with output captured in the background. Returns `@{ Proc; StdoutTask; StderrTask; Stopwatch }`; throws if it can't start. |
 | `Wait-PkProcess -Process -TimeoutMs` | Wait for exit with a timeout that can't overrun. Returns `$true` if it exited. |
 | `Complete-PkProcess -Job` | Collect exit code and output from a finished one (`-Job` is what `Start-PkProcess` returned). Same result as `Invoke-PkProcessWithTimeout`. |

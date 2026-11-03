@@ -2617,6 +2617,104 @@ Test-Assert ((Get-StartMessageCount "*$missing*") -eq 2) ("and collapsed there (
 Reset-Harness
 Write-Host ""
 
+Write-Host "=== AE: a list in Arguments is quoted, one argument per element ===" -ForegroundColor Cyan
+
+$argvExe = Join-Path $env:TEMP ("pk-argv-" + [guid]::NewGuid().ToString("N") + ".exe")
+$argvSrc = [System.IO.Path]::ChangeExtension($argvExe, '.cs')
+[System.IO.File]::WriteAllText($argvSrc, 'public static class PkArgv { public static void Main(string[] args) { foreach (string a in args) { System.Console.WriteLine("[" + a + "]"); } } }')
+$csc = $null
+try { $csc = Invoke-PkProcessWithTimeout -FilePath $cscExe -Arguments (ConvertTo-PkArgumentString @('/nologo', ('/out:' + $argvExe), $argvSrc)) } catch { Write-Host "  csc.exe failed to run: $_" }
+[System.IO.File]::Delete($argvSrc)
+$compiled = ($null -ne $csc -and $csc.ExitCode -eq 0 -and [System.IO.File]::Exists($argvExe))
+Test-Assert $compiled "the argument-printing test program compiles"
+if ($compiled) {
+    function Get-ArgvText { param($Stdout) return (@(([string]$Stdout).Split([string[]]@("`r`n"), [System.StringSplitOptions]::RemoveEmptyEntries)) -join '') }
+    function Get-BatchArgvText {
+        param($ArgumentValue)
+        $batch = Invoke-PkProcessBatch -Commands @(@{ FilePath = $argvExe; Arguments = $ArgumentValue }) -MaxConcurrent 1
+        return (Get-ArgvText $batch.Results[0].Stdout)
+    }
+    $spaced = @('C:\My Files\a.png', 'out.jxl')
+    $spacedText = '[C:\My Files\a.png][out.jxl]'
+
+    # All four entry points.
+    $text = Get-BatchArgvText $spaced
+    Test-Assert ($text -eq $spacedText) ("batch: an array is one argument per element (" + $text + ")")
+    $feedArgs = @{ Given = $false }
+    $gotArgs = @{ Text = $null }
+    $null = Invoke-PkProcessDispatch -MaxConcurrent 1 `
+        -GroupProvider { if ($feedArgs.Given) { return $null }; $feedArgs.Given = $true; return 'g' }.GetNewClosure() `
+        -JobBuilder { param($g) return @(@{ FilePath = $argvExe; Arguments = $spaced }) }.GetNewClosure() `
+        -JobFinalize { param($job, $q) $gotArgs.Text = (Complete-PkProcess -Job $job).Stdout }.GetNewClosure()
+    $text = Get-ArgvText $gotArgs.Text
+    Test-Assert ($text -eq $spacedText) ("dispatcher: an array is one argument per element (" + $text + ")")
+    $text = $null
+    try { $text = Get-ArgvText (Invoke-PkProcessWithTimeout -FilePath $argvExe -Arguments $spaced).Stdout } catch { $text = "threw: $_" }
+    Test-Assert ($text -eq $spacedText) ("Invoke-PkProcessWithTimeout takes an array (" + $text + ")")
+    $text = $null
+    try {
+        $started = Start-PkProcess -FilePath $argvExe -Arguments $spaced
+        $null = Wait-PkProcess -Process $started['Proc'] -TimeoutMs 10000
+        $text = Get-ArgvText (Complete-PkProcess -Job $started).Stdout
+    } catch { $text = "threw: $_" }
+    Test-Assert ($text -eq $spacedText) ("Start-PkProcess takes an array (" + $text + ")")
+
+    # The kinds of list.
+    $list = [System.Collections.Generic.List[string]]::new(); $list.Add('C:\My Files\a.png'); $list.Add('out.jxl')
+    $started = Start-PkProcess -FilePath $argvExe -Arguments $list
+    $null = Wait-PkProcess -Process $started['Proc'] -TimeoutMs 10000
+    $text = Get-ArgvText (Complete-PkProcess -Job $started).Stdout
+    Test-Assert ($text -eq $spacedText) ("a List[string] is quoted too (" + $text + ")")
+    $arrayList = [System.Collections.ArrayList]::new(); $null = $arrayList.Add('two words')
+    Test-Assert ((Get-BatchArgvText $arrayList) -eq '[two words]') "so is an ArrayList, even of one element"
+    Test-Assert ((Get-BatchArgvText ([string[]]@('two words', 'x'))) -eq '[two words][x]') "and a [string[]]"
+    Test-Assert ((Get-BatchArgvText @('two words')) -eq '[two words]') "a single-element array stays one argument"
+    Test-Assert ((Get-BatchArgvText @(1, 2.5, 'x')) -eq '[1][2.5][x]') "numbers in a list become arguments"
+    Test-Assert ((Get-BatchArgvText @()) -eq '') "an empty list is no arguments"
+    Test-Assert ((Get-BatchArgvText $null) -eq '') "`$null is no arguments"
+    Test-Assert ((Get-BatchArgvText 7) -eq '[7]') "a single number is one argument"
+
+    # $null elements are dropped, the same from every route; '' is an argument.
+    Test-Assert ((Get-BatchArgvText @('a', $null, 'b')) -eq '[a][b]') "a `$null element is dropped"
+    Test-Assert ((Get-BatchArgvText @('a', '', 'b')) -eq '[a][][b]') "an empty string stays an argument"
+    Test-Assert ((ConvertTo-PkArgumentString @('a', $null, 'b')) -eq 'a b') "ConvertTo-PkArgumentString drops a `$null element too"
+    $withNull = @('a', $null, 'b')
+    Test-Assert ((ConvertTo-PkArgumentString $withNull) -eq 'a b') "and from a variable, where binding used to turn it into `"`""
+    Test-Assert ((ConvertTo-PkArgumentString $null) -eq '') "and takes `$null itself"
+    Test-Assert ((ConvertTo-PkArgumentString 'two words') -eq '"two words"' -and (ConvertTo-PkArgumentString @(1, 'x y')) -eq '1 "x y"') "it still takes one string, and non-strings"
+
+    # A string is still exactly as written.
+    Test-Assert ((Get-BatchArgvText '"C:\My Files\a.png" out.jxl') -eq $spacedText) "a string is still passed exactly as written"
+    # The documented change: list elements are values, not pieces of a command line.
+    Test-Assert ((Get-BatchArgvText @('"two words"', 'x')) -eq '["two words"][x]') "quotes already in a list element reach the program as quotes"
+
+    # The join used to follow $OFS.
+    $OFS = ','
+    try { $text = Get-BatchArgvText $spaced } finally { Remove-Variable -Name OFS }
+    Test-Assert ($text -eq $spacedText) ("`$OFS doesn't change a list (" + $text + ")")
+
+    # A hashtable is enumerable, but it isn't a list of arguments.
+    Reset-Harness
+    $hashBatch = Invoke-PkProcessBatch -Commands @(@{ FilePath = $argvExe; Arguments = @{ a = 1 } }) -MaxConcurrent 1
+    Test-Assert ($hashBatch.Results[0].StartError -like '*Arguments must be*' -and $null -eq $hashBatch.Results[0].ExitCode) "a hashtable in Arguments is that command's StartError"
+    $thrown = $null
+    try { $null = Invoke-PkProcessWithTimeout -FilePath $argvExe -Arguments @{ a = 1 } } catch { $thrown = [string]$_ }
+    Test-Assert ($thrown -like '*Arguments must be*') "and a clear error from the direct functions"
+
+    # Inside a worker, where the kit's functions are plain copies.
+    Reset-Harness
+    $argWorker = [System.Collections.Generic.List[object]]::new()
+    $argOut = Invoke-PkRunspaceJobs -MaxParallel 1 -JobParams (New-JobList -Jobs @(@{ Exe = $argvExe })) -ResultHandler { param($r) $argWorker.Add($r) }.GetNewClosure() -WorkerScript {
+        param([string]$Exe)
+        $batch = Invoke-PkProcessBatch -Commands @(@{ FilePath = $Exe; Arguments = @('two words', 'x') }) -MaxConcurrent 1
+        return @{ Stdout = $batch.Results[0].Stdout; StartError = $batch.Results[0].StartError }
+    }
+    Test-Assert ($argOut.CrashedCount -eq 0 -and $argWorker.Count -eq 1 -and (Get-ArgvText $argWorker[0]['Stdout']) -eq '[two words][x]') "a list works inside a worker"
+    try { [System.IO.File]::Delete($argvExe) } catch { }  # temp file only; best effort
+}
+Reset-Harness
+Write-Host ""
+
 Set-PkMessageHandler -Handler $null
 Reset-PkAbortState
 
