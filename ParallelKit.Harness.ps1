@@ -2357,6 +2357,168 @@ Test-Assert ($workerWait.Count -eq 1 -and $workerWait[0] -eq 2) "a batch inside 
 Reset-Harness
 Write-Host ""
 
+# ==============================================================================
+Write-Host "=== AC: the dispatcher's per-job time limit ===" -ForegroundColor Cyan
+
+function Invoke-LimitGroup {
+    # One group of jobs through the dispatcher. Logs each finalized job.
+    param([hashtable[]]$Jobs, [hashtable]$Extra = @{})
+    $log = [System.Collections.Generic.List[object]]::new()
+    $feed = @{ Given = $false }
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $dispatchParams = @{
+        MaxConcurrent = 6; AbortTimeoutSeconds = 30
+        GroupProvider = { if ($feed.Given) { return $null }; $feed.Given = $true; return 'g' }.GetNewClosure()
+        JobBuilder    = { param($g) return $Jobs }.GetNewClosure()
+        JobFinalize   = {
+            param($job, $q)
+            $done = $null
+            if ($job['Proc'] -is [System.Diagnostics.Process]) { $done = Complete-PkProcess -Job $job }
+            $exit = $null
+            if ($null -ne $done) { $exit = $done.ExitCode }
+            $log.Add([pscustomobject]@{ Name = $job['Name']; TimedOut = $job['TimedOut']; ExitCode = $exit; At = $sw.Elapsed.TotalSeconds })
+            if ($job['Retry'] -gt 0) { $job['Retry']--; $q.Enqueue($job) }
+        }.GetNewClosure()
+    }
+    foreach ($k in $Extra.Keys) { $dispatchParams[$k] = $Extra[$k] }
+    $result = $null
+    $problem = $null
+    try { $result = Invoke-PkProcessDispatch @dispatchParams } catch { $problem = [string]$_ }
+    return @{ Log = $log; Result = $result; Problem = $problem; Secs = $sw.Elapsed.TotalSeconds }
+}
+function Get-LimitEntry { param($Run, [string]$Name) return ,@($Run.Log | Where-Object { $_.Name -eq $Name }) }
+function Get-LimitPingCount { param([int]$N) return @(Get-CimInstance Win32_Process -Filter "Name = 'PING.EXE'" | Where-Object { $_.CommandLine -like ("*-n " + $N + " 127.0.0.1*") }).Count }
+
+# -TimeoutSeconds, and a job's own key overriding it in both directions.
+$limitRun = Invoke-LimitGroup -Extra @{ TimeoutSeconds = 2 } -Jobs @(
+    @{ Name = 'slow'; FilePath = $cmdExe; Arguments = ('/c ""' + $pingExe + '" -n 37 127.0.0.1"') },
+    @{ Name = 'fast'; FilePath = $cmdExe; Arguments = '/c exit 0' },
+    @{ Name = 'optout'; FilePath = $pingExe; Arguments = '-n 4 127.0.0.1'; TimeoutSeconds = 0 },
+    @{ Name = 'shorter'; FilePath = $pingExe; Arguments = '-n 30 127.0.0.1'; TimeoutSeconds = 0.5 })
+$slow = Get-LimitEntry $limitRun 'slow'; $fast = Get-LimitEntry $limitRun 'fast'; $optout = Get-LimitEntry $limitRun 'optout'; $shorter = Get-LimitEntry $limitRun 'shorter'
+Test-Assert ($null -eq $limitRun.Problem -and $slow.Count -eq 1 -and $slow[0].TimedOut -eq $true -and $slow[0].ExitCode -ne 0 -and $slow[0].At -ge 2 -and $slow[0].At -lt 8) ("-TimeoutSeconds kills an overrunning job, and -JobFinalize sees TimedOut (problem: " + $limitRun.Problem + ")")
+Test-Assert ((Get-LimitPingCount 37) -eq 0) "and what it started is killed with it"
+Test-Assert ($fast.Count -eq 1 -and $fast[0].TimedOut -eq $false -and $fast[0].ExitCode -eq 0) "a job that finishes in time has TimedOut = `$false"
+Test-Assert ($optout.Count -eq 1 -and $optout[0].TimedOut -eq $false -and $optout[0].ExitCode -eq 0 -and $optout[0].At -ge 2.5) "a job's TimeoutSeconds = 0 opts out of -TimeoutSeconds"
+Test-Assert ($shorter.Count -eq 1 -and $shorter[0].TimedOut -eq $true -and $shorter[0].At -lt 1.9) "a job's own TimeoutSeconds beats -TimeoutSeconds, and can be fractional"
+
+# A job's key with no -TimeoutSeconds; a job without the key isn't limited.
+$limitRun = Invoke-LimitGroup -Jobs @(
+    @{ Name = 'limited'; FilePath = $pingExe; Arguments = '-n 30 127.0.0.1'; TimeoutSeconds = 1 },
+    @{ Name = 'free'; FilePath = $pingExe; Arguments = '-n 3 127.0.0.1' })
+$limited = Get-LimitEntry $limitRun 'limited'; $free = Get-LimitEntry $limitRun 'free'
+Test-Assert ($limited.Count -eq 1 -and $limited[0].TimedOut -eq $true -and $limited[0].At -lt 5) ("a job's TimeoutSeconds works without -TimeoutSeconds (problem: " + $limitRun.Problem + ")")
+Test-Assert ($free.Count -eq 1 -and $free[0].TimedOut -eq $false -and $free[0].ExitCode -eq 0) "and a job without the key runs to its end"
+
+# Still in force while an abort waits for running jobs.
+$limitCts = [System.Threading.CancellationTokenSource]::new()
+$limitCts.CancelAfter(500)
+$limitCleaned = [System.Collections.Generic.List[object]]::new()
+$limitRun = Invoke-LimitGroup -Jobs @(@{ Name = 'drain'; FilePath = $pingExe; Arguments = '-n 30 127.0.0.1' }) -Extra @{ TimeoutSeconds = 2; CancelToken = $limitCts.Token; JobAbortCleanup = { param($job) $limitCleaned.Add($job['Name']) }.GetNewClosure() }
+$drain = Get-LimitEntry $limitRun 'drain'
+Test-Assert ($null -ne $limitRun.Result -and $limitRun.Result.Aborted -and $limitRun.Result.ForceKilledCount -eq 0 -and $drain.Count -eq 1 -and $drain[0].TimedOut -eq $true -and $limitCleaned.Count -eq 0 -and $limitRun.Secs -lt 10) ("a limit fires during an abort's wait, and the job is finalized (" + [int]$limitRun.Secs + "s, problem: " + $limitRun.Problem + ")")
+$limitCts.Dispose()
+
+# A starter that sets no Stopwatch is still timed.
+$noWatchStarter = { param($job) $s = Start-PkProcess -FilePath $job['FilePath'] -Arguments $job['Arguments']; $job['Proc'] = $s.Proc; $job['StdoutTask'] = $s.StdoutTask; $job['StderrTask'] = $s.StderrTask; return $job }
+$limitRun = Invoke-LimitGroup -Jobs @(@{ Name = 'nowatch'; FilePath = $pingExe; Arguments = '-n 30 127.0.0.1' }) -Extra @{ TimeoutSeconds = 1; JobStarter = $noWatchStarter }
+$noWatch = Get-LimitEntry $limitRun 'nowatch'
+Test-Assert ($noWatch.Count -eq 1 -and $noWatch[0].TimedOut -eq $true -and $noWatch[0].At -lt 5) ("a starter with no Stopwatch is still timed (problem: " + $limitRun.Problem + ")")
+
+# A job with no real process is left to its own -JobPollCompleted.
+$customClock = [System.Diagnostics.Stopwatch]::StartNew()
+$limitRun = Invoke-LimitGroup -Jobs @(@{ Name = 'custom' }) -Extra @{
+    TimeoutSeconds = 1
+    JobStarter = { param($job) $job['Proc'] = 'not a process'; return $job }
+    JobPollCompleted = { param($job) return ($customClock.Elapsed.TotalSeconds -ge 1.8) }.GetNewClosure()
+}
+$custom = Get-LimitEntry $limitRun 'custom'
+Test-Assert ($null -eq $limitRun.Problem -and $null -ne $limitRun.Result -and $custom.Count -eq 1 -and $custom[0].TimedOut -eq $false -and $custom[0].At -ge 1.7) ("a job whose .Proc isn't a process isn't timed (problem: " + $limitRun.Problem + ")")
+
+# A program that can't be stopped gets one try and one warning, not a taskkill
+# on every pass. A Process that was never started can't be stopped or read.
+Reset-Harness
+$stuckClock = [System.Diagnostics.Stopwatch]::StartNew()
+$limitRun = Invoke-LimitGroup -Jobs @(@{ Name = 'stuck' }) -Extra @{
+    TimeoutSeconds = 0.2
+    JobStarter = { param($job) $job['Proc'] = [System.Diagnostics.Process]::new(); return $job }
+    JobPollCompleted = { param($job) return ($stuckClock.Elapsed.TotalSeconds -ge 1) }.GetNewClosure()
+    JobFinalize = { param($job, $q) }
+}
+$stuckWarnings = @($script:messages | Where-Object { $_.Level -eq 'Warn' -and $_.Message -like "*couldn't be stopped*" }).Count
+Test-Assert ($null -eq $limitRun.Problem -and $null -ne $limitRun.Result -and $stuckWarnings -eq 1) ("a program that can't be stopped gets one warning and the run carries on (warnings " + $stuckWarnings + ", problem: " + $limitRun.Problem + ")")
+Reset-Harness
+
+# Fractional, and under 0.5 s: not rounded to 0, which would mean no limit.
+$limitRun = Invoke-LimitGroup -Extra @{ TimeoutSeconds = 0.4 } -Jobs @(@{ Name = 'fraction'; FilePath = $pingExe; Arguments = '-n 30 127.0.0.1' })
+$fraction = Get-LimitEntry $limitRun 'fraction'
+Test-Assert ($fraction.Count -eq 1 -and $fraction[0].TimedOut -eq $true -and $fraction[0].At -lt 5) "a fractional -TimeoutSeconds isn't rounded away"
+$fractionBatch = Invoke-PkProcessBatch -TimeoutSeconds 0.4 -Commands @(@{ FilePath = $pingExe; Arguments = '-n 30 127.0.0.1' })
+Test-Assert ($fractionBatch.Results[0].TimedOut -eq $true) "and neither is the batch's"
+
+# On the main thread too, a plain callback reads the caller's $TimeoutSeconds:
+# reading the kit's 0 here would finish the job at once.
+$TimeoutSeconds = 1.5
+$limitRun = Invoke-LimitGroup -Jobs @(@{ Name = 'plain'; FilePath = $cmdExe; Arguments = '/c exit 0' }) -Extra @{
+    TimeoutSeconds = 30
+    JobPollCompleted = { param($job) $job['Proc'].HasExited -and $job['Stopwatch'].Elapsed.TotalSeconds -ge $TimeoutSeconds }
+}
+Remove-Variable -Name TimeoutSeconds
+$plain = Get-LimitEntry $limitRun 'plain'
+Test-Assert ($plain.Count -eq 1 -and $plain[0].At -ge 1.4 -and $plain[0].At -lt 10) ("a plain -JobPollCompleted reads the caller's `$TimeoutSeconds, not the dispatcher's (finished at " + $(if ($plain.Count) { [Math]::Round($plain[0].At, 1) }) + " s)")
+
+# A bad key fails that job's start, before anything runs.
+Reset-Harness
+$limitRun = Invoke-LimitGroup -Jobs @(
+    @{ Name = 'word'; FilePath = $pingExe; Arguments = '-n 33 127.0.0.1'; TimeoutSeconds = 'soon' },
+    @{ Name = 'minus'; FilePath = $pingExe; Arguments = '-n 33 127.0.0.1'; TimeoutSeconds = -1 },
+    @{ Name = 'nan'; FilePath = $pingExe; Arguments = '-n 33 127.0.0.1'; TimeoutSeconds = 'NaN' })
+$badKeyMessages = @($script:messages | Where-Object { $_.Level -eq 'Error' -and $_.Message -like "*TimeoutSeconds must be*" }).Count
+Test-Assert ($null -ne $limitRun.Result -and $limitRun.Result.JobStarterFailedCount -eq 3 -and $limitRun.Log.Count -eq 0 -and $badKeyMessages -eq 3) ("a bad TimeoutSeconds key is a failed start with a clear message (messages " + $badKeyMessages + ", problem: " + $limitRun.Problem + ")")
+Reset-Harness
+
+# A retry of a timed-out job gets a fresh clock.
+$limitRun = Invoke-LimitGroup -Jobs @(@{ Name = 'retry'; FilePath = $pingExe; Arguments = '-n 30 127.0.0.1'; Retry = 1 }) -Extra @{ TimeoutSeconds = 1 }
+$retried = Get-LimitEntry $limitRun 'retry'
+Test-Assert ($retried.Count -eq 2 -and $retried[0].TimedOut -and $retried[1].TimedOut -and ($retried[1].At - $retried[0].At) -ge 0.8) ("a retried job gets a fresh clock (" + $retried.Count + " runs, problem: " + $limitRun.Problem + ")")
+
+$limitRun = Invoke-LimitGroup -Jobs @(@{ Name = 'x'; FilePath = $cmdExe; Arguments = '/c exit 0' }) -Extra @{ TimeoutSeconds = -1 }
+Test-Assert ($null -ne $limitRun.Problem -and $limitRun.Problem -like '*-TimeoutSeconds must be*') "a negative -TimeoutSeconds is refused by the dispatcher"
+
+# The batch: a command's own key, and a bad one still gets a result.
+$keyBatch = Invoke-PkProcessBatch -MaxConcurrent 4 -TimeoutSeconds 1 -Commands @(
+    @{ Name = 'own'; FilePath = $pingExe; Arguments = '-n 30 127.0.0.1'; TimeoutSeconds = 0.5 },
+    @{ Name = 'optout'; FilePath = $pingExe; Arguments = '-n 3 127.0.0.1'; TimeoutSeconds = 0 },
+    @{ Name = 'inherit'; FilePath = $pingExe; Arguments = '-n 30 127.0.0.1' },
+    @{ Name = 'bad'; FilePath = $pingExe; Arguments = '-n 33 127.0.0.1'; TimeoutSeconds = 'soon' })
+$keyResult = @{}
+foreach ($r in $keyBatch.Results) { $keyResult[$r.Command['Name']] = $r }
+Test-Assert ($keyBatch.Results.Count -eq 4 -and $keyResult['own'].TimedOut -and $keyResult['inherit'].TimedOut) ("batch: a command's TimeoutSeconds key and -TimeoutSeconds both fire (" + $keyBatch.Results.Count + " results)")
+Test-Assert ($keyResult.ContainsKey('optout') -and -not $keyResult['optout'].TimedOut -and $keyResult['optout'].ExitCode -eq 0) "batch: a command's TimeoutSeconds = 0 opts out"
+Test-Assert ($keyResult.ContainsKey('bad') -and $keyResult['bad'].StartError -like '*TimeoutSeconds must be*' -and (Get-LimitPingCount 33) -eq 0) "batch: a bad TimeoutSeconds key is that command's StartError, and it doesn't run"
+Reset-Harness
+
+# Inside a worker, where the helpers are plain copies and a plain callback sees
+# the kit's frames: it must read the worker's own $TimeoutSeconds.
+$limitWorker = [System.Collections.Generic.List[object]]::new()
+$limitOut = Invoke-PkRunspaceJobs -MaxParallel 1 -JobParams (New-JobList -Jobs @(@{ PingExe = $pingExe })) -ResultHandler { param($r) $limitWorker.Add($r) }.GetNewClosure() -WorkerScript {
+    param([string]$PingExe)
+    $TimeoutSeconds = 99
+    $seen = @{ Value = $null }
+    $feed = @{ Given = $false }
+    $flags = [System.Collections.Generic.List[object]]::new()
+    $null = Invoke-PkProcessDispatch -MaxConcurrent 1 -TimeoutSeconds 1 `
+        -GroupProvider { if ($feed.Given) { return $null }; $feed.Given = $true; return 'g' }.GetNewClosure() `
+        -JobBuilder { param($g) return @(@{ FilePath = $PingExe; Arguments = '-n 30 127.0.0.1' }) }.GetNewClosure() `
+        -JobPollCompleted { param($job) $seen.Value = $TimeoutSeconds; $job['Proc'].HasExited } `
+        -JobFinalize { param($job, $q) $null = Complete-PkProcess -Job $job; $flags.Add($job['TimedOut']) }.GetNewClosure()
+    return @{ Flags = ($flags -join ','); Seen = $seen.Value }
+}
+Test-Assert ($limitOut.CrashedCount -eq 0 -and $limitWorker.Count -eq 1 -and $limitWorker[0]['Flags'] -eq 'True') "a time limit works inside a worker"
+Test-Assert ($limitWorker.Count -eq 1 -and $limitWorker[0]['Seen'] -eq 99) "and a plain callback there reads the worker's `$TimeoutSeconds, not the dispatcher's"
+Reset-Harness
+Write-Host ""
+
 Set-PkMessageHandler -Handler $null
 Reset-PkAbortState
 
