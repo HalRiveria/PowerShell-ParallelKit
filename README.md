@@ -129,14 +129,14 @@ Programs run in your current location (`Get-Location`) unless a command says oth
 
 - `Command` is your original command hashtable, so extra keys like `Source` above come back with it.
 - `ExitCode` is whatever the program returned. The kit doesn't treat a non-zero code as a failure; that's for you to decide.
-- `StartError` is set when the program couldn't be started (not found, say).
+- `StartError` is set when the program couldn't be started (not found, say). Every command is still tried and gets its own result, but repeats of the same failure for the same program print once, with a count at the end.
 - `Aborted` is `$true` for a command an abort killed or kept from starting.
 - `TimedOut` is `$true` for a program `-TimeoutSeconds` killed.
 - `StreamTimedOut` / `StreamError` mean the output may be incomplete. The output read gives up 15 seconds after the program exits, which only happens when a program it started is still holding the output open.
 
 `Results` is in the order commands finished, not the order you gave them. Use `Command` to match them up.
 
-`-OnComplete` runs as each command finishes, but only for commands that actually ran. Check `Results` for the ones that couldn't start or were aborted. Defaults: `-MaxConcurrent` 4, `-AbortTimeoutSeconds` 60 (how long Ctrl+C waits for running programs), `-TimeoutSeconds` 0 (no limit).
+`-OnComplete` runs as each command finishes, but only for commands that actually ran. Check `Results` for the ones that couldn't start or were aborted. A progress counter driven from `-OnComplete` won't reach the total if any did, so count from `$batch.Results` afterwards for the final numbers. Defaults: `-MaxConcurrent` 4, `-AbortTimeoutSeconds` 60 (how long Ctrl+C waits for running programs), `-TimeoutSeconds` 0 (no limit).
 
 `-TimeoutSeconds 600` kills any program still running after 10 minutes. Its result has `TimedOut = $true`, still goes through `-OnComplete`, and the rest of the batch carries on. The default, 0, means no limit. Any programs it started are killed with it. It can be fractional. A command's own `TimeoutSeconds` key overrides this for that command; 0 opts it out of the limit. A bad value there gives that command a `StartError`.
 
