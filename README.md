@@ -136,7 +136,7 @@ Programs run in your current location (`Get-Location`) unless a command says oth
 
 `Results` is in the order commands finished, not the order you gave them. Use `Command` to match them up.
 
-`-OnComplete` runs as each command finishes, but only for commands that actually ran. Check `Results` for the ones that couldn't start or were aborted. A progress counter driven from `-OnComplete` won't reach the total if any did, so count from `$batch.Results` afterwards for the final numbers. Defaults: `-MaxConcurrent` 4, `-AbortTimeoutSeconds` 60 (how long Ctrl+C waits for running programs), `-TimeoutSeconds` 0 (no limit).
+`-OnComplete` runs as each command finishes, but only for commands that actually ran. Check `Results` for the ones that couldn't start or were aborted. A progress counter driven from `-OnComplete` won't reach the total if any did, so count from `$batch.Results` afterwards for the final numbers. Defaults: `-MaxConcurrent` 4, `-AbortTimeoutSeconds` 60 (how long Ctrl+C waits for running programs), `-TimeoutSeconds` 0 (no limit). The runspace engine's names, `-MaxParallel` and `-DrainTimeoutSeconds`, work here too, and on the dispatcher.
 
 `-TimeoutSeconds 600` kills any program still running after 10 minutes. Its result has `TimedOut = $true`, still goes through `-OnComplete`, and the rest of the batch carries on. The default, 0, means no limit. Any programs it started are killed with it. It can be fractional. A command's own `TimeoutSeconds` key overrides this for that command; 0 opts it out of the limit. A bad value there gives that command a `StartError`.
 
@@ -194,7 +194,7 @@ Each worker runs in its own runspace: a separate PowerShell session inside the s
   }
   ```
 - Don't call `exit` in a worker. It ends that job quietly (not as a crash) and sets your whole script's exit code.
-- `-MaxParallel` has no default; you choose it. `-DrainTimeoutSeconds` (how long Ctrl+C waits for running workers) defaults to 60.
+- `-MaxParallel` has no default; you choose it. `-DrainTimeoutSeconds` (how long Ctrl+C waits for running workers) defaults to 60. The process engines' names, `-MaxConcurrent` and `-AbortTimeoutSeconds`, work here too.
 - If `-ResultHandler`, `-PollCallback` or `-NextJobProvider` throws, the run stops: workers still going are told to stop and the exception comes out of the call.
 - Returns an object with `ForceStoppedCount`, `CrashedCount`, `Aborted` and `Crashed`, which lists the `Job` and `Error` of each worker that threw.
 
@@ -286,7 +286,7 @@ Inside `Invoke-PkRun { ... }`, Ctrl+C:
 
 1. stops new jobs from starting,
 2. cancels the run's token (`Test-PkCancelRequested` turns true in workers),
-3. waits for in-flight work (`-DrainTimeoutSeconds` / `-AbortTimeoutSeconds`, default 60),
+3. waits for in-flight work (`-AbortTimeoutSeconds`, default 60; every engine also takes it as `-DrainTimeoutSeconds`),
 4. force-stops whatever is left, calling `-JobAbortCleanup` for each killed or never-started process job.
 
 Press Ctrl+C again to skip step 3: whatever is still running is force-stopped straight away, and your script carries on. A third press stops the script the way Ctrl+C normally does. Presses less than a second apart count as one, and Ctrl+Break works the same as Ctrl+C.
