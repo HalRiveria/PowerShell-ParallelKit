@@ -2435,22 +2435,19 @@ $limitRun = Invoke-LimitGroup -Jobs @(@{ Name = 'custom' }) -Extra @{
 $custom = Get-LimitEntry $limitRun 'custom'
 Test-Assert ($null -eq $limitRun.Problem -and $null -ne $limitRun.Result -and $custom.Count -eq 1 -and $custom[0].TimedOut -eq $false -and $custom[0].At -ge 1.7) ("a job whose .Proc isn't a process isn't timed (problem: " + $limitRun.Problem + ")")
 
-# A process that can't be read isn't timed, and doesn't stop the other jobs.
-$unreadableClock = [System.Diagnostics.Stopwatch]::StartNew()
-$limitRun = Invoke-LimitGroup -Jobs @(@{ Name = 'unreadable' }, @{ Name = 'other'; FilePath = $pingExe; Arguments = '-n 2 127.0.0.1' }) -Extra @{
+# A program that can't be stopped gets one try and one warning, not a taskkill
+# on every pass. A Process that was never started can't be stopped or read.
+Reset-Harness
+$stuckClock = [System.Diagnostics.Stopwatch]::StartNew()
+$limitRun = Invoke-LimitGroup -Jobs @(@{ Name = 'stuck' }) -Extra @{
     TimeoutSeconds = 0.2
-    JobStarter = {
-        param($job)
-        $s = Start-PkProcess -FilePath $cmdExe -Arguments '/c exit 0'
-        if ($job['Name'] -eq 'unreadable') { $null = $s.Proc.WaitForExit(5000); $s.Proc.Dispose(); $job['Proc'] = $s.Proc; return $job }
-        $s = Start-PkProcess -FilePath $job['FilePath'] -Arguments $job['Arguments']
-        foreach ($k in $s.Keys) { $job[$k] = $s[$k] }
-        return $job
-    }.GetNewClosure()
-    JobPollCompleted = { param($job) if ($job['Name'] -eq 'unreadable') { return ($unreadableClock.Elapsed.TotalSeconds -ge 1) }; return $job['Proc'].HasExited }.GetNewClosure()
-    JobFinalize = { param($job, $q) if ($job['Name'] -ne 'unreadable') { $null = Complete-PkProcess -Job $job } }
+    JobStarter = { param($job) $job['Proc'] = [System.Diagnostics.Process]::new(); return $job }
+    JobPollCompleted = { param($job) return ($stuckClock.Elapsed.TotalSeconds -ge 1) }.GetNewClosure()
+    JobFinalize = { param($job, $q) }
 }
-Test-Assert ($null -eq $limitRun.Problem -and $null -ne $limitRun.Result -and $limitRun.Result.JobStarterFailedCount -eq 0) ("a process that can't be read doesn't stop the run (problem: " + $limitRun.Problem + ")")
+$stuckWarnings = @($script:messages | Where-Object { $_.Level -eq 'Warn' -and $_.Message -like "*couldn't be stopped*" }).Count
+Test-Assert ($null -eq $limitRun.Problem -and $null -ne $limitRun.Result -and $stuckWarnings -eq 1) ("a program that can't be stopped gets one warning and the run carries on (warnings " + $stuckWarnings + ", problem: " + $limitRun.Problem + ")")
+Reset-Harness
 
 # Fractional, and under 0.5 s: not rounded to 0, which would mean no limit.
 $limitRun = Invoke-LimitGroup -Extra @{ TimeoutSeconds = 0.4 } -Jobs @(@{ Name = 'fraction'; FilePath = $pingExe; Arguments = '-n 30 127.0.0.1' })

@@ -976,14 +976,7 @@ function Stop-PkTimedOutJob {
     $proc = $Job['Proc']
     $clock = $Job['Stopwatch']
     if ($proc -isnot [System.Diagnostics.Process] -or $clock -isnot [System.Diagnostics.Stopwatch]) { return }
-    try {
-        if ($proc.HasExited -or $clock.Elapsed.TotalSeconds -lt $Job['TimeLimit']) { return }
-    } catch {
-        # A process that can't be read (a starter's own, say) can't be timed.
-        # That's no reason to stop every other job, which a throw here would do.
-        $Job['TimeLimit'] = 0
-        return
-    }
+    if ($proc.HasExited -or $clock.Elapsed.TotalSeconds -lt $Job['TimeLimit']) { return }
     # Only flagged if this call did the killing: a program that exited on its
     # own right at the deadline didn't time out. One try only: this runs every
     # pass, and a program that can't be killed would start a taskkill each time.
