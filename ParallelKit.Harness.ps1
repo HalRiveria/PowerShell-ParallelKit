@@ -2715,6 +2715,62 @@ if ($compiled) {
 Reset-Harness
 Write-Host ""
 
+Write-Host "=== AF: parameter handling: advanced functions, aliases, the safety switch ===" -ForegroundColor Cyan
+
+# Every public function is advanced, so a wrong or extra argument is an error
+# rather than silently ignored.
+$simpleFunctions = @($publicFunctions | Where-Object { -not (Get-Command $_).CmdletBinding })
+Test-Assert ($simpleFunctions.Count -eq 0) ("every public function rejects unknown arguments (not: " + ($simpleFunctions -join ', ') + ")")
+$threw = $null
+try { $null = Initialize-ParallelKit -MaxParallel 4 } catch { $threw = [string]$_ }
+Test-Assert ($threw -like '*MaxParallel*') "Initialize-ParallelKit -MaxParallel (the engine's name) is an error, not ignored"
+$threw = $null
+try { $null = Test-PkAbortSignal 'extra' } catch { $threw = [string]$_ }
+Test-Assert ($null -ne $threw) "Test-PkAbortSignal refuses an argument it doesn't take"
+$threw = $null
+try { Reset-PkAbortState -WhatIf } catch { $threw = [string]$_ }
+Test-Assert ($null -ne $threw) "Reset-PkAbortState -WhatIf is an error, not a reset"
+# Still called the usual ways.
+Set-PkMessageHandler { param($Message, $Level) $messageSink.Add(@{ Message = $Message; Level = $Level }) }.GetNewClosure()
+Write-PkMessage 'pk-positional-handler'
+Test-Assert ((Get-StartMessageCount '*pk-positional-handler*') -eq 1) "Set-PkMessageHandler still takes the handler by position"
+
+$threw = $null
+try { $null = Invoke-PkProcessBatch -Commands @(@{ FilePath = $cmdExe; Arguments = '/c exit 0' }) -MaxConcurrent 0 } catch { $threw = [string]$_ }
+Test-Assert ($threw -like 'Invoke-PkProcessBatch:*') ("the batch's own -MaxConcurrent error names the batch (" + $threw + ")")
+
+# The concurrency and abort-wait names work on every engine.
+Reset-Harness
+$aliasBatchParams = @{ Commands = @(@{ FilePath = $cmdExe; Arguments = '/c exit 3' }); MaxParallel = 2; DrainTimeoutSeconds = 5 }
+$aliasBatch = $null
+try { $aliasBatch = Invoke-PkProcessBatch @aliasBatchParams } catch { Write-Host "  batch alias threw: $_" }
+Test-Assert ($null -ne $aliasBatch -and $aliasBatch.Results[0].ExitCode -eq 3) "the batch takes -MaxParallel and -DrainTimeoutSeconds"
+$aliasRunParams = @{ WorkerScript = { param($Id) $Id * 2 }; JobParams = (New-JobList -Jobs @(@{ Id = 21 })); MaxConcurrent = 2; AbortTimeoutSeconds = 5 }
+$aliasRunResults = [System.Collections.Generic.List[object]]::new()
+try { $null = Invoke-PkRunspaceJobs @aliasRunParams -ResultHandler { param($r) $aliasRunResults.Add($r) }.GetNewClosure() } catch { Write-Host "  runspace alias threw: $_" }
+Test-Assert ($aliasRunResults.Count -eq 1 -and $aliasRunResults[0] -eq 42) "Invoke-PkRunspaceJobs takes -MaxConcurrent and -AbortTimeoutSeconds"
+$aliasFeed = @{ Given = $false }
+$aliasDispatch = $null
+try {
+    $aliasDispatch = Invoke-PkProcessDispatch -MaxParallel 1 -DrainTimeoutSeconds 5 `
+        -GroupProvider { if ($aliasFeed.Given) { return $null }; $aliasFeed.Given = $true; return 'g' }.GetNewClosure() `
+        -JobBuilder { param($g) return @(@{ FilePath = $cmdExe; Arguments = '/c exit 0' }) }.GetNewClosure() `
+        -JobFinalize { param($job, $q) $null = Complete-PkProcess -Job $job }
+} catch { Write-Host "  dispatcher alias threw: $_" }
+Test-Assert ($null -ne $aliasDispatch -and $aliasDispatch.GroupResults.Count -eq 1) "the dispatcher takes -MaxParallel and -DrainTimeoutSeconds"
+
+# -CheckWorkerSafety: on unless turned off, however it's passed.
+$unsafeWorker = { param($Id) $null = [Func[int]]{ 1 } }
+$threw = $false
+try { $null = Invoke-PkRunspaceJobs -WorkerScript $unsafeWorker -JobParams (New-JobList -Jobs @(@{ Id = 1 })) -MaxParallel 1 } catch { $threw = ($_.ToString() -like '*Func*') }
+Test-Assert $threw "the worker-safety check is on when -CheckWorkerSafety isn't given"
+$safetyOff = @{ CheckWorkerSafety = $false }
+$out = $null
+try { $out = Invoke-PkRunspaceJobs -WorkerScript $unsafeWorker -JobParams (New-JobList -Jobs @(@{ Id = 1 })) -MaxParallel 1 @safetyOff } catch { Write-Host "  splatted opt-out threw: $_" }
+Test-Assert ($null -ne $out -and $out.CrashedCount -eq 0) "a splatted CheckWorkerSafety = `$false turns it off"
+Reset-Harness
+Write-Host ""
+
 Set-PkMessageHandler -Handler $null
 Reset-PkAbortState
 

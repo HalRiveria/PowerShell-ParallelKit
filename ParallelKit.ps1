@@ -374,6 +374,7 @@ function Set-PkMessageHandler {
     # { param($Message, $Level) ... }, or $null to go back to the default (console).
     # .EXAMPLE
     # Set-PkMessageHandler { param($Message, $Level) Add-Content run.log "$Level $Message" }
+    [CmdletBinding()]
     param([scriptblock]$Handler)
     [PkState]::MessageHandler = $Handler
 }
@@ -475,6 +476,7 @@ function Initialize-ParallelKit {
     # .OUTPUTS
     # An object with AbortHandler, ChildProcessJob and ThreadPool, each $true if that
     # part worked.
+    [CmdletBinding()]
     param([int]$MaxConcurrentProcesses = 0)
     $handlerOk = Register-PkAbortHandler
     $jobOk     = Initialize-PkChildProcessJob
@@ -523,6 +525,8 @@ function Reset-PkAbortState {
 
     # Deliberately leaves RunActive alone: that belongs to Invoke-PkRun, and
     # clearing it here would disarm a run that calls this part-way through.
+    [CmdletBinding()]
+    param()
     [PkState]::AbortLatched = $false
     [PkState]::CloseAbort   = $false
     [PkConsoleCtrl]::AbortRequested = $false
@@ -534,6 +538,8 @@ function Reset-PkAbortState {
 function Request-PkAbort {
     # .SYNOPSIS
     # Starts an abort from code, the same as the user pressing Ctrl+C.
+    [CmdletBinding()]
+    param()
     [PkConsoleCtrl]::AbortRequested = $true
 }
 
@@ -547,6 +553,8 @@ function Test-PkAbortSignal {
     # the abort. Worker code should use Test-PkCancelRequested instead.
     # .OUTPUTS
     # [bool]
+    [CmdletBinding()]
+    param()
     if ($null -ne $global:PkWorkerQueue) {
         return [PkConsoleCtrl]::AbortRequested
     }
@@ -582,6 +590,8 @@ function Test-PkCancelRequested {
     # and can carry on once its current .NET call returns.
     # .OUTPUTS
     # [bool]
+    [CmdletBinding()]
+    param()
     if ($null -ne $global:PkCancelToken -and $global:PkCancelToken.IsCancellationRequested) { return $true }
     return [PkConsoleCtrl]::AbortRequested
 }
@@ -592,6 +602,8 @@ function Get-PkAbortTriggerLabel {
     # or "Request-PkAbort" for an abort started from code.
     # .OUTPUTS
     # [string]
+    [CmdletBinding()]
+    param()
     if ([PkState]::CloseAbort) { return "window close (X button)" }
     $pressedKey = [PkConsoleCtrl]::PressedKey
     if ($null -ne $pressedKey) { return $pressedKey }
@@ -1237,7 +1249,7 @@ function Invoke-PkProcessDispatch {
     # abort cut short, so check Test-PkCancelRequested before anything irreversible.
     # .PARAMETER MaxConcurrent
     # How many programs run at once: an int, or a SemaphoreSlim shared by several
-    # dispatchers that must stay under one combined limit.
+    # dispatchers that must stay under one combined limit. -MaxParallel also works.
     # .PARAMETER AbortPollCallback
     # { param($runningJobs) } run on every loop pass, with the jobs currently running.
     # .PARAMETER CancelToken
@@ -1246,7 +1258,7 @@ function Invoke-PkProcessDispatch {
     # .PARAMETER AbortTimeoutSeconds
     # How long an abort waits for running jobs before force-stopping them
     # (default 60). A force-stopped program is killed along with anything it
-    # started.
+    # started. -DrainTimeoutSeconds also works.
     # .PARAMETER MaxQueueAhead
     # How many groups to pull ahead of the ones running (default 3).
     # .PARAMETER GroupReleaseCheck
@@ -1273,9 +1285,11 @@ function Invoke-PkProcessDispatch {
         [scriptblock]$JobAbortCleanup = $null,
         [scriptblock]$GroupCompleteCallback = $null,
         [Parameter(Mandatory)]
+        [Alias('MaxParallel')]
         $MaxConcurrent,
         [scriptblock]$AbortPollCallback = $null,
         [System.Threading.CancellationToken]$CancelToken,
+        [Alias('DrainTimeoutSeconds')]
         [int]$AbortTimeoutSeconds = 60,
         [int]$MaxQueueAhead = 3,
         [scriptblock]$GroupReleaseCheck = $null,
@@ -1854,12 +1868,13 @@ function Invoke-PkProcessBatch {
     # .PARAMETER Commands
     # The command hashtables. $null or empty returns no results.
     # .PARAMETER MaxConcurrent
-    # How many programs run at once (default 4).
+    # How many programs run at once (default 4). -MaxParallel also works.
     # .PARAMETER OnComplete
     # { param($command, $result) } run on the main thread as each program finishes.
     # Not called for one that couldn't start or was stopped by an abort.
     # .PARAMETER AbortTimeoutSeconds
     # How long an abort waits for running programs before killing them (default 60).
+    # -DrainTimeoutSeconds also works.
     # .PARAMETER TimeoutSeconds
     # Kill a program still running after this long (default 0, no limit). Its
     # result has TimedOut = $true.
@@ -1879,8 +1894,10 @@ function Invoke-PkProcessBatch {
         [AllowNull()]
         [AllowEmptyCollection()]
         [hashtable[]]$Commands,
+        [Alias('MaxParallel')]
         [int]$MaxConcurrent = 4,
         [scriptblock]$OnComplete = $null,
+        [Alias('DrainTimeoutSeconds')]
         [int]$AbortTimeoutSeconds = 60,
         [double]$TimeoutSeconds = 0,
         $OutputEncoding = $null
@@ -1898,6 +1915,8 @@ function Invoke-PkProcessBatch {
 
     # Checked once here, so a bad name fails the call instead of every command.
     $null = Resolve-PkEncoding -Encoding $pkOutputEncoding
+    # Invoke-PkProcessDispatch has the same check; this one names the batch.
+    if ($pkMaxConcurrent -lt 1) { throw ("Invoke-PkProcessBatch: -MaxConcurrent must be at least 1 (got " + $pkMaxConcurrent + ").") }
     # Invoke-PkProcessDispatch has the same check; this one names the batch.
     if ($pkTimeoutSeconds -lt 0) { throw "Invoke-PkProcessBatch: -TimeoutSeconds must be 0 (no limit) or more." }
 
@@ -2174,7 +2193,7 @@ function Invoke-PkRunspaceJobs {
     # .PARAMETER SharedFunctionNames
     # Your functions the worker calls.
     # .PARAMETER MaxParallel
-    # How many workers run at once.
+    # How many workers run at once. -MaxConcurrent also works.
     # .PARAMETER Cts
     # Your own CancellationTokenSource for the run; an abort cancels it too.
     # .PARAMETER ResultHandler
@@ -2189,12 +2208,12 @@ function Invoke-PkRunspaceJobs {
     # as a message and the run carries on.
     # .PARAMETER DrainTimeoutSeconds
     # How long an abort waits for running workers before force-stopping them
-    # (default 60).
+    # (default 60). -AbortTimeoutSeconds also works.
     # .PARAMETER AbortWaitMessage
     # The message shown while an abort waits; '' for none.
     # .PARAMETER CheckWorkerSafety
-    # Check the worker code and job values before starting (default on).
-    # -CheckWorkerSafety:$false turns it off.
+    # Check the worker code and job values before starting. On unless you pass
+    # -CheckWorkerSafety:$false, whatever Get-Help says the default is.
     # .OUTPUTS
     # An object with ForceStoppedCount, CrashedCount, Aborted and Crashed (one
     # @{ Job; Error } entry per worker that threw).
@@ -2207,16 +2226,21 @@ function Invoke-PkRunspaceJobs {
         [scriptblock]$NextJobProvider = $null,
         [string[]]$SharedFunctionNames = @(),
         [Parameter(Mandatory)]
+        [Alias('MaxConcurrent')]
         [int]$MaxParallel,
         [System.Threading.CancellationTokenSource]$Cts = $null,
         [scriptblock]$ResultHandler = $null,
         [scriptblock]$PollCallback = $null,
         [scriptblock]$JobCrashedHandler = $null,
+        [Alias('AbortTimeoutSeconds')]
         [int]$DrainTimeoutSeconds = 60,
         [string]$AbortWaitMessage,
-        # On by default; -CheckWorkerSafety:$false turns it off.
-        [switch]$CheckWorkerSafety = $true
+        # On unless turned off; see $checkSafety below.
+        [switch]$CheckWorkerSafety
     )
+    # A switch can't default to on without a lint warning, so "not passed"
+    # means on. A bare -CheckWorkerSafety (the v1 opt-in) still means on.
+    $checkSafety = (-not $PSBoundParameters.ContainsKey('CheckWorkerSafety')) -or $CheckWorkerSafety.IsPresent
 
     if ($null -eq $JobParams -and $null -eq $NextJobProvider) {
         throw "Invoke-PkRunspaceJobs: must supply either -JobParams or -NextJobProvider."
@@ -2247,7 +2271,7 @@ function Invoke-PkRunspaceJobs {
     $outcome = [ordered]@{ ForceStoppedCount = 0; CrashedCount = 0; Aborted = $false; Crashed = [System.Collections.Generic.List[object]]::new() }
     if ($null -ne $JobParams -and $JobParams.Count -eq 0) { return [pscustomobject]$outcome }
 
-    if ($CheckWorkerSafety) {
+    if ($checkSafety) {
         $safetyFindings = Test-PkWorkerSafetyCore -WorkerScript $WorkerScript -SharedFunctionNames $SharedFunctionNames -SessionState $PSCmdlet.SessionState
         if ($safetyFindings.Count -gt 0) {
             $safetyLines = foreach ($f in $safetyFindings) { "  " + $f.Text }
@@ -2273,7 +2297,7 @@ function Invoke-PkRunspaceJobs {
                     throw ("Invoke-PkRunspaceJobs: job " + $jobIndex + " supplies '" + $key + "', but -WorkerScript's param() block doesn't declare it. Nothing was started.")
                 }
             }
-            if ($CheckWorkerSafety) {
+            if ($checkSafety) {
                 $sbKey = Get-PkScriptBlockJobKey -Job $JobParams[$jobIndex]
                 if ($null -ne $sbKey) { throw ((Get-PkScriptBlockJobMessage -Job ("job " + $jobIndex) -Key $sbKey) + " Nothing was started.") }
             }
@@ -2373,7 +2397,7 @@ function Invoke-PkRunspaceJobs {
                         throw ("Invoke-PkRunspaceJobs: a job supplies '" + $key + "', but -WorkerScript's param() block doesn't declare it.")
                     }
                 }
-                if ($CheckWorkerSafety -and $null -eq $JobParams) {
+                if ($checkSafety -and $null -eq $JobParams) {
                     $sbKey = Get-PkScriptBlockJobKey -Job $nextJob
                     if ($null -ne $sbKey) { throw (Get-PkScriptBlockJobMessage -Job "a job from -NextJobProvider" -Key $sbKey) }
                 }
