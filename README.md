@@ -129,14 +129,14 @@ Programs run in your current location (`Get-Location`) unless a command says oth
 
 - `Command` is your original command hashtable, so extra keys like `Source` above come back with it.
 - `ExitCode` is whatever the program returned. The kit doesn't treat a non-zero code as a failure; that's for you to decide.
-- `StartError` is set when the program couldn't be started (not found, say).
+- `StartError` is set when the program couldn't be started (not found, say). Every command is still tried and gets its own result, but repeats of the same failure for the same program print once, with a count at the end.
 - `Aborted` is `$true` for a command an abort killed or kept from starting.
 - `TimedOut` is `$true` for a program `-TimeoutSeconds` killed.
 - `StreamTimedOut` / `StreamError` mean the output may be incomplete. The output read gives up 15 seconds after the program exits, which only happens when a program it started is still holding the output open.
 
 `Results` is in the order commands finished, not the order you gave them. Use `Command` to match them up.
 
-`-OnComplete` runs as each command finishes, but only for commands that actually ran. Check `Results` for the ones that couldn't start or were aborted. Defaults: `-MaxConcurrent` 4, `-AbortTimeoutSeconds` 60 (how long Ctrl+C waits for running programs), `-TimeoutSeconds` 0 (no limit).
+`-OnComplete` runs as each command finishes, but only for commands that actually ran. Check `Results` for the ones that couldn't start or were aborted. A progress counter driven from `-OnComplete` won't reach the total if any did, so count from `$batch.Results` afterwards for the final numbers. Defaults: `-MaxConcurrent` 4, `-AbortTimeoutSeconds` 60 (how long Ctrl+C waits for running programs), `-TimeoutSeconds` 0 (no limit).
 
 `-TimeoutSeconds 600` kills any program still running after 10 minutes. Its result has `TimedOut = $true`, still goes through `-OnComplete`, and the rest of the batch carries on. The default, 0, means no limit. Any programs it started are killed with it. It can be fractional. A command's own `TimeoutSeconds` key overrides this for that command; 0 opts it out of the limit. A bad value there gives that command a `StartError`.
 
@@ -240,7 +240,7 @@ All of these callbacks run on whichever thread called the dispatcher: the main t
 - `-JobFinalize` is called once per finished job. Collect its exit code and output there with `Complete-PkProcess -Job $job`; the dispatcher disposes the process right after.
 - Groups are pulled lazily, at most `-MaxQueueAhead` (default 3) ahead.
 - A group can be any value: a hashtable, a path, a name. Each job gets its group as `$job.Group`.
-- The dispatcher keeps its state on the job hashtables. Don't use these names for your own job fields: `GroupKey`, `SlotReleased`, `Proc`, `StdoutTask`, `StderrTask`, `Stopwatch`, `TimeLimit`, `TimedOut`. (`Group` is yours if you set it yourself.)
+- The dispatcher keeps its state on the job hashtables. Don't use these names for your own job fields: `GroupKey`, `SlotReleased`, `Proc`, `StdoutTask`, `StderrTask`, `Stopwatch`, `TimeLimit`, `TimedOut`, `StartFailureReported`. (`Group` is yours if you set it yourself.)
 - `-TimeoutSeconds 600` kills a job's program, and anything it started, if it's still running after 10 minutes. The default, 0, means no limit, and it can be fractional. A job's own `TimeoutSeconds` key overrides it; 0 opts the job out, and a bad value is a failed start. The killed job still goes through `-JobFinalize`, where `$job['TimedOut']` is `$true`, and other jobs carry on. The limit stays in force while an abort waits for running jobs. A retry gets a fresh clock. A job whose `.Proc` isn't a process isn't timed: `-JobPollCompleted` is the place for its limit.
 - To retry a job or add follow-up work, enqueue job hashtables onto `$pending` inside `-JobFinalize`. They join the same group, and the group isn't complete until they've all finished. A retry can start within milliseconds of the failure, so cap the number of retries, and don't count on the gap for something like a locked file to clear.
 - Supply `-JobStarter { param($job) ... }` to start jobs yourself. It must set `$job.Proc` and should return the job. A starter that is just `Start-PkProcess ...` works too: its result is folded into your job. Throw to report a job that couldn't start.

@@ -885,7 +885,8 @@ function Start-PkProcessCore {
     } catch {
         $tried = ""
         if ($psi.FileName -ne $FilePath) { $tried = " (" + $psi.FileName + ")" }
-        throw ("Start-PkProcess: could not start '" + $FilePath + "'" + $tried + ": " + $_)
+        # The original goes along as the inner exception: the batch reads Windows' error code from it.
+        throw [System.Management.Automation.RuntimeException]::new("Start-PkProcess: could not start '" + $FilePath + "'" + $tried + ": " + $_, $_.Exception)
     }
     $null = [PkChildProcessJob]::Assign($proc)
     return @{
@@ -1505,7 +1506,9 @@ function Invoke-PkProcessDispatchCore {
                 }
                 $pkJob['SlotReleased'] = $false
                 # Before starting, so a bad key never leaves a program running.
+                $pkStartFailureText = "ProcessDispatch: a job couldn't start: "
                 $pkJob['TimeLimit'] = Get-PkJobTimeLimit -Job $pkJob -DefaultTimeoutSeconds $pkTimeoutSeconds
+                $pkStartFailureText = "ProcessDispatch: JobStarter failed to start a job: "
                 $pkStartedRaw = & $pkJobStarter $pkJob
                 foreach ($pkItem in @($pkStartedRaw)) {
                     if ($pkItem -isnot [hashtable] -or [object]::ReferenceEquals($pkItem, $pkJob)) { continue }
@@ -1524,7 +1527,8 @@ function Invoke-PkProcessDispatchCore {
                 # would otherwise leak (this job never reached $pkRunning, so
                 # the outer cleanup can't find it).
                 if ($pkIsSharedBudget) { $null = $pkMaxConcurrent.Release() }
-                Write-PkMessage ("ProcessDispatch: JobStarter failed to start a job: " + $_) -Level Error
+                # The batch sets this key on its own jobs: it reports start failures itself.
+                if (-not $pkJob['StartFailureReported']) { Write-PkMessage ($pkStartFailureText + $_) -Level Error }
                 $pkDispatchResult.JobStarterFailedCount++
                 $pkKey = $pkJob['GroupKey']
                 if ($pkGroupStates.ContainsKey($pkKey)) {
@@ -1796,6 +1800,19 @@ function New-PkBatchResult {
     return [pscustomobject]$r
 }
 
+function Get-PkStartFailureCause {
+    # Why a command couldn't start, for telling repeats apart: Windows' own text
+    # for the error code where there is one, because on 7 the exception's text
+    # for one failure differs by working directory.
+    param([Parameter(Mandatory)][System.Management.Automation.ErrorRecord]$StartError)
+    for ($e = $StartError.Exception; $null -ne $e; $e = $e.InnerException) {
+        if ($e -is [System.ComponentModel.Win32Exception]) {
+            return [System.ComponentModel.Win32Exception]::new($e.NativeErrorCode).Message.TrimEnd('.')
+        }
+    }
+    return [string]$StartError
+}
+
 function Invoke-PkProcessBatch {
     # .SYNOPSIS
     # Runs a list of external programs, a limited number at a time, and returns
@@ -1806,7 +1823,10 @@ function Invoke-PkProcessBatch {
     # TimeoutSeconds (overrides -TimeoutSeconds) and any keys of your own, which
     # come back on the result's Command. Inside
     # Invoke-PkRun, Ctrl+C lets running programs finish (up to -AbortTimeoutSeconds)
-    # and starts no new ones; a second Ctrl+C kills them straight away.
+    # and starts no new ones; a second Ctrl+C kills them straight away. Every
+    # command is tried, and one that can't start gets a StartError on its result.
+    # Repeats of the same failure for the same program are reported once, with a
+    # count at the end.
     # .PARAMETER Commands
     # The command hashtables. $null or empty returns no results.
     # .PARAMETER MaxConcurrent
@@ -1864,7 +1884,25 @@ function Invoke-PkProcessBatch {
     $pkNewBatchResult = ${function:New-PkBatchResult}
     $pkStartProcessCore = ${function:Start-PkProcessCore}
     $pkGetJobTimeLimit = ${function:Get-PkJobTimeLimit}
+    $pkGetStartFailureCause = ${function:Get-PkStartFailureCause}
     $pkCallerState = $PSCmdlet.SessionState
+    $pkStartFailures = [System.Collections.Specialized.OrderedDictionary]::new([System.StringComparer]::OrdinalIgnoreCase)
+
+    # The first failure for a program and cause goes out in full; the rest only
+    # add to the count that's reported after the dispatch.
+    $pkReportStartFailure = {
+        param($pkCommand, $pkError)
+        $pkResults.Add((& $pkNewBatchResult -Command $pkCommand -StartError ([string]$pkError)))
+        $pkFilePath = [string]$pkCommand['FilePath']
+        $pkCause = & $pkGetStartFailureCause -StartError $pkError
+        $pkFailureKey = $pkFilePath + '|' + $pkCause
+        if ($pkStartFailures.Contains($pkFailureKey)) {
+            $pkStartFailures[$pkFailureKey].More++
+            return
+        }
+        $pkStartFailures[$pkFailureKey] = @{ FilePath = $pkFilePath; Cause = $pkCause; More = 0 }
+        Write-PkMessage ("Invoke-PkProcessBatch: a command couldn't start: " + $pkError) -Level Error
+    }.GetNewClosure()
 
     $pkGroupProvider = {
         if ($pkState.Given) { return $null }
@@ -1884,8 +1922,7 @@ function Invoke-PkProcessBatch {
             try {
                 $null = & $pkGetJobTimeLimit -Job $pkC
             } catch {
-                $pkResults.Add((& $pkNewBatchResult -Command $pkC -StartError ([string]$_)))
-                Write-PkMessage ("Invoke-PkProcessBatch: a command couldn't start: " + $_) -Level Error
+                & $pkReportStartFailure $pkC $_
                 continue
             }
             $pkJobs.Add(@{ FilePath = $pkC['FilePath']; Arguments = [string]$pkC['Arguments']; WorkingDirectory = [string]$pkC['WorkingDirectory']; OutputEncoding = $pkEncoding; TimeoutSeconds = $pkC['TimeoutSeconds']; Command = $pkC })
@@ -1898,7 +1935,8 @@ function Invoke-PkProcessBatch {
         try {
             $pkStarted = & $pkStartProcessCore -CallerState $pkCallerState -FilePath $pkJob['FilePath'] -Arguments $pkJob['Arguments'] -WorkingDirectory $pkJob['WorkingDirectory'] -OutputEncoding $pkJob['OutputEncoding']
         } catch {
-            $pkResults.Add((& $pkNewBatchResult -Command $pkJob['Command'] -StartError ([string]$_)))
+            $pkJob['StartFailureReported'] = $true
+            & $pkReportStartFailure $pkJob['Command'] $_
             throw
         }
         $pkJob['Proc'] = $pkStarted.Proc; $pkJob['StdoutTask'] = $pkStarted.StdoutTask; $pkJob['StderrTask'] = $pkStarted.StderrTask
@@ -1924,7 +1962,15 @@ function Invoke-PkProcessBatch {
         JobFinalize = $pkJobFinalize; JobAbortCleanup = $pkJobAbortCleanup; MaxConcurrent = $pkMaxConcurrent
         AbortTimeoutSeconds = $pkAbortTimeoutSeconds; MaxQueueAhead = 1; TimeoutSeconds = $pkTimeoutSeconds
     }
-    $pkDispatch = Invoke-PkProcessDispatch @pkDispatchParams
+    try {
+        $pkDispatch = Invoke-PkProcessDispatch @pkDispatchParams
+    } finally {
+        foreach ($pkFailure in $pkStartFailures.Values) {
+            if ($pkFailure.More -eq 0) { continue }
+            $pkCommandWord = if ($pkFailure.More -eq 1) { 'command' } else { 'commands' }
+            Write-PkMessage ("Invoke-PkProcessBatch: " + $pkFailure.More + " more " + $pkCommandWord + " couldn't start '" + $pkFailure.FilePath + "' (" + $pkFailure.Cause + ").") -Level Error
+        }
+    }
 
     return [pscustomobject][ordered]@{ Results = $pkResults; Aborted = $pkDispatch.Aborted; ForceKilledCount = $pkDispatch.ForceKilledCount }
 }
@@ -1938,7 +1984,7 @@ function Get-PkWorkerSafeFunctionNames {
     return @('Write-PkMessage', 'Test-PkAbortSignal', 'Test-PkCancelRequested', 'Initialize-PkThreadPool', 'Stop-PkProcessTree', 'Stop-PkJobProcesses', 'Resolve-PkEncoding',
              'Start-PkProcess', 'Wait-PkProcess', 'Wait-PkRunningJobs', 'Complete-PkProcess', 'Invoke-PkProcessWithTimeout',
              'Invoke-PkProcessDispatch', 'Invoke-PkProcessDispatchCore', 'Invoke-PkProcessBatch',
-             'Register-PkCancellationSource', 'Unregister-PkCancellationSource', 'New-PkBatchResult', 'ConvertTo-PkArgumentString', 'Get-PkForceStopReason', 'Resolve-PkFileSystemPath', 'Add-PkDispatchGroupJobs', 'Start-PkProcessCore', 'Get-PkJobTimeLimit', 'Stop-PkTimedOutJob')
+             'Register-PkCancellationSource', 'Unregister-PkCancellationSource', 'New-PkBatchResult', 'ConvertTo-PkArgumentString', 'Get-PkForceStopReason', 'Resolve-PkFileSystemPath', 'Add-PkDispatchGroupJobs', 'Start-PkProcessCore', 'Get-PkJobTimeLimit', 'Stop-PkTimedOutJob', 'Get-PkStartFailureCause')
 }
 
 function Get-PkHandlerParamCount {

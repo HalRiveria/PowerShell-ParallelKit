@@ -2519,6 +2519,104 @@ Test-Assert ($limitWorker.Count -eq 1 -and $limitWorker[0]['Seen'] -eq 99) "and 
 Reset-Harness
 Write-Host ""
 
+Write-Host "=== AD: repeated start failures are reported once, with a count ===" -ForegroundColor Cyan
+
+function Get-StartMessageCount { param([string]$Like) return @($script:messages | Where-Object { $_.Message -like $Like }).Count }
+$missing = 'pk-no-such-program.exe'
+$missingCommands = @(1..5 | ForEach-Object { @{ FilePath = $missing; Arguments = "$_"; Tag = $_ } })
+
+Reset-Harness
+$completedCount = @{ N = 0 }
+$collapsed = Invoke-PkProcessBatch -Commands $missingCommands -MaxConcurrent 2 -OnComplete { param($c, $r) $completedCount.N++ }.GetNewClosure()
+Test-Assert (@($collapsed.Results | Where-Object { $_.StartError -like "*could not start '$missing'*" }).Count -eq 5) "every command that can't start still gets its own StartError"
+Test-Assert ($completedCount.N -eq 0) "-OnComplete still skips commands that couldn't start"
+Test-Assert ((Get-StartMessageCount "*$missing*") -eq 2) ("five failures of one program give two messages, the first and a summary (" + (Get-StartMessageCount "*$missing*") + ")")
+Test-Assert ((Get-StartMessageCount "*4 more commands couldn't start '$missing'*") -eq 1) "the summary counts the ones it left out"
+Test-Assert ((Get-StartMessageCount "*JobStarter*") -eq 0 -and (Get-StartMessageCount "*ProcessDispatch*") -eq 0) "batch messages don't name dispatcher internals"
+Test-Assert (@($script:messages | Where-Object { $_.Message -like "*more command*" -and $_.Message -like "*could not start*" }).Count -eq 0) "the summary gives Windows' reason, without the per-command text"
+
+Reset-Harness
+$null = Invoke-PkProcessBatch -Commands @(@{ FilePath = $missing }) -MaxConcurrent 2
+Test-Assert ((Get-StartMessageCount "*$missing*") -eq 1 -and (Get-StartMessageCount "*more command*") -eq 0) "one failure gets no summary"
+
+Reset-Harness
+$null = Invoke-PkProcessBatch -Commands @(@{ FilePath = $missing }, @{ FilePath = $missing }) -MaxConcurrent 2
+Test-Assert ((Get-StartMessageCount "*1 more command couldn't start '$missing'*") -eq 1) "the summary reads right for one more"
+
+Reset-Harness
+$null = Invoke-PkProcessBatch -MaxConcurrent 2 -Commands @(
+    @{ FilePath = 'pk-missing-a.exe' }, @{ FilePath = 'pk-missing-b.exe' }, @{ FilePath = 'pk-missing-a.exe' },
+    @{ FilePath = 'pk-missing-b.exe' }, @{ FilePath = 'pk-missing-a.exe' }, @{ FilePath = 'pk-missing-b.exe' })
+Test-Assert ((Get-StartMessageCount "*pk-missing-a.exe*") -eq 2 -and (Get-StartMessageCount "*pk-missing-b.exe*") -eq 2) "different programs are reported separately"
+
+Reset-Harness
+$null = Invoke-PkProcessBatch -Commands @(@{ FilePath = 'PK-MISSING-C.exe' }, @{ FilePath = 'pk-missing-c.EXE' }) -MaxConcurrent 2
+Test-Assert ((Get-StartMessageCount "*1 more command couldn't start*") -eq 1) "a program's name is matched as Windows matches it, ignoring case"
+
+# On 7 the text of this failure names the working directory, so it differs
+# between these: repeats have to be matched on Windows' error code.
+Reset-Harness
+$null = Invoke-PkProcessBatch -MaxConcurrent 2 -Commands @(
+    @{ FilePath = $missing; WorkingDirectory = $env:TEMP }, @{ FilePath = $missing; WorkingDirectory = $env:windir }, @{ FilePath = $missing; WorkingDirectory = $PSHOME })
+Test-Assert ((Get-StartMessageCount "*$missing*") -eq 2) ("the same failure from different folders counts as a repeat (" + (Get-StartMessageCount "*$missing*") + ")")
+
+# A different reason for the same program isn't a repeat.
+Reset-Harness
+$null = Invoke-PkProcessBatch -MaxConcurrent 2 -Commands @(
+    @{ FilePath = $cmdExe; Arguments = '/c exit 0'; WorkingDirectory = (Join-Path $env:TEMP 'pk-no-such-folder') },
+    @{ FilePath = $cmdExe; Arguments = ('/c rem ' + ('x' * 33000)) })
+Test-Assert ((Get-StartMessageCount "*couldn't start*") -eq 2 -and (Get-StartMessageCount "*more command*") -eq 0) "different reasons for one program are reported separately"
+
+Reset-Harness
+$mixed = Invoke-PkProcessBatch -MaxConcurrent 2 -Commands @(
+    @{ Name = 'bad'; FilePath = $cmdExe; Arguments = '/c exit 0'; WorkingDirectory = (Join-Path $env:TEMP 'pk-no-such-folder') },
+    @{ Name = 'good1'; FilePath = $cmdExe; Arguments = '/c exit 0' }, @{ Name = 'good2'; FilePath = $cmdExe; Arguments = '/c exit 0' })
+$mixedOk = @($mixed.Results | Where-Object { $_.ExitCode -eq 0 -and $_.Command['Name'] -like 'good*' }).Count
+Test-Assert ($mixedOk -eq 2 -and @($mixed.Results | Where-Object { $_.Command['Name'] -eq 'bad' -and $_.StartError }).Count -eq 1) "a command that can't start doesn't stop the good ones"
+
+Reset-Harness
+$badKeys = Invoke-PkProcessBatch -MaxConcurrent 2 -Commands @(
+    @{ FilePath = $cmdExe; Arguments = '/c exit 0'; TimeoutSeconds = 'soon' }, @{ FilePath = $cmdExe; Arguments = '/c exit 0'; TimeoutSeconds = 'soon' }, @{ FilePath = $cmdExe; Arguments = '/c exit 0'; TimeoutSeconds = 'soon' })
+Test-Assert ($badKeys.Results.Count -eq 3 -and (Get-StartMessageCount "*TimeoutSeconds must be*") -eq 2 -and (Get-StartMessageCount "*2 more commands*") -eq 1) "repeats of a bad TimeoutSeconds key are collapsed too"
+
+# The summary isn't lost when a callback stops the batch.
+Reset-Harness
+$thrown = $null
+try {
+    $null = Invoke-PkProcessBatch -MaxConcurrent 3 -OnComplete { throw 'pk-callback-stop' } -Commands @(
+        @{ FilePath = $missing }, @{ FilePath = $missing }, @{ FilePath = $cmdExe; Arguments = '/c exit 0' })
+} catch { $thrown = [string]$_ }
+Test-Assert ((Get-StartMessageCount "*1 more command couldn't start '$missing'*") -eq 1) ("the summary still prints when -OnComplete throws (threw: " + $thrown + ")")
+
+# Or when an abort ends the batch early.
+Reset-Harness
+$abortedBatch = Invoke-PkProcessBatch -MaxConcurrent 3 -AbortTimeoutSeconds 1 -OnComplete { Request-PkAbort } -Commands @(
+    @{ FilePath = $missing }, @{ FilePath = $missing }, @{ FilePath = $cmdExe; Arguments = '/c exit 0' }, @{ FilePath = $pingExe; Arguments = '-n 30 127.0.0.1' })
+Test-Assert ($abortedBatch.Aborted -and (Get-StartMessageCount "*1 more command couldn't start '$missing'*") -eq 1) ("the summary still prints after an abort (aborted: " + $abortedBatch.Aborted + ")")
+
+# The dispatcher's custom starters can throw anything, so it reports each one.
+Reset-Harness
+$dispatchMissing = Invoke-LimitGroup -Jobs @(
+    @{ Name = 'a'; FilePath = $missing }, @{ Name = 'b'; FilePath = $missing }, @{ Name = 'c'; FilePath = $missing })
+Test-Assert ($dispatchMissing.Result.JobStarterFailedCount -eq 3 -and (Get-StartMessageCount "*JobStarter failed to start a job*$missing*") -eq 3) "the dispatcher still reports every failed start"
+
+# A bad key is refused before the starter runs, so don't blame the starter.
+Reset-Harness
+$null = Invoke-LimitGroup -Jobs @(@{ Name = 'x'; FilePath = $cmdExe; Arguments = '/c exit 0'; TimeoutSeconds = 'soon' })
+Test-Assert ((Get-StartMessageCount "*ProcessDispatch: a job couldn't start:*TimeoutSeconds must be*") -eq 1 -and (Get-StartMessageCount "*JobStarter*") -eq 0) "a bad TimeoutSeconds key on a dispatcher job doesn't blame the JobStarter"
+
+Reset-Harness
+$collapseWorker = [System.Collections.Generic.List[object]]::new()
+$collapseOut = Invoke-PkRunspaceJobs -MaxParallel 1 -JobParams (New-JobList -Jobs @(@{ Missing = $missing })) -ResultHandler { param($r) $collapseWorker.Add($r) }.GetNewClosure() -WorkerScript {
+    param([string]$Missing)
+    $batch = Invoke-PkProcessBatch -Commands @(@{ FilePath = $Missing }, @{ FilePath = $Missing }, @{ FilePath = $Missing }) -MaxConcurrent 2
+    return @{ Failed = @($batch.Results | Where-Object { $_.StartError }).Count }
+}
+Test-Assert ($collapseOut.CrashedCount -eq 0 -and $collapseWorker.Count -eq 1 -and $collapseWorker[0]['Failed'] -eq 3) "start failures are handled inside a worker too"
+Test-Assert ((Get-StartMessageCount "*$missing*") -eq 2) ("and collapsed there (" + (Get-StartMessageCount "*$missing*") + " messages)")
+Reset-Harness
+Write-Host ""
+
 Set-PkMessageHandler -Handler $null
 Reset-PkAbortState
 
