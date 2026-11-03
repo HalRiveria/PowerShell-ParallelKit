@@ -2533,7 +2533,7 @@ Test-Assert ($completedCount.N -eq 0) "-OnComplete still skips commands that cou
 Test-Assert ((Get-StartMessageCount "*$missing*") -eq 2) ("five failures of one program give two messages, the first and a summary (" + (Get-StartMessageCount "*$missing*") + ")")
 Test-Assert ((Get-StartMessageCount "*4 more commands couldn't start '$missing'*") -eq 1) "the summary counts the ones it left out"
 Test-Assert ((Get-StartMessageCount "*JobStarter*") -eq 0 -and (Get-StartMessageCount "*ProcessDispatch*") -eq 0) "batch messages don't name dispatcher internals"
-Test-Assert (@($script:messages | Where-Object { $_.Message -like "*more command*" -and $_.Message -notlike "*cannot find the file*" }).Count -eq 0) "the summary gives Windows' reason, without the per-command text"
+Test-Assert (@($script:messages | Where-Object { $_.Message -like "*more command*" -and $_.Message -like "*could not start*" }).Count -eq 0) "the summary gives Windows' reason, without the per-command text"
 
 Reset-Harness
 $null = Invoke-PkProcessBatch -Commands @(@{ FilePath = $missing }) -MaxConcurrent 2
@@ -2587,6 +2587,12 @@ try {
         @{ FilePath = $missing }, @{ FilePath = $missing }, @{ FilePath = $cmdExe; Arguments = '/c exit 0' })
 } catch { $thrown = [string]$_ }
 Test-Assert ((Get-StartMessageCount "*1 more command couldn't start '$missing'*") -eq 1) ("the summary still prints when -OnComplete throws (threw: " + $thrown + ")")
+
+# Or when an abort ends the batch early.
+Reset-Harness
+$abortedBatch = Invoke-PkProcessBatch -MaxConcurrent 3 -AbortTimeoutSeconds 1 -OnComplete { Request-PkAbort } -Commands @(
+    @{ FilePath = $missing }, @{ FilePath = $missing }, @{ FilePath = $cmdExe; Arguments = '/c exit 0' }, @{ FilePath = $pingExe; Arguments = '-n 30 127.0.0.1' })
+Test-Assert ($abortedBatch.Aborted -and (Get-StartMessageCount "*1 more command couldn't start '$missing'*") -eq 1) ("the summary still prints after an abort (aborted: " + $abortedBatch.Aborted + ")")
 
 # The dispatcher's custom starters can throw anything, so it reports each one.
 Reset-Harness
