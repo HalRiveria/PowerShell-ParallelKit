@@ -2719,6 +2719,14 @@ if ($compiled) {
     try { $null = Invoke-PkProcessWithTimeout -FilePath $argvExe -Arguments @{ a = 1 } } catch { $thrown = [string]$_ }
     Test-Assert ($thrown -like '*Arguments must be*') "and a clear error from the direct functions"
 
+    # A list inside the list used to become one argument, joined with $OFS.
+    Reset-Harness
+    $nestedBatch = Invoke-PkProcessBatch -Commands @(@{ FilePath = $argvExe; Arguments = @('a', @('b', 'c')) }) -MaxConcurrent 1
+    Test-Assert ($nestedBatch.Results[0].StartError -like '*element 2 is itself a list*' -and $null -eq $nestedBatch.Results[0].ExitCode) ("a list inside an Arguments list is that command's StartError (" + $nestedBatch.Results[0].StartError + ")")
+    $thrown = $null
+    try { $null = ConvertTo-PkArgumentString @('a', @{ b = 1 }) } catch { $thrown = [string]$_ }
+    Test-Assert ($thrown -like '*element 2 is itself a list*') "and ConvertTo-PkArgumentString refuses one too, a hashtable included"
+
     # Inside a worker, where the kit's functions are plain copies.
     Reset-Harness
     $argWorker = [System.Collections.Generic.List[object]]::new()

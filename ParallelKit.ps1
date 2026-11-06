@@ -704,7 +704,8 @@ function ConvertTo-PkArgumentString {
     # list.
     # .PARAMETER Arguments
     # The arguments, in order. A $null one is left out; an empty string is passed
-    # as "".
+    # as "". An element that is itself a list (or a hashtable) is an error: put
+    # each argument in the outer list.
     # .OUTPUTS
     # [string]
     # .EXAMPLE
@@ -723,8 +724,14 @@ function ConvertTo-PkArgumentString {
         [object[]]$Arguments
     )
     $parts = [System.Collections.Generic.List[string]]::new()
+    $position = 0
     foreach ($item in $Arguments) {
+        $position++
         if ($null -eq $item) { continue }
+        # A [string] cast would join a nested list with $OFS into one argument.
+        if ($item -isnot [string] -and $item -is [System.Collections.IEnumerable]) {
+            throw ("Arguments must be one string or a list of arguments, but element " + $position + " is itself a list (" + $item.GetType().Name + "). Put each argument in the outer list.")
+        }
         $arg = [string]$item
         # The C runtime only needs quotes around whitespace and quotes. The rest
         # are cmd.exe's: it runs a .bat/.cmd program's command line, acting on
