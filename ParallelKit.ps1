@@ -704,7 +704,8 @@ function ConvertTo-PkArgumentString {
     # list.
     # .PARAMETER Arguments
     # The arguments, in order. A $null one is left out; an empty string is passed
-    # as "". An element that is itself a list (or a hashtable) is an error: put
+    # as "". A file or folder object (from Get-ChildItem or Get-Item) is its full
+    # path. An element that is itself a list (or a hashtable) is an error: put
     # each argument in the outer list.
     # .OUTPUTS
     # [string]
@@ -732,7 +733,8 @@ function ConvertTo-PkArgumentString {
         if ($item -isnot [string] -and $item -is [System.Collections.IEnumerable]) {
             throw ("Arguments must be one string or a list of arguments, but element " + $position + " is itself a list (" + $item.GetType().Name + "). Put each argument in the outer list.")
         }
-        $arg = [string]$item
+        # On 5.1 a FileInfo from Get-ChildItem casts to its bare name.
+        if ($item -is [System.IO.FileSystemInfo]) { $arg = $item.FullName } else { $arg = [string]$item }
         # The C runtime only needs quotes around whitespace and quotes. The rest
         # are cmd.exe's: it runs a .bat/.cmd program's command line, acting on
         # & | < > ^ ( ) outside quotes and splitting batch arguments at , ;
@@ -767,14 +769,15 @@ function ConvertTo-PkArgumentString {
 function Resolve-PkArguments {
     # -Arguments / Arguments as given -> the command line. A string is used as
     # written; a list is quoted one argument per element, so a path with a space
-    # stays whole (a plain [string] cast would join it with spaces, or $OFS).
+    # stays whole (a plain [string] cast would join it with spaces, or $OFS). A
+    # lone file or folder object is one argument, its full path.
     param($Arguments)
     if ($null -eq $Arguments) { return '' }
     if ($Arguments -is [string]) { return $Arguments }
     if ($Arguments -is [System.Collections.IDictionary]) {
         throw ("Arguments must be one string or a list of arguments (got a " + $Arguments.GetType().Name + ").")
     }
-    if ($Arguments -is [System.Collections.IEnumerable]) { return (ConvertTo-PkArgumentString -Arguments @($Arguments)) }
+    if ($Arguments -is [System.Collections.IEnumerable] -or $Arguments -is [System.IO.FileSystemInfo]) { return (ConvertTo-PkArgumentString -Arguments @($Arguments)) }
     return [string]$Arguments
 }
 
