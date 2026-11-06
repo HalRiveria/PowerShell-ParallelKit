@@ -2719,6 +2719,27 @@ if ($compiled) {
     try { $null = Invoke-PkProcessWithTimeout -FilePath $argvExe -Arguments @{ a = 1 } } catch { $thrown = [string]$_ }
     Test-Assert ($thrown -like '*Arguments must be*') "and a clear error from the direct functions"
 
+    # A list inside the list used to become one argument, joined with $OFS.
+    Reset-Harness
+    $nestedBatch = Invoke-PkProcessBatch -Commands @(@{ FilePath = $argvExe; Arguments = @('a', @('b', 'c')) }) -MaxConcurrent 1
+    Test-Assert ($nestedBatch.Results[0].StartError -like '*element 2 is itself a list*' -and $null -eq $nestedBatch.Results[0].ExitCode) ("a list inside an Arguments list is that command's StartError (" + $nestedBatch.Results[0].StartError + ")")
+    $thrown = $null
+    try { $null = ConvertTo-PkArgumentString @('a', @{ b = 1 }) } catch { $thrown = [string]$_ }
+    Test-Assert ($thrown -like '*element 2 is itself a list*') "and ConvertTo-PkArgumentString refuses one too, a hashtable included"
+
+    # File and folder objects are their full path. On 5.1 a FileInfo from
+    # Get-ChildItem casts to its bare name, so the program got 'a b.txt'.
+    $fsDir = Join-Path $env:TEMP ("pk fs " + [guid]::NewGuid().ToString("N"))
+    $null = New-Item -ItemType Directory -Force -Path $fsDir
+    [System.IO.File]::WriteAllText((Join-Path $fsDir 'a b.txt'), 'x')
+    $fsFile = Get-ChildItem -LiteralPath $fsDir -File
+    $fsFolder = Get-Item -LiteralPath $fsDir
+    $fsText = '[' + $fsFile.FullName + '][' + $fsFolder.FullName + ']'
+    Test-Assert ((Get-BatchArgvText @($fsFile, $fsFolder)) -eq $fsText) ("Get-ChildItem and Get-Item objects in a list are their full paths (" + (Get-BatchArgvText @($fsFile, $fsFolder)) + ")")
+    Test-Assert ((Get-BatchArgvText $fsFile) -eq ('[' + $fsFile.FullName + ']')) "and so is one on its own, quoted"
+    Test-Assert ((ConvertTo-PkArgumentString @($fsFile)) -eq ('"' + $fsFile.FullName + '"')) "ConvertTo-PkArgumentString too"
+    Remove-Item -LiteralPath $fsDir -Recurse -Force
+
     # Inside a worker, where the kit's functions are plain copies.
     Reset-Harness
     $argWorker = [System.Collections.Generic.List[object]]::new()

@@ -80,7 +80,7 @@ What none of them do for you:
 
 ## Setup
 
-Requires Windows, with Windows PowerShell 5.1 or PowerShell 7. Download `ParallelKit.ps1` from the [Releases page](https://github.com/HalRiveria/PowerShell-ParallelKit/releases) (this README describes version 2.2 and later), put it in your project, and dot-source it from your script:
+Requires Windows, with Windows PowerShell 5.1 or PowerShell 7. Download `ParallelKit.ps1` from the [Releases page](https://github.com/HalRiveria/PowerShell-ParallelKit/releases) (this README describes version 2.3 and later), put it in your project, and dot-source it from your script:
 
 ```powershell
 . "$PSScriptRoot\ParallelKit.ps1"
@@ -88,6 +88,8 @@ $null = Initialize-ParallelKit -MaxConcurrentProcesses 8
 ```
 
 If you downloaded the file, Windows marks it as coming from the internet and your execution policy may refuse to load it. Run `Unblock-File .\ParallelKit.ps1` once to clear that.
+
+If your machines only run signed scripts (the `AllSigned` execution policy), the file has to be signed with a certificate they trust. The release copy isn't signed.
 
 It works whether or not your script uses `Set-StrictMode`.
 
@@ -121,7 +123,7 @@ $batch = Invoke-PkRun { Invoke-PkProcessBatch @batchParams }
 
 Long parameter lists in these examples use splatting (`@batchParams`) instead of trailing backticks: it's easier to read, and a stray space after a backtick can't break it.
 
-Each command is a hashtable with `FilePath`, `Arguments` and optionally `WorkingDirectory`, plus any keys of your own. `Arguments` is either one string, passed to the program exactly as written, or a list, where each element is one argument: `Arguments = @($in, $out)` works with spaces in the paths. A list is quoted the way `ConvertTo-PkArgumentString @(...)` quotes it, so the program gets exactly that list back, spaces, quotes and trailing backslashes included, and `$null` elements are left out. Quotes inside an element are passed on as quote characters, so don't pre-quote list elements. It follows the rules most Windows programs use; `cmd.exe /c` parses its own way, so give it one string. A `.bat` or `.cmd` program runs through `cmd.exe` too. A list element holding `&`, `|`, `<`, `>`, `^`, `(`, `)`, `,` or `;` is quoted, so such a program gets it as one argument. What quoting can't cover there: `cmd.exe` expands `%NAME%` in an argument, quoted or not, when a variable by that name exists; it splits batch arguments at `=`, which isn't quoted because some programs read `NAME=value` from the command line themselves; and an element containing a `"` can leave the characters after it unquoted as far as `cmd.exe` is concerned. Programs run hidden, with their output captured.
+Each command is a hashtable with `FilePath`, `Arguments` and optionally `WorkingDirectory`, plus any keys of your own. `Arguments` is either one string, passed to the program exactly as written, or a list, where each element is one argument: `Arguments = @($in, $out)` works with spaces in the paths. A list is quoted the way `ConvertTo-PkArgumentString @(...)` quotes it, so the program gets exactly that list back, spaces, quotes and trailing backslashes included, and `$null` elements are left out. A file or folder object from `Get-ChildItem` or `Get-Item` is passed as its full path. An element that's itself a list is an error, not one argument. Quotes inside an element are passed on as quote characters, so don't pre-quote list elements. It follows the rules most Windows programs use; `cmd.exe /c` parses its own way, so give it one string. A `.bat` or `.cmd` program runs through `cmd.exe` too. A list element holding `&`, `|`, `<`, `>`, `^`, `(`, `)`, `,` or `;` is quoted, so such a program gets it as one argument. What quoting can't cover there: `cmd.exe` expands `%NAME%` in an argument, quoted or not, when a variable by that name exists; it splits batch arguments at `=`, which isn't quoted because some programs read `NAME=value` from the command line themselves; and an element containing a `"` can leave the characters after it unquoted as far as `cmd.exe` is concerned. Programs run hidden, with their output captured.
 
 Programs run in your current location (`Get-Location`) unless a command says otherwise, and a relative `WorkingDirectory`, or a `FilePath` with a folder in it like `.\tools\cjxl.exe`, is relative to that location too. Drives PowerShell knows, like `~` or one made with `New-PSDrive`, work in both. A bare name like `cjxl.exe` is found the way Windows finds programs, mostly on `PATH`. A `.bat` or `.cmd` program can't run in a network-share (`\\server\share`) folder: `cmd.exe` falls back to `C:\Windows` there, so give such commands a local `WorkingDirectory`.
 
@@ -134,7 +136,7 @@ Programs run in your current location (`Get-Location`) unless a command says oth
 - `TimedOut` is `$true` for a program `-TimeoutSeconds` killed.
 - `StreamTimedOut` / `StreamError` mean the output may be incomplete. The output read gives up 15 seconds after the program exits, which only happens when a program it started is still holding the output open.
 
-`Results` is in the order commands finished, not the order you gave them. Use `Command` to match them up.
+`Results` is in the order commands finished, not the order you gave them. Use `Command` to match them up, or give each command your own key (`Index = $n`) and sort on it: `$batch.Results | Sort-Object { $_.Command.Index }`.
 
 `-OnComplete` runs as each command finishes, but only for commands that actually ran. Check `Results` for the ones that couldn't start or were aborted. A progress counter driven from `-OnComplete` won't reach the total if any did, so count from `$batch.Results` afterwards for the final numbers. Defaults: `-MaxConcurrent` 4, `-AbortTimeoutSeconds` 60 (how long Ctrl+C waits for running programs), `-TimeoutSeconds` 0 (no limit). The runspace engine's names, `-MaxParallel` and `-DrainTimeoutSeconds`, work here too, and on the dispatcher.
 
@@ -179,7 +181,7 @@ Each worker runs in its own runspace: a separate PowerShell session inside the s
 - `-JobParams` takes a list or array of job hashtables. A single hashtable works too, so a list that happens to hold one job is fine.
 - A worker runspace starts empty. Name every one of your functions it calls in `-SharedFunctionNames`. The kit's own worker functions are always there, and cmdlets and functions from installed modules load on their own. A module you imported by path isn't installed, so list its functions too (or put it on `$env:PSModulePath`).
 - Each job starts in your current location (the real folder, if you're on a `New-PSDrive` drive), in a fresh scope. A folder change or a variable one job makes, preference variables like `$ErrorActionPreference` included, doesn't carry over to the next job. Relative paths in .NET calls such as `[System.IO.File]::ReadAllText('x.txt')` still go by the process's working directory, as they do outside workers, so give .NET full paths.
-- Whatever the worker returns is handed to `-ResultHandler` on the main thread, once per object returned.
+- Whatever the worker returns is handed to `-ResultHandler` on the main thread, once per object returned, in the order workers finish. Return something that identifies the job with each result, as the example's `Path` does.
 - `-NextJobProvider { ... }` can replace `-JobParams` to produce jobs lazily: it's called on the main thread for the next job hashtable, and returns `$null` when there are no more.
 - `-PollCallback { ... }` runs on the main thread on every loop pass, for progress display and the like. That's at least every 0.1 s, and can be many times more often when jobs finish quickly, so keep it cheap.
 - `-JobCrashedHandler { param($err, $job) ... }` is told when a worker throws, including while an abort waits for running workers, with the job hashtable that crashed. Leave `$job` out of `param()` if you don't need it. `$err.Exception.InnerException` is the worker's own error. That job's result handler isn't called, and anything the worker output before throwing is lost. If the handler itself throws, that's reported as a message and the run carries on.
@@ -312,7 +314,7 @@ Other pieces: `Request-PkAbort` triggers the same abort from code. `Test-PkAbort
 ## Limits
 
 - Windows only (console and Job Object APIs). Built for Windows PowerShell 5.1; PowerShell 7 on Windows passes the same test suite.
-- Run it in a PowerShell console window or an editor's terminal (graceful Ctrl+C tested in Windows Terminal and Visual Studio's built-in terminal). The Windows PowerShell ISE isn't supported: tested there, the kit loads and runs, but the ISE has no console, so Ctrl+C stops the script outright, with no graceful drain and no cleanup callbacks.
+- Run it in a PowerShell console window or an editor's terminal (graceful Ctrl+C tested in Windows Terminal, Visual Studio's built-in terminal and VS Code's terminal, including the PowerShell extension's). The Windows PowerShell ISE isn't supported: tested there, the kit loads and runs, but the ISE has no console, so Ctrl+C stops the script outright, with no graceful drain and no cleanup callbacks.
 - It needs FullLanguage mode, since it compiles a little C# with `Add-Type` when loaded. On a machine locked down to Constrained Language Mode (usually by AppLocker or Windows Defender Application Control), loading it fails with a message saying so. Some endpoint security products also flag scripts that compile code calling Windows APIs at runtime; if yours blocks the kit, that's the likely reason.
 - After changing `ParallelKit.ps1` itself, start a new PowerShell window. A session keeps the kit's compiled parts until it closes; the kit tells you if it finds an older copy loaded.
 - One run at a time per process. The abort state is shared. A nested `Invoke-PkRun` just runs inside the outer one.
