@@ -694,8 +694,14 @@ function ConvertTo-PkArgumentString {
     # An argument with a space, tab, newline or quote is wrapped in quotes, its
     # quotes become \", and backslashes are doubled where they come before a quote.
     # These are the C runtime's rules, which most Windows programs use; cmd.exe /c
-    # parses its own way. The kit's -Arguments and Arguments values do this
-    # themselves when given a list.
+    # parses its own way. An argument with one of & | < > ^ ( ) , ; is quoted
+    # too, so a .bat or .cmd program, which runs through cmd.exe, gets it as one
+    # argument instead of cmd acting on it. Not covered for those programs: cmd
+    # expands %NAME% inside quotes, splits batch arguments at = (left unquoted,
+    # since some programs read NAME=value themselves), and counts a \" as a
+    # quote, so an argument containing a quote can end up partly unquoted. The
+    # kit's -Arguments and Arguments values do this themselves when given a
+    # list.
     # .PARAMETER Arguments
     # The arguments, in order. A $null one is left out; an empty string is passed
     # as "".
@@ -720,7 +726,11 @@ function ConvertTo-PkArgumentString {
     foreach ($item in $Arguments) {
         if ($null -eq $item) { continue }
         $arg = [string]$item
-        if ($arg.Length -gt 0 -and $arg.IndexOfAny([char[]]@(' ', "`t", "`n", "`v", '"')) -lt 0) {
+        # The C runtime only needs quotes around whitespace and quotes. The rest
+        # are cmd.exe's: it runs a .bat/.cmd program's command line, acting on
+        # & | < > ^ ( ) outside quotes and splitting batch arguments at , ;
+        # Quoting them is harmless to other programs.
+        if ($arg.Length -gt 0 -and $arg.IndexOfAny([char[]]@(' ', "`t", "`n", "`v", '"', '&', '|', '<', '>', '^', '(', ')', ',', ';')) -lt 0) {
             $parts.Add($arg)
             continue
         }

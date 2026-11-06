@@ -2683,6 +2683,24 @@ if ($compiled) {
     Test-Assert ((ConvertTo-PkArgumentString $null) -eq '') "and takes `$null itself"
     Test-Assert ((ConvertTo-PkArgumentString 'two words') -eq '"two words"' -and (ConvertTo-PkArgumentString @(1, 'x y')) -eq '1 "x y"') "it still takes one string, and non-strings"
 
+    # cmd.exe's special characters. A .bat/.cmd program runs through cmd.exe,
+    # which acts on & | < > ^ outside quotes and splits batch arguments at , ;
+    # so an element holding one is quoted even without a space. 'a&ver' used to
+    # reach a batch file as 'a' and run ver.
+    $special = @('a&b', 'a|b', 'a<b', 'a>b', 'a^b', '(x)', 'a,b', 'a;b')
+    Test-Assert ((ConvertTo-PkArgumentString $special) -eq '"a&b" "a|b" "a<b" "a>b" "a^b" "(x)" "a,b" "a;b"') "an element with a cmd.exe special character is quoted"
+    Test-Assert ((Get-BatchArgvText $special) -eq '[a&b][a|b][a<b][a>b][a^b][(x)][a,b][a;b]') "and an ordinary program still gets it exactly"
+    Test-Assert ((ConvertTo-PkArgumentString @('a=b', '100%', 'a!b')) -eq 'a=b 100% a!b') "= % and ! are left alone"
+    $batFile = Join-Path $env:TEMP ("pk-args-" + [guid]::NewGuid().ToString("N") + ".cmd")
+    # set "NAME=value" keeps & | ^ literal, so this prints what cmd handed over.
+    [System.IO.File]::WriteAllText($batFile, "@echo off`r`nset `"PKARG1=%~1`"`r`nset `"PKARG2=%~2`"`r`nset PKARG`r`n")
+    foreach ($value in @('a&ver', 'a|b', 'a^b', 'a,b', 'a;b', '(x)')) {
+        $batText = $null
+        try { $batText = (Invoke-PkProcessWithTimeout -FilePath $batFile -Arguments @($value) -TimeoutMs 10000).Stdout.Trim() } catch { $batText = [string]$_ }
+        Test-Assert ($batText -ceq ('PKARG1=' + $value)) ("a .cmd program gets '" + $value + "' as one argument, and nothing else runs (" + $batText + ")")
+    }
+    try { [System.IO.File]::Delete($batFile) } catch { }  # temp file only; best effort
+
     # A string is still exactly as written.
     Test-Assert ((Get-BatchArgvText '"C:\My Files\a.png" out.jxl') -eq $spacedText) "a string is still passed exactly as written"
     # The documented change: list elements are values, not pieces of a command line.
