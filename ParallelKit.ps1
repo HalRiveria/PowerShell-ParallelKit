@@ -1597,8 +1597,14 @@ function Invoke-PkProcessDispatchCore {
             } catch {
                 # Release BEFORE reporting: if reporting throws, the slot
                 # would otherwise leak (this job never reached $pkRunning, so
-                # the outer cleanup can't find it). Cleared first, so the
-                # teardown can't release the same slot again.
+                # the outer cleanup can't find it). $pkStarting is cleared
+                # first, so the teardown can't release the same slot again.
+                # A starter that started its program and then threw: nothing
+                # tracks that program now, so kill it before its slot goes back.
+                if ($pkJob['Proc'] -is [System.Diagnostics.Process]) {
+                    try { $null = Stop-PkProcessTree -Process $pkJob['Proc'] } catch { }   # best effort; the failed start is still reported below
+                    try { $pkJob['Proc'].Dispose() } catch { }
+                }
                 $pkStarting = $null
                 if ($pkIsSharedBudget) { $null = $pkMaxConcurrent.Release() }
                 # The batch sets this key on its own jobs: it reports start failures itself.
@@ -1785,6 +1791,7 @@ function Invoke-PkProcessDispatchCore {
             $pkRunning = $pkStillWaiting
         }
 
+        # Same per-job steps as the teardown in the finally below; keep the two in step.
         if ($pkRunning.Count -gt 0) {
             $pkDispatchResult.ForceKilledCount = $pkRunning.Count
             Write-PkMessage ("ProcessDispatch: force-stopping " + $pkRunning.Count + " job(s)" + (Get-PkForceStopReason -TimeoutSeconds $pkAbortTimeoutSeconds) + ".") -Level Warn
@@ -1805,7 +1812,8 @@ function Invoke-PkProcessDispatchCore {
             # error carries on up by itself. A job with SlotReleased set was
             # already finalized or force-stopped, and its process disposed:
             # left alone, since a disposed Process makes Stop-PkProcessTree
-            # throw part-way through.
+            # throw part-way through. Same per-job steps as the abort wait's
+            # force-stop above; keep the two in step.
             $pkTearDown = [System.Collections.Generic.List[hashtable]]::new()
             foreach ($pkJob in $pkRunning) { if (-not $pkJob['SlotReleased']) { $pkTearDown.Add($pkJob) } }
             if ($null -ne $pkStarting -and -not $pkTearDown.Contains($pkStarting)) { $pkTearDown.Add($pkStarting) }
