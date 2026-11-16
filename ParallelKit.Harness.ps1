@@ -1867,7 +1867,7 @@ function Get-HarnessCd {
     $wd.WithTimeout = (Invoke-PkProcessWithTimeout -FilePath $cmdExe -Arguments '/c cd').Stdout.Trim()
     $started = Start-PkProcess -FilePath $cmdExe -Arguments '/c cd'
     $null = Wait-PkProcess -Process $started['Proc'] -TimeoutMs 10000
-    $wd.StartProcess = (Complete-PkProcess -Job $started -Dispose $true).Stdout.Trim()
+    $wd.StartProcess = (Complete-PkProcess -Job $started -Dispose).Stdout.Trim()
     $out = @{ Text = $null }
     $feed = @{ Given = $false }
     $null = Invoke-PkProcessDispatch -MaxConcurrent 1 `
@@ -2187,7 +2187,7 @@ function Test-HarnessFunctionDrive {
     try {
         $started = Start-PkProcess -FilePath $cmdExe -Arguments '/c cd' -WorkingDirectory 'PkFnDrive:\sub'
         $null = Wait-PkProcess -Process $started['Proc'] -TimeoutMs 10000
-        & $check 'start' (Complete-PkProcess -Job $started -Dispose $true).Stdout
+        & $check 'start' (Complete-PkProcess -Job $started -Dispose).Stdout
     } catch { $wrong.Add('start threw') }
     $batch = Invoke-PkProcessBatch -Commands @(@{ FilePath = $cmdExe; Arguments = '/c cd'; WorkingDirectory = 'PkFnDrive:\sub' })
     & $check 'batch' $batch.Results[0].Stdout
@@ -3215,6 +3215,24 @@ $null = Invoke-PkProcessDispatch -MaxConcurrent 1 -TimeoutSeconds 1 `
     } `
     -JobFinalize { param($job, $q) $tkLog.Add(@{ TimedOut = $job['TimedOut']; Protected = ($null -ne $job['Child']) }); if ($null -ne $job['Child']) { $job['Child'].Dispose() } }.GetNewClosure()
 Test-Assert ($tkLog.Count -eq 1 -and $tkLog[0].Protected -and $tkLog[0].TimedOut -eq $true) ("a job killed for its time limit has TimedOut = `$true even when part of its tree survives (" + (@($tkLog | ForEach-Object { 'TimedOut=' + $_.TimedOut + ', child protected=' + $_.Protected }) -join '; ') + ")")
+Reset-Harness
+Write-Host ""
+
+Write-Host "=== AK: 3.0 parameter changes ===" -ForegroundColor Cyan
+
+# Complete-PkProcess -Dispose is a switch, and only -Job binds by position, so
+# the old -Dispose $true is an error instead of a 1 ms -StreamTimeoutMs.
+Reset-Harness
+$apiStarted = Start-PkProcess -FilePath $cmdExe -Arguments '/c echo pk-api'
+$null = $apiStarted.Proc.WaitForExit(10000)
+$threw = $null
+try { $null = Complete-PkProcess -Job $apiStarted -Dispose $true } catch { $threw = [string]$_ }
+Test-Assert ($threw -like "*positional parameter*'True'*") ("Complete-PkProcess -Dispose `$true is an error (" + $threw + ")")
+$threw = $null
+try { $null = Complete-PkProcess $apiStarted 5000 } catch { $threw = [string]$_ }
+Test-Assert ($threw -like "*positional parameter*'5000'*") ("a -StreamTimeoutMs by position is an error (" + $threw + ")")
+$apiDone = Complete-PkProcess $apiStarted -Dispose
+Test-Assert ($apiDone.ExitCode -eq 0 -and ([string]$apiDone.Stdout).Trim() -eq 'pk-api') "Complete-PkProcess `$job -Dispose works, -Job by position"
 Reset-Harness
 Write-Host ""
 

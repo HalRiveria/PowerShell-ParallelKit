@@ -1173,14 +1173,19 @@ function Complete-PkProcess {
     # .PARAMETER StreamTimeoutMs
     # How long to wait for the output after the program exits (default 15000).
     # .PARAMETER Dispose
-    # Dispose the process object afterwards (default $false).
+    # Dispose the process object afterwards.
     # .OUTPUTS
     # An object with ExitCode, Stdout, Stderr, StreamTimedOut and StreamError.
+
+    # Only -Job by position: with -Dispose a switch, the old `-Dispose $true`
+    # would otherwise hand its $true to -StreamTimeoutMs (1 ms) and cut the
+    # output off without an error. This way it's an error.
+    [CmdletBinding(PositionalBinding = $false)]
     param(
-        [Parameter(Mandatory)]
+        [Parameter(Mandatory, Position = 0)]
         [hashtable]$Job,
         [int]$StreamTimeoutMs = 15000,
-        [bool]$Dispose = $false
+        [switch]$Dispose
     )
     $result = [ordered]@{ ExitCode = $null; Stdout = $null; Stderr = $null; StreamTimedOut = $false; StreamError = $null }
     # A job started by a custom starter may have no read tasks, and a read
