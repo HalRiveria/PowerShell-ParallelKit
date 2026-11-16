@@ -2387,7 +2387,9 @@ function Invoke-LimitGroup {
     return @{ Log = $log; Result = $result; Problem = $problem; Secs = $sw.Elapsed.TotalSeconds }
 }
 function Get-LimitEntry { param($Run, [string]$Name) return ,@($Run.Log | Where-Object { $_.Name -eq $Name }) }
-function Get-LimitPingCount { param([int]$N) return @(Get-CimInstance Win32_Process -Filter "Name = 'PING.EXE'" | Where-Object { $_.CommandLine -like ("*-n " + $N + " 127.0.0.1*") }).Count }
+# The pings a test started, told apart by their -n count. Also used by section AG.
+function Get-LimitPing { param([int]$N) return @(Get-CimInstance Win32_Process -Filter "Name = 'PING.EXE'" | Where-Object { $_.CommandLine -like ("*-n " + $N + " 127.0.0.1*") }) }
+function Get-LimitPingCount { param([int]$N) return @(Get-LimitPing $N).Count }
 
 # -TimeoutSeconds, and a job's own key overriding it in both directions.
 $limitRun = Invoke-LimitGroup -Extra @{ TimeoutSeconds = 2 } -Jobs @(
@@ -2807,6 +2809,146 @@ $safetyOff = @{ CheckWorkerSafety = $false }
 $out = $null
 try { $out = Invoke-PkRunspaceJobs -WorkerScript $unsafeWorker -JobParams (New-JobList -Jobs @(@{ Id = 1 })) -MaxParallel 1 @safetyOff } catch { Write-Host "  splatted opt-out threw: $_" }
 Test-Assert ($null -ne $out -and $out.CrashedCount -eq 0) "a splatted CheckWorkerSafety = `$false turns it off"
+Reset-Harness
+Write-Host ""
+
+Write-Host "=== AG: a stopped run leaves no programs running ===" -ForegroundColor Cyan
+
+# PowerShell stopping a script (Ctrl+C outside Invoke-PkRun, a third press
+# inside it, the runspace engine force-stopping a worker) skips catch blocks
+# and runs only finally blocks. Each run below is stopped while its programs
+# are running; each uses its own ping count so it can be told apart.
+$stopKitPath = Join-Path $PSScriptRoot "ParallelKit.ps1"
+function Stop-StrayPings {
+    param([int]$N)
+    Get-LimitPing $N | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+}
+function Invoke-StoppedRun {
+    # Runs $Script (given the kit's path, then $ArgumentList) in its own
+    # [PowerShell], waits for $Expect pings of count $N, stops it, and
+    # returns how many were running before and after the stop.
+    param([scriptblock]$Script, [object[]]$ArgumentList = @(), [int]$N, [int]$Expect)
+    $ps = [PowerShell]::Create()
+    $null = $ps.AddScript($Script).AddArgument($stopKitPath)
+    foreach ($a in $ArgumentList) { $null = $ps.AddArgument($a) }
+    $null = $ps.BeginInvoke()
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    while ((Get-LimitPingCount $N) -lt $Expect -and $sw.Elapsed.TotalSeconds -lt 15) { Start-Sleep -Milliseconds 200 }
+    $before = Get-LimitPingCount $N
+    $ps.Stop()
+    $sw.Restart()
+    while ((Get-LimitPingCount $N) -gt 0 -and $sw.Elapsed.TotalSeconds -lt 3) { Start-Sleep -Milliseconds 200 }
+    $after = Get-LimitPingCount $N
+    Stop-StrayPings $N
+    $ps.Dispose()
+    return @{ Before = $before; After = $after }
+}
+
+$stopRun = Invoke-StoppedRun -N 41 -Expect 2 -Script {
+    param($kit, $ping)
+    . $kit
+    Invoke-PkProcessBatch -MaxConcurrent 2 -Commands @(@{ FilePath = $ping; Arguments = '-n 41 127.0.0.1' }, @{ FilePath = $ping; Arguments = '-n 41 127.0.0.1' })
+} -ArgumentList @($pingExe)
+Test-Assert ($stopRun.Before -eq 2 -and $stopRun.After -eq 0) ("stopping a batch kills its running programs (" + $stopRun.Before + " running, " + $stopRun.After + " left)")
+
+$stopBudget = [System.Threading.SemaphoreSlim]::new(2, 2)
+$stopRun = Invoke-StoppedRun -N 42 -Expect 2 -Script {
+    param($kit, $ping, $budget)
+    . $kit
+    $feed = @{ Given = $false }
+    Invoke-PkProcessDispatch -MaxConcurrent $budget `
+        -GroupProvider { if ($feed.Given) { return $null }; $feed.Given = $true; return 'g' }.GetNewClosure() `
+        -JobBuilder { param($g) return @(@{ FilePath = $ping; Arguments = '-n 42 127.0.0.1' }, @{ FilePath = $ping; Arguments = '-n 42 127.0.0.1' }) }.GetNewClosure() `
+        -JobFinalize { param($job, $q) $null = Complete-PkProcess -Job $job }
+} -ArgumentList @($pingExe, $stopBudget)
+Test-Assert ($stopRun.Before -eq 2 -and $stopRun.After -eq 0 -and $stopBudget.CurrentCount -eq 2) ("stopping a dispatcher kills its programs and gives back its shared slots (" + $stopRun.After + " left, " + $stopBudget.CurrentCount + " of 2 slots free)")
+
+# Stopped while -JobStarter is still running, after it set .Proc: the job
+# isn't in the running list yet.
+$stopBudget = [System.Threading.SemaphoreSlim]::new(2, 2)
+$stopRun = Invoke-StoppedRun -N 44 -Expect 1 -Script {
+    param($kit, $ping, $budget)
+    . $kit
+    $feed = @{ Given = $false }
+    Invoke-PkProcessDispatch -MaxConcurrent $budget `
+        -GroupProvider { if ($feed.Given) { return $null }; $feed.Given = $true; return 'g' }.GetNewClosure() `
+        -JobBuilder { param($g) return @(@{ FilePath = $ping; Arguments = '-n 44 127.0.0.1' }) }.GetNewClosure() `
+        -JobStarter { param($job) $s = Start-PkProcess -FilePath $job['FilePath'] -Arguments $job['Arguments']; $job['Proc'] = $s.Proc; $job['StdoutTask'] = $s.StdoutTask; $job['StderrTask'] = $s.StderrTask; Start-Sleep -Seconds 60; return $job } `
+        -JobFinalize { param($job, $q) $null = Complete-PkProcess -Job $job }
+} -ArgumentList @($pingExe, $stopBudget)
+Test-Assert ($stopRun.Before -eq 1 -and $stopRun.After -eq 0 -and $stopBudget.CurrentCount -eq 2) ("stopping a dispatcher mid-start kills that program too and gives back its slot (" + $stopRun.After + " left, " + $stopBudget.CurrentCount + " of 2 slots free)")
+
+$stopRun = Invoke-StoppedRun -N 43 -Expect 1 -Script {
+    param($kit, $ping)
+    . $kit
+    Invoke-PkProcessWithTimeout -FilePath $ping -Arguments '-n 43 127.0.0.1' -TimeoutMs 120000
+} -ArgumentList @($pingExe)
+Test-Assert ($stopRun.Before -eq 1 -and $stopRun.After -eq 0) ("stopping Invoke-PkProcessWithTimeout kills its program (" + $stopRun.Before + " running, " + $stopRun.After + " left)")
+
+# The runspace engine force-stops a worker whose dispatcher is still waiting
+# out its own abort: the worker's programs must die with it.
+Reset-Harness
+$stopCts = [System.Threading.CancellationTokenSource]::new()
+$stopWatch = [System.Diagnostics.Stopwatch]::StartNew()
+$stopPoll = { if ($stopWatch.Elapsed.TotalSeconds -ge 1 -and (Get-LimitPingCount 46) -ge 2) { $stopCts.Cancel() } elseif ($stopWatch.Elapsed.TotalSeconds -ge 15) { $stopCts.Cancel() } }.GetNewClosure()
+$stopOut = $null
+try {
+    $stopOut = Invoke-PkRunspaceJobs -MaxParallel 1 -Cts $stopCts -DrainTimeoutSeconds 1 -AbortWaitMessage '' -PollCallback $stopPoll `
+        -JobParams (New-JobList -Jobs @(@{ Ping = $pingExe })) `
+        -WorkerScript { param($Ping) $null = Invoke-PkProcessBatch -MaxConcurrent 2 -Commands @(@{ FilePath = $Ping; Arguments = '-n 46 127.0.0.1' }, @{ FilePath = $Ping; Arguments = '-n 46 127.0.0.1' }) }
+} catch { Write-Host "  force-stopped worker run threw: $_" }
+$stopWatch.Restart()
+while ((Get-LimitPingCount 46) -gt 0 -and $stopWatch.Elapsed.TotalSeconds -lt 8) { Start-Sleep -Milliseconds 200 }
+$stopLeft = Get-LimitPingCount 46
+Stop-StrayPings 46
+Test-Assert ($null -ne $stopOut -and $stopOut.ForceStoppedCount -eq 1 -and $stopLeft -eq 0) ("a force-stopped worker's programs are killed (" + $stopLeft + " left)")
+$stopCts.Dispose()
+
+# Not a stop, but the same leak: a starter that started its program and then
+# threw. The failed start is counted and reported; the program must not run on.
+Reset-Harness
+$stopBudget = [System.Threading.SemaphoreSlim]::new(2, 2)
+$stopFeed = @{ Given = $false }
+$stopResult = $null
+try {
+    $stopResult = Invoke-PkProcessDispatch -MaxConcurrent $stopBudget `
+        -GroupProvider { if ($stopFeed.Given) { return $null }; $stopFeed.Given = $true; return 'g' }.GetNewClosure() `
+        -JobBuilder { param($g) return @(@{ FilePath = $pingExe; Arguments = '-n 48 127.0.0.1' }) }.GetNewClosure() `
+        -JobStarter { param($job) $s = Start-PkProcess -FilePath $job['FilePath'] -Arguments $job['Arguments']; $job['Proc'] = $s.Proc; throw "starter failed after starting" } `
+        -JobFinalize { param($job, $q) $null = Complete-PkProcess -Job $job }
+} catch { Write-Host "  throwing-starter run threw: $_" }
+$stopLeft = Get-LimitPingCount 48
+Stop-StrayPings 48
+Test-Assert ($null -ne $stopResult -and $stopResult.JobStarterFailedCount -eq 1 -and $stopLeft -eq 0 -and $stopBudget.CurrentCount -eq 2) ("a starter that throws after starting its program doesn't leave it running (" + $stopLeft + " left, " + $stopBudget.CurrentCount + " of 2 slots free)")
+
+# An error out of the loop, after another job in the same pass was finalized
+# and disposed: the teardown must still kill the job that's running.
+Reset-Harness
+$stopJobs = @(@{ Name = 'a'; FilePath = $cmdExe; Arguments = '/c exit 0' }, @{ Name = 'b'; FilePath = $cmdExe; Arguments = '/c exit 0' }, @{ Name = 'c'; FilePath = $pingExe; Arguments = '-n 47 127.0.0.1' })
+$stopFeed = @{ Given = $false }
+$stopReady = @{ Done = $false }
+$stopProblem = $null
+try {
+    $null = Invoke-PkProcessDispatch -MaxConcurrent 3 `
+        -GroupProvider { if ($stopFeed.Given) { return $null }; $stopFeed.Given = $true; return 'g' }.GetNewClosure() `
+        -JobBuilder { param($g) return $stopJobs }.GetNewClosure() `
+        -JobPollCompleted {
+            param($job)
+            if ($job['Name'] -eq 'c') { return $false }
+            # 'a' and 'b' only report done together, so both finish in one
+            # pass. Latched: 'a' is disposed once it's finalized.
+            if (-not $stopReady.Done) {
+                foreach ($j in $stopJobs[0..1]) { if ($null -eq $j['Proc'] -or -not $j['Proc'].HasExited) { return $false } }
+                if ((Get-LimitPingCount 47) -lt 1) { return $false }
+                $stopReady.Done = $true
+            }
+            return $true
+        }.GetNewClosure() `
+        -JobFinalize { param($job, $q) $null = Complete-PkProcess -Job $job; if ($job['Name'] -eq 'b') { throw "finalize failed" } }
+} catch { $stopProblem = [string]$_ }
+$stopLeft = Get-LimitPingCount 47
+Stop-StrayPings 47
+Test-Assert ($stopProblem -like '*finalize failed*' -and $stopLeft -eq 0) ("an error after a job was finalized in the same pass still kills the running ones (" + $stopLeft + " left, problem: " + $stopProblem + ")")
 Reset-Harness
 Write-Host ""
 
