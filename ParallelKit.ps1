@@ -1,7 +1,8 @@
 # ParallelKit - parallel runspace jobs, bounded external-process dispatch, and
-# graceful Ctrl+C/window-close handling for Windows PowerShell 5.1.
+# graceful Ctrl+C/window-close handling for Windows PowerShell 5.1 and
+# PowerShell 7.
 #
-# Version 2.3 - https://github.com/HalRiveria/PowerShell-ParallelKit
+# Version 3.0 - https://github.com/HalRiveria/PowerShell-ParallelKit
 # Copyright (c) 2026 HalRiveria. MIT License: keep this notice with any copy;
 # the full text is in LICENSE in the repository.
 #
@@ -355,6 +356,7 @@ function Set-PkMessageHandler {
     # The handler gets ($Message, $Level), where Level is Info, Warn or Error, and
     # always runs on the main thread, including for messages from worker code. If it
     # throws, the message is shown on the console instead and the run carries on.
+    # Leave it early with return: continue and break end it too, but warn once.
     # .PARAMETER Handler
     # { param($Message, $Level) ... }, or $null to go back to the default (console).
     # .EXAMPLE
@@ -658,7 +660,8 @@ function Invoke-PkRun {
     # and whatever is left is then stopped. A long step of your own in here must
     # check Test-PkAbortSignal now and then and stop when it's true, or Ctrl+C will
     # seem to do nothing until that step ends. Pressing Ctrl+C again, or closing the
-    # window, skips the wait; a third press stops the script as Ctrl+C normally does.
+    # window, skips the wait; a third press stops the script as Ctrl+C normally does,
+    # and the kit's engines still kill the programs they started.
     #
     # For the length of the run it also keeps the PC from idle-sleeping and turns off
     # the console's QuickEdit mode. Whatever the block outputs is passed through.
@@ -906,7 +909,8 @@ function Start-PkProcess {
     # The program to run. A path with a folder in it is read as PowerShell reads
     # paths: .\tool.exe and bin\tool.exe are relative to your current location, and
     # drives like Data:\ or ~ work. A bare name (tool.exe) is found the way Windows
-    # finds programs, mostly on PATH.
+    # finds programs, mostly on PATH. Only an .exe is found without its extension:
+    # write a .cmd wrapper out in full (npm.cmd).
     # .PARAMETER Arguments
     # Its command line: one string, passed exactly as written, or a list, each
     # element one argument, quoted for you (see ConvertTo-PkArgumentString).
@@ -1007,8 +1011,9 @@ function Stop-PkProcessTree {
     # .PARAMETER Process
     # The program(s), such as the Proc that Start-PkProcess returns.
     # .OUTPUTS
-    # [bool] For one program, $true if this call killed it and $false if it
-    # had already exited. For several, $true if this call killed any of them.
+    # [bool] For one program, $true if this call killed it, even if part of its
+    # tree couldn't be killed, and $false if it had already exited. For several,
+    # $true if this call killed any of them.
     param(
         [Parameter(Mandatory)]
         [AllowEmptyCollection()]
@@ -1289,8 +1294,9 @@ function Invoke-PkProcessDispatch {
     # .DESCRIPTION
     # Groups are pulled one at a time from -GroupProvider; -JobBuilder turns each
     # into job hashtables; jobs run up to -MaxConcurrent at once across all groups;
-    # -GroupCompleteCallback fires when a group's last job finishes. Anything your
-    # callbacks output is discarded.
+    # -GroupCompleteCallback fires when a group's last job finishes. Apart from the
+    # return values described below, anything your callbacks output is discarded.
+    # Leave a callback early with return: continue and break end it too, but warn.
     #
     # The dispatcher keeps its own state on each job hashtable. Don't use these keys
     # for anything else: GroupKey, SlotReleased, Proc, StdoutTask, StderrTask,
@@ -1950,7 +1956,7 @@ function Invoke-PkProcessBatch {
     # ExitCode, Stdout, Stderr, StreamTimedOut, StreamError, StartError, Aborted and
     # TimedOut, in the order the programs finished.
     # .EXAMPLE
-    # $commands = foreach ($f in Get-ChildItem *.png) { @{ FilePath = 'cjxl.exe'; Arguments = (ConvertTo-PkArgumentString @($f.FullName, "$($f.FullName).jxl")) } }
+    # $commands = foreach ($f in Get-ChildItem *.png) { @{ FilePath = 'cjxl.exe'; Arguments = @($f.FullName, "$($f.FullName).jxl") } }
     # $batch = Invoke-PkRun { Invoke-PkProcessBatch -Commands $commands -MaxConcurrent 6 }
     # $batch.Results | Format-Table ExitCode, Aborted, TimedOut
     param(

@@ -22,7 +22,7 @@ Most uses are this: a list of command-line programs, run a few at a time, where 
 . "$PSScriptRoot\ParallelKit.ps1"
 
 $commands = foreach ($f in Get-ChildItem *.png) {
-    @{ FilePath = 'cjxl.exe'; Arguments = (ConvertTo-PkArgumentString @($f.FullName, "$($f.FullName).jxl")) }
+    @{ FilePath = 'cjxl.exe'; Arguments = @($f.FullName, "$($f.FullName).jxl") }
 }
 $batch = Invoke-PkRun { Invoke-PkProcessBatch -Commands $commands -MaxConcurrent 6 }
 
@@ -80,7 +80,7 @@ What none of them do for you:
 
 ## Setup
 
-Requires Windows, with Windows PowerShell 5.1 or PowerShell 7. Download `ParallelKit.ps1` from the [Releases page](https://github.com/HalRiveria/PowerShell-ParallelKit/releases) (this README describes version 2.3 and later), put it in your project, and dot-source it from your script:
+Requires Windows, with Windows PowerShell 5.1 or PowerShell 7. Download `ParallelKit.ps1` from the [Releases page](https://github.com/HalRiveria/PowerShell-ParallelKit/releases) (this README describes version 3.0 and later), put it in your project, and dot-source it from your script:
 
 ```powershell
 . "$PSScriptRoot\ParallelKit.ps1"
@@ -108,7 +108,7 @@ Each public function has built-in help: `Get-Help Invoke-PkProcessBatch -Full` s
 ```powershell
 # Any command-line tool works. cjxl is a JPEG XL image encoder.
 $commands = foreach ($f in Get-ChildItem *.png) {
-    @{ FilePath = 'cjxl.exe'; Arguments = (ConvertTo-PkArgumentString @($f.FullName, "$($f.FullName).jxl")); Source = $f }
+    @{ FilePath = 'cjxl.exe'; Arguments = @($f.FullName, "$($f.FullName).jxl"); Source = $f }
 }
 $batchParams = @{
     Commands      = $commands
@@ -123,7 +123,16 @@ $batch = Invoke-PkRun { Invoke-PkProcessBatch @batchParams }
 
 Long parameter lists in these examples use splatting (`@batchParams`) instead of trailing backticks: it's easier to read, and a stray space after a backtick can't break it.
 
-Each command is a hashtable with `FilePath`, `Arguments` and optionally `WorkingDirectory`, plus any keys of your own. `Arguments` is either one string, passed to the program exactly as written, or a list, where each element is one argument: `Arguments = @($in, $out)` works with spaces in the paths. A list is quoted the way `ConvertTo-PkArgumentString @(...)` quotes it, so the program gets exactly that list back, spaces, quotes and trailing backslashes included, and `$null` elements are left out. A file or folder object from `Get-ChildItem` or `Get-Item` is passed as its full path. An element that's itself a list is an error, not one argument. Quotes inside an element are passed on as quote characters, so don't pre-quote list elements. It follows the rules most Windows programs use; `cmd.exe /c` parses its own way, so give it one string. A `.bat` or `.cmd` program runs through `cmd.exe` too. A list element holding `&`, `|`, `<`, `>`, `^`, `(`, `)`, `,` or `;` is quoted, so such a program gets it as one argument. What quoting can't cover there: `cmd.exe` expands `%NAME%` in an argument, quoted or not, when a variable by that name exists; and it splits batch arguments at `=`, which isn't quoted because some programs read `NAME=value` from the command line themselves. A `"` inside an element is written `""` for these programs, so `cmd.exe` can't be made to run anything else, and a batch file that passes `%*` on to another program still delivers it as one `"`. An element holding a line break can't be passed to them at all, so it's an error. All this needs the list form: a string, including one from `ConvertTo-PkArgumentString`, is passed as written. Programs run hidden, with their output captured.
+Each command is a hashtable with `FilePath`, `Arguments` and optionally `WorkingDirectory`, plus any keys of your own. Programs run hidden, with their output captured.
+
+`Arguments` is either one string, passed to the program exactly as written, or a list with one argument per element: `Arguments = @($in, $out)` works with spaces in the paths. With a list:
+
+- The program gets exactly that list back, spaces, quotes and trailing backslashes included. Don't pre-quote elements: a quote inside one is passed on as a quote character.
+- `$null` elements are left out, a file or folder object from `Get-ChildItem` or `Get-Item` is its full path, and an element that's itself a list is an error.
+- The quoting follows the rules most Windows programs use. `cmd.exe /c` parses its own way, so give it one string.
+- A `.bat` or `.cmd` program runs through `cmd.exe`, and the list is quoted for it: an element holding `&`, `|`, `<`, `>`, `^`, `(`, `)`, `,`, `;` or `"` reaches it as one argument and can't make `cmd.exe` run anything else, and a batch file that passes `%*` on to another program delivers the same list. An element with a line break is an error. What quoting can't stop: `cmd.exe` expands `%NAME%` when a variable by that name exists, and splits batch arguments at `=` (left unquoted, since some programs read `NAME=value` themselves).
+
+Only the list form gets this quoting. A string, including one built with `ConvertTo-PkArgumentString`, is passed as written.
 
 Programs run in your current location (`Get-Location`) unless a command says otherwise, and a relative `WorkingDirectory`, or a `FilePath` with a folder in it like `.\tools\cjxl.exe`, is relative to that location too. Drives PowerShell knows, like `~` or one made with `New-PSDrive`, work in both. A bare name like `cjxl.exe` is found the way Windows finds programs, mostly on `PATH`. Only an `.exe` is found without its extension (Windows doesn't use `PATHEXT` here), so a `.cmd` wrapper such as `npm` has to be written out: `npm.cmd`. A `.bat` or `.cmd` program can't run in a network-share (`\\server\share`) folder: `cmd.exe` falls back to `C:\Windows` there, so give such commands a local `WorkingDirectory`.
 
@@ -198,7 +207,7 @@ Each worker runs in its own runspace: a separate PowerShell session inside the s
 - Don't call `exit` in a worker. It ends that job quietly (not as a crash) and sets your whole script's exit code.
 - `-MaxParallel` has no default; you choose it. `-DrainTimeoutSeconds` (how long Ctrl+C waits for running workers) defaults to 60. The process engines' names, `-MaxConcurrent` and `-AbortTimeoutSeconds`, work here too.
 - If `-ResultHandler`, `-PollCallback` or `-NextJobProvider` throws, the run stops: workers still going are told to stop and the exception comes out of the call.
-- Returns an object with `ForceStoppedCount`, `CrashedCount`, `Aborted`, `Crashed`, which lists the `Job` and `Error` of each worker that threw, and `Errors`, which lists the `Job` and `Error` of each non-terminating error a worker wrote (including any a worker wrote before it threw). A worker that was force-stopped is in neither list. Every entry is kept until the call returns, so a worker that can write thousands of errors (walking a tree full of folders it can't read, say) should handle them itself, e.g. with `-ErrorAction SilentlyContinue -ErrorVariable`.
+- Returns an object with `ForceStoppedCount`, `CrashedCount`, `Aborted`, `Crashed` and `Errors`. `Crashed` lists the `Job` and `Error` of each worker that threw. `Errors` lists the `Job` and `Error` of each non-terminating error a worker wrote, including any written before it threw. A force-stopped worker is in neither list. Every entry is kept until the call returns, so a worker that can write thousands of errors (walking a tree of folders it can't read, say) should handle them itself, e.g. with `-ErrorAction SilentlyContinue -ErrorVariable`.
 
 ## The two rules for worker code
 
@@ -264,11 +273,11 @@ To leave any callback early, use `return`. PowerShell sends a `continue` or `bre
 | Function | Use |
 |---|---|
 | `Invoke-PkProcessWithTimeout -FilePath -Arguments -TimeoutMs` | Run one program and wait, with a hard time limit (default 60s). Returns an object with `ExitCode`, `Stdout`, `Stderr`, `StreamTimedOut` and `StreamError`. If it overruns, or the run is aborted, the program is killed and this **throws**; add `-IgnoreAbort` for a cleanup step that must finish anyway. |
-| `ConvertTo-PkArgumentString @(args)` | Join a list of arguments into one correctly quoted command line. `-Arguments` / `Arguments` also take the list directly and quote it the same way. |
+| `ConvertTo-PkArgumentString @(args)` | Join a list of arguments into one correctly quoted command line. `-Arguments` / `Arguments` also take the list directly, and then also quote it for `cmd.exe` when the program is a `.bat` or `.cmd`. |
 | `Start-PkProcess -FilePath -Arguments` | Start one hidden, with output captured in the background. Returns `@{ Proc; StdoutTask; StderrTask; Stopwatch }`; throws if it can't start. |
 | `Wait-PkProcess -Process -TimeoutMs` | Wait for exit with a timeout that can't overrun. Returns `$true` if it exited. |
 | `Complete-PkProcess -Job` | Collect exit code and output from a finished one (`-Job` is what `Start-PkProcess` returned). Same result as `Invoke-PkProcessWithTimeout`. |
-| `Stop-PkProcessTree -Process` | Kill one or more programs and every program they started, in one `taskkill` call. For one program, returns `$false` if it had already exited. |
+| `Stop-PkProcessTree -Process` | Kill one or more programs and every program they started, in one `taskkill` call. For one program, returns `$true` if it killed it (even if part of its tree couldn't be) and `$false` if it had already exited. |
 
 `Invoke-PkProcessWithTimeout` and `Start-PkProcess` also take `-WorkingDirectory`.
 
@@ -293,7 +302,7 @@ Inside `Invoke-PkRun { ... }`, Ctrl+C:
 3. waits for in-flight work (`-AbortTimeoutSeconds`, default 60; every engine also takes it as `-DrainTimeoutSeconds`),
 4. force-stops whatever is left, calling `-JobAbortCleanup` for each killed or never-started process job.
 
-Press Ctrl+C again to skip step 3: whatever is still running is force-stopped right away, and your script carries on. A third press stops the script the way Ctrl+C normally does. Presses less than a second apart count as one, and Ctrl+Break works the same as Ctrl+C.
+Press Ctrl+C again to skip step 3: whatever is still running is force-stopped right away, and your script carries on. A third press stops the script the way Ctrl+C normally does, and the kit's engines still kill the programs they started. Presses less than a second apart count as one, and Ctrl+Break works the same as Ctrl+C.
 
 Closing the window does the same minus step 3: Windows allows only a few seconds, so leftovers are stopped right away.
 
@@ -332,7 +341,7 @@ Other pieces: `Request-PkAbort` triggers the same abort from code. `Test-PkAbort
 powershell -NoProfile -File .\ParallelKit.Harness.ps1
 ```
 
-It uses real runspaces and real child processes (`cmd.exe`, `ping.exe`), with nothing mocked, so it takes about two minutes. It prints a `[PASS]`/`[FAIL]` line per check and exits 0 only if everything passed. A few checks send real Ctrl+C, Ctrl+Break and window-close events to child PowerShell processes in hidden consoles of their own, never to yours. Where a machine can't deliver those, they print `[SKIP]` with the reason instead; set `PK_HARNESS_NO_SKIP=1` to count skips as failures. A few `message handler failed` lines in the output are expected: some checks break the message handler on purpose to test the fallback.
+It uses real runspaces and real child processes (`cmd.exe`, `ping.exe`), with nothing mocked, so it takes two to three minutes. It prints a `[PASS]`/`[FAIL]` line per check and exits 0 only if everything passed. A few checks send real Ctrl+C, Ctrl+Break and window-close events to child PowerShell processes in hidden consoles of their own, never to yours. Where a machine can't deliver those, they print `[SKIP]` with the reason instead; set `PK_HARNESS_NO_SKIP=1` to count skips as failures. A few `message handler failed` lines in the output are expected: some checks break the message handler on purpose to test the fallback.
 
 GitHub runs the same harness on Windows PowerShell 5.1 and on PowerShell 7 for every pull request and every change to `main`.
 
