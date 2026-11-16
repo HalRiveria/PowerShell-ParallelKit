@@ -257,6 +257,8 @@ All of these callbacks run on whichever thread called the dispatcher: the main t
 
 Callbacks: a plain `{ ... }` callback sees your variables and functions from where you called the kit, never the kit's own internals, so `.GetNewClosure()` isn't needed for that, inside a worker runspace or out. Keep any state a callback changes in a hashtable (`$state = @{ Count = 0 }`, then `$state.Count++`). A plain variable assigned inside a callback doesn't stick between calls. A `.GetNewClosure()` block can't see functions your script defines when the script is run from a prompt (`.\script.ps1`); the kit's own functions always work, but define any of yours that a closure calls as `function global:Get-Thing { ... }`.
 
+To leave any callback early, use `return`. PowerShell sends a `continue` or `break` to the nearest loop, which for a callback is one of the kit's own, so the kit catches them and treats them as `return`, with a warning (once per callback per call). A labeled `break` to a loop of yours (`break outer`) does leave the kit's call: it stops there, kills the programs it started and returns nothing.
+
 ## Single processes
 
 | Function | Use |

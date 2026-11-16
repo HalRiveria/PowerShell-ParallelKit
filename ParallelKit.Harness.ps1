@@ -2952,6 +2952,133 @@ Test-Assert ($stopProblem -like '*finalize failed*' -and $stopLeft -eq 0) ("an e
 Reset-Harness
 Write-Host ""
 
+Write-Host "=== AH: 'continue' or 'break' in a callback stays in the callback ===" -ForegroundColor Cyan
+
+# PowerShell sends continue/break to the nearest loop on the call stack, which
+# for a callback is one of the kit's own. Each case runs in its own
+# [PowerShell] so one that hangs fails after a timeout instead of hanging the
+# suite. In each, KEYWORD becomes the keyword; the case sets $kwOk and
+# $kwDetail. The kit must finish the run correctly and warn once.
+$kwPrelude = @'
+$kwMessages = [System.Collections.Generic.List[string]]::new()
+Set-PkMessageHandler { param($Message, $Level) $kwMessages.Add($Message) }.GetNewClosure()
+$kwCount = @{ N = 0 }
+$kwList = [System.Collections.Generic.List[object]]::new()
+function Invoke-KwDispatch {
+    param([hashtable]$Extra = @{}, [int]$Jobs = 2, [string]$FilePath = 'cmd.exe', [string]$Arguments = '/c exit 0', [int]$MaxConcurrent = 1)
+    $feed = @{ Given = $false }
+    $done = [System.Collections.Generic.List[object]]::new()
+    $p = @{
+        MaxConcurrent = $MaxConcurrent
+        GroupProvider = { if ($feed.Given) { return $null }; $feed.Given = $true; 'g' }.GetNewClosure()
+        JobBuilder    = { param($g) foreach ($i in 1..$Jobs) { @{ FilePath = $FilePath; Arguments = $Arguments } } }.GetNewClosure()
+        JobFinalize   = { param($job, $q) $null = Complete-PkProcess -Job $job; $done.Add(1) }.GetNewClosure()
+    }
+    foreach ($k in $Extra.Keys) { $p[$k] = $Extra[$k] }
+    $r = Invoke-PkProcessDispatch @p
+    return @{ Result = $r; Done = $done.Count }
+}
+'@
+$kwCases = [ordered]@{
+    '-OnComplete (batch)' = @'
+$b = Invoke-PkProcessBatch -MaxConcurrent 1 -Commands @(@{ FilePath = 'cmd.exe'; Arguments = '/c exit 0' }, @{ FilePath = 'cmd.exe'; Arguments = '/c exit 0' }, @{ FilePath = 'cmd.exe'; Arguments = '/c exit 0' }) -OnComplete { param($c, $r) $kwCount.N++; KEYWORD }
+$kwOk = ($b.Results.Count -eq 3 -and $kwCount.N -eq 3); $kwDetail = "results " + $b.Results.Count + ", calls " + $kwCount.N
+'@
+    '-JobFinalize' = @'
+$d = Invoke-KwDispatch -Extra @{ JobFinalize = { param($job, $q) $null = Complete-PkProcess -Job $job; $kwCount.N++; KEYWORD } }
+$kwOk = ($kwCount.N -eq 2 -and $d.Result.GroupResults.Count -eq 1 -and $d.Result.GroupResults[0].Completed); $kwDetail = "finalized " + $kwCount.N
+'@
+    '-GroupCompleteCallback' = @'
+$d = Invoke-KwDispatch -Extra @{ GroupCompleteCallback = { param($g) $kwCount.N++; KEYWORD } }
+$kwOk = ($kwCount.N -eq 1 -and $d.Done -eq 2 -and $d.Result.GroupResults.Count -eq 1); $kwDetail = "calls " + $kwCount.N + ", done " + $d.Done
+'@
+    '-JobStarter' = @'
+$d = Invoke-KwDispatch -Extra @{ JobStarter = { param($job) $s = Start-PkProcess -FilePath $job['FilePath'] -Arguments $job['Arguments']; $job['Proc'] = $s.Proc; $job['StdoutTask'] = $s.StdoutTask; $job['StderrTask'] = $s.StderrTask; KEYWORD } }
+$kwOk = ($d.Done -eq 2 -and $d.Result.JobStarterFailedCount -eq 0); $kwDetail = "done " + $d.Done
+'@
+    '-JobPollCompleted' = @'
+$d = Invoke-KwDispatch -FilePath 'ping.exe' -Arguments '-n 2 127.0.0.1' -MaxConcurrent 2 -Extra @{ JobPollCompleted = { param($job) if ($job['Proc'].HasExited) { return $true }; $kwCount.N++; KEYWORD } }
+$kwOk = ($d.Done -eq 2 -and $kwCount.N -gt 0); $kwDetail = "done " + $d.Done + ", not-yet polls " + $kwCount.N
+'@
+    '-JobAbortCleanup' = @'
+$cts = [System.Threading.CancellationTokenSource]::new()
+$cts.CancelAfter(300)
+$d = Invoke-KwDispatch -Jobs 3 -FilePath 'ping.exe' -Arguments '-n 2 127.0.0.1' -Extra @{ CancelToken = $cts.Token; AbortTimeoutSeconds = 30; JobAbortCleanup = { param($job) $kwCount.N++; KEYWORD } }
+$kwOk = ($d.Result.Aborted -and $d.Done -eq 1 -and $kwCount.N -eq 2); $kwDetail = "done " + $d.Done + ", cleaned " + $kwCount.N
+'@
+    '-GroupReleaseCheck' = @'
+$d = Invoke-KwDispatch -Jobs 0 -Extra @{ JobBuilder = { param($g) }; GroupReleaseCheck = { param($g) $kwCount.N++; if ($kwCount.N -ge 3) { return $true }; KEYWORD } }
+$kwOk = ($d.Result.GroupResults.Count -eq 1 -and $kwCount.N -ge 3); $kwDetail = "checks " + $kwCount.N
+'@
+    '-AbortPollCallback' = @'
+$d = Invoke-KwDispatch -Extra @{ AbortPollCallback = { param($running) $kwCount.N++; KEYWORD } }
+$kwOk = ($d.Done -eq 2 -and $d.Result.GroupResults.Count -eq 1); $kwDetail = "done " + $d.Done
+'@
+    '-GroupProvider' = @'
+$d = Invoke-KwDispatch -Extra @{ GroupProvider = { $kwCount.N++; if ($kwCount.N -eq 1) { return 'g' }; KEYWORD } }
+$kwOk = ($d.Done -eq 2 -and $d.Result.GroupResults.Count -eq 1); $kwDetail = "done " + $d.Done + ", provider calls " + $kwCount.N
+'@
+    '-JobBuilder' = @'
+$d = Invoke-KwDispatch -Extra @{ JobBuilder = { param($g) @{ FilePath = 'cmd.exe'; Arguments = '/c exit 0' }; KEYWORD } }
+$kwOk = ($d.Done -eq 1 -and $d.Result.GroupResults.Count -eq 1); $kwDetail = "done " + $d.Done
+'@
+    '-ResultHandler' = @'
+$o = Invoke-PkRunspaceJobs -MaxParallel 1 -JobParams @(@{ Id = 1 }) -WorkerScript { param($Id) 1; 2; 3 } -ResultHandler { param($r) $kwCount.N++; KEYWORD }
+$kwOk = ($kwCount.N -eq 3 -and -not $o.Aborted); $kwDetail = "results " + $kwCount.N
+'@
+    '-PollCallback' = @'
+$o = Invoke-PkRunspaceJobs -MaxParallel 1 -JobParams @(@{ Id = 1 }, @{ Id = 2 }) -WorkerScript { param($Id) Start-Sleep -Milliseconds 300; $Id } -ResultHandler { param($r) $kwList.Add($r) } -PollCallback { $kwCount.N++; KEYWORD }
+$kwOk = ($kwList.Count -eq 2 -and $o.ForceStoppedCount -eq 0); $kwDetail = "results " + $kwList.Count
+'@
+    '-NextJobProvider' = @'
+$o = Invoke-PkRunspaceJobs -MaxParallel 1 -NextJobProvider { $kwCount.N++; if ($kwCount.N -le 3) { return @{ Id = $kwCount.N } }; KEYWORD } -WorkerScript { param($Id) $Id } -ResultHandler { param($r) $kwList.Add($r) }
+$kwOk = ($kwList.Count -eq 3); $kwDetail = "results " + $kwList.Count
+'@
+    '-JobCrashedHandler' = @'
+$o = Invoke-PkRunspaceJobs -MaxParallel 1 -JobParams @(@{ Id = 1 }, @{ Id = 2 }) -WorkerScript { param($Id) throw "boom" } -JobCrashedHandler { param($e) $kwCount.N++; KEYWORD }
+$kwOk = ($kwCount.N -eq 2 -and $o.CrashedCount -eq 2); $kwDetail = "handler calls " + $kwCount.N + ", crashed " + $o.CrashedCount
+'@
+    'message handler' = @'
+Set-PkMessageHandler { param($Message, $Level) $kwList.Add($Message); KEYWORD }
+$b = Invoke-PkProcessBatch -MaxConcurrent 1 -Commands @(@{ FilePath = 'cmd.exe'; Arguments = '/c exit 0' }, @{ FilePath = 'pk-no-such-program.exe' }, @{ FilePath = 'cmd.exe'; Arguments = '/c exit 0' })
+$kwOk = ($b.Results.Count -eq 3 -and $kwList.Count -ge 1); $kwDetail = "results " + $b.Results.Count
+'@
+}
+$kwEpilogue = @'
+[pscustomobject]@{ Ok = [bool]$kwOk; Detail = [string]$kwDetail; Warned = @($kwMessages | Where-Object { $_ -like "*'continue' or 'break'*" }).Count }
+'@
+$kwSavedHandler = [PkState]::MessageHandler
+foreach ($kwName in $kwCases.Keys) {
+    foreach ($kwKeyword in 'continue', 'break') {
+        $kwScript = ". '" + $stopKitPath + "'`r`n" + $kwPrelude + "`r`n" + $kwCases[$kwName].Replace('KEYWORD', $kwKeyword) + "`r`n" + $kwEpilogue
+        $ps = [PowerShell]::Create()
+        $null = $ps.AddScript($kwScript)
+        $async = $ps.BeginInvoke()
+        $kwFinished = $async.AsyncWaitHandle.WaitOne(20000)
+        $kwOut = $null
+        $kwError = ''
+        if ($kwFinished) {
+            try { $kwOut = @($ps.EndInvoke($async)) | Select-Object -Last 1 } catch { $kwError = [string]$_ }
+        } else {
+            $ps.Stop()
+        }
+        $kwConsole = (@($ps.Streams.Information) | ForEach-Object { [string]$_ }) -join ' '
+        $ps.Dispose()
+        # The case set its own handler in this process's shared state: put the harness's back.
+        [PkState]::MessageHandler = $kwSavedHandler
+        if ($kwName -eq 'message handler') {
+            # Its warning can't go through the handler that broke, so it goes to the console.
+            $kwWarned = $kwConsole -like "*'continue' or 'break'*"
+        } else {
+            $kwWarned = ($null -ne $kwOut -and $kwOut.Warned -eq 1)
+        }
+        $kwDetailText = if ($null -ne $kwOut) { $kwOut.Detail + ", warnings " + $kwOut.Warned } elseif ($kwFinished) { "error: " + $kwError } else { "still running after 20 s" }
+        Test-Assert ($kwFinished -and $null -ne $kwOut -and $kwOut.Ok -and $kwWarned) ("'" + $kwKeyword + "' in " + $kwName + " ends only the callback, with one warning (" + $kwDetailText + ")")
+    }
+}
+Reset-Harness
+Write-Host ""
+
 Set-PkMessageHandler -Handler $null
 Reset-PkAbortState
 
