@@ -2158,6 +2158,23 @@ function Add-PkCrashedJob {
     }
 }
 
+function Add-PkJobErrors {
+    # A finished worker's non-terminating errors: print each, as always, and
+    # record it with its job on the run's outcome. Shared by the main loop and
+    # the abort drain. Called for a worker that crashed too: its error stream
+    # holds only the errors from before the one that stopped it.
+    param(
+        [Parameter(Mandatory)][System.Collections.Specialized.OrderedDictionary]$PkOutcome,
+        [hashtable]$PkJob,
+        $PkErrors
+    )
+    if ($null -eq $PkErrors) { return }
+    foreach ($pkError in $PkErrors) {
+        $PkOutcome.Errors.Add([pscustomobject][ordered]@{ Job = $PkJob; Error = $pkError })
+        Invoke-PkMessageHandler -Message ("Runspace error: " + $pkError.ToString()) -Level Error
+    }
+}
+
 function Receive-PkCompletedHandles {
     param(
         [System.Collections.Generic.List[hashtable]]$Handles,
@@ -2174,14 +2191,15 @@ function Receive-PkCompletedHandles {
             # locals, and $results.Add($r) there grew the collection this loop
             # walks, so it never ended. Same in Invoke-PkRunspaceJobs.
             $pkWorkerOutput = $null
+            $pkCrash = $null
             try {
-                $pkWorkerOutput = $h.PS.EndInvoke($h.Handle)
-                # Same report as Invoke-PkRunspaceJobs' main loop.
-                if ($h.PS.HadErrors) {
-                    foreach ($e in $h.PS.Streams.Error) { Invoke-PkMessageHandler -Message ("Runspace error: " + $e.ToString()) -Level Error }
+                try { $pkWorkerOutput = $h.PS.EndInvoke($h.Handle) } catch { $pkCrash = $_ }
+                # Same report as Invoke-PkRunspaceJobs' main loop: the errors
+                # it wrote, then the crash, in the order they happened.
+                Add-PkJobErrors -PkOutcome $Outcome -PkJob $h['Job'] -PkErrors $h.PS.Streams.Error
+                if ($null -ne $pkCrash) {
+                    Add-PkCrashedJob -PkOutcome $Outcome -PkJob $h['Job'] -PkError $pkCrash -PkHandler $JobCrashedHandler -PkWhen " during abort drain" -PkCallbackWarned $CallbackWarned
                 }
-            } catch {
-                Add-PkCrashedJob -PkOutcome $Outcome -PkJob $h['Job'] -PkError $_ -PkHandler $JobCrashedHandler -PkWhen " during abort drain" -PkCallbackWarned $CallbackWarned
             } finally {
                 $h.PS.Dispose()
             }
@@ -2265,7 +2283,8 @@ function Invoke-PkRunspaceJobs {
     # Each job starts in your current location, in a fresh scope: a folder change
     # or a variable from an earlier job doesn't carry over.
     # Only an error that stops the worker (throw, -ErrorAction Stop) counts as a
-    # crash; a non-terminating one is printed and the job's output still counts.
+    # crash; a non-terminating one is printed, recorded in Errors, and the job's
+    # output still counts.
     # The worker code is checked against the worker rules (see the README)
     # before anything starts, and each job's values before that job starts;
     # code or values that break them are refused.
@@ -2303,8 +2322,9 @@ function Invoke-PkRunspaceJobs {
     # Check the worker code and job values before starting. On unless you pass
     # -CheckWorkerSafety:$false, whatever Get-Help says the default is.
     # .OUTPUTS
-    # An object with ForceStoppedCount, CrashedCount, Aborted and Crashed (one
-    # @{ Job; Error } entry per worker that threw).
+    # An object with ForceStoppedCount, CrashedCount, Aborted, Crashed (one
+    # @{ Job; Error } entry per worker that threw) and Errors (one @{ Job; Error }
+    # entry per non-terminating error a worker wrote).
     # .EXAMPLE
     # Invoke-PkRunspaceJobs -MaxParallel 4 -JobParams @(@{ Id = 1 }, @{ Id = 2 }) -WorkerScript { param($Id) $Id * 2 } -ResultHandler { param($r) Write-Host $r }
     param(
@@ -2356,7 +2376,7 @@ function Invoke-PkRunspaceJobs {
         $JobParams = $normalizedJobs
     }
 
-    $outcome = [ordered]@{ ForceStoppedCount = 0; CrashedCount = 0; Aborted = $false; Crashed = [System.Collections.Generic.List[object]]::new() }
+    $outcome = [ordered]@{ ForceStoppedCount = 0; CrashedCount = 0; Aborted = $false; Crashed = [System.Collections.Generic.List[object]]::new(); Errors = [System.Collections.Generic.List[object]]::new() }
     if ($null -ne $JobParams -and $JobParams.Count -eq 0) { return [pscustomobject]$outcome }
 
     if ($checkSafety) {
@@ -2520,16 +2540,17 @@ function Invoke-PkRunspaceJobs {
                     # $results.Add($r) there grew the collection this loop
                     # walks, so it never ended. Same in Receive-PkCompletedHandles.
                     $pkWorkerOutput = $null
+                    $pkCrash = $null
                     try {
-                        $pkWorkerOutput = $h.PS.EndInvoke($h.Handle)
-                        # Same report as Receive-PkCompletedHandles.
-                        if ($h.PS.HadErrors) {
-                            foreach ($e in $h.PS.Streams.Error) { Invoke-PkMessageHandler -Message ("Runspace error: " + $e.ToString()) -Level Error }
+                        try { $pkWorkerOutput = $h.PS.EndInvoke($h.Handle) } catch { $pkCrash = $_ }
+                        # Same report as Receive-PkCompletedHandles: the errors
+                        # it wrote, then the crash, in the order they happened.
+                        Add-PkJobErrors -PkOutcome $outcome -PkJob $h['Job'] -PkErrors $h.PS.Streams.Error
+                        if ($null -ne $pkCrash) {
+                            # The worker itself threw - there is no result, so
+                            # -ResultHandler is never called for this job.
+                            Add-PkCrashedJob -PkOutcome $outcome -PkJob $h['Job'] -PkError $pkCrash -PkHandler $JobCrashedHandler -PkCallbackWarned $pkCallbackWarned
                         }
-                    } catch {
-                        # The worker itself threw - there is no result, so
-                        # -ResultHandler is never called for this job.
-                        Add-PkCrashedJob -PkOutcome $outcome -PkJob $h['Job'] -PkError $_ -PkHandler $JobCrashedHandler -PkCallbackWarned $pkCallbackWarned
                     } finally {
                         $h.PS.Dispose()
                     }

@@ -1341,7 +1341,7 @@ Test-Assert ((Get-HarnessShape $shapeOne) -eq 'ExitCode,Stdout,Stderr,StreamTime
 $shapeDispatch = Invoke-PkProcessDispatch -MaxConcurrent 1 -GroupProvider { return $null } -JobBuilder { param($g) } -JobFinalize { param($j, $p) }
 Test-Assert ((Get-HarnessShape $shapeDispatch) -eq 'GroupResults,Aborted,ForceKilledCount,JobStarterFailedCount') ("the dispatcher returns an object (" + (Get-HarnessShape $shapeDispatch) + ")")
 $shapeJobs = Invoke-PkRunspaceJobs -MaxParallel 1 -JobParams @{ Id = 1 } -WorkerScript { param($Id) }
-Test-Assert ((Get-HarnessShape $shapeJobs) -eq 'ForceStoppedCount,CrashedCount,Aborted,Crashed') ("runspace jobs return an object (" + (Get-HarnessShape $shapeJobs) + ")")
+Test-Assert ((Get-HarnessShape $shapeJobs) -eq 'ForceStoppedCount,CrashedCount,Aborted,Crashed,Errors') ("runspace jobs return an object (" + (Get-HarnessShape $shapeJobs) + ")")
 $shapeFindings = Test-PkWorkerSafety -WorkerScript { param($Id) $null = [Func[int]]{ 1 } }
 $shapeFinding = $shapeFindings[0]
 Test-Assert ((Get-HarnessShape $shapeFinding) -eq 'Rule,Where,Line,Text') ("worker-safety findings are objects (" + (Get-HarnessShape $shapeFinding) + ")")
@@ -2052,7 +2052,7 @@ $outcome = @{}
 $plainJobs = Invoke-PkRunspaceJobs -MaxParallel 1 -JobParams (New-JobList -Jobs @(@{ Id = 1 })) -WorkerScript { param([int]$Id) @{ Id = ("job" + $Id) } } -ResultHandler { param($r) $outcome[$r.Id] = 1 }
 $privateCall = @(Test-PkWorkerSafety -WorkerScript { param($N) Invoke-PkMessageHandler -Message 'x' -Level Info })
 Test-Assert ($privateCall.Count -eq 1 -and $privateCall[0].Rule -eq 'MissingFunction') ("worker code calling one of the kit's private helpers is still flagged (" + (@($privateCall | ForEach-Object { $_.Rule }) -join ',') + ")")
-Test-Assert ($outcome.Count -eq 1 -and @($plainJobs.PSObject.Properties).Count -eq 4) ("a plain -ResultHandler writes to the caller's `$outcome, not the kit's return value (caller's " + $outcome.Count + ")")
+Test-Assert ($outcome.Count -eq 1 -and @($plainJobs.PSObject.Properties).Count -eq 5) ("a plain -ResultHandler writes to the caller's `$outcome, not the kit's return value (caller's " + $outcome.Count + ")")
 $ScriptBlock = 'mine'
 $fromRun = Invoke-PkRun { $ScriptBlock }
 Remove-Variable -Name ScriptBlock
@@ -2256,6 +2256,10 @@ $softRun = Invoke-PkRunspaceJobs -MaxParallel 2 -JobParams (New-JobList -Jobs @(
 } -PollCallback { $poll.Count++; if ($poll.Count -eq 3) { Request-PkAbort } }.GetNewClosure() -ResultHandler { param($r) $softOut.Add($r) }.GetNewClosure()
 $softMessages = @($script:messages | Where-Object { $_.Level -eq 'Error' -and $_.Message -like 'Runspace error: soft drain*' }).Count
 Test-Assert ($softRun.Aborted -and $softRun.CrashedCount -eq 0 -and $softOut.Count -eq 2 -and $softMessages -eq 2) ("a non-terminating error during an abort's drain is reported (messages " + $softMessages + ", results " + $softOut.Count + ")")
+$softErrorsProp = $softRun.PSObject.Properties['Errors']   # read safely: strict mode throws on a missing property
+$softErrorIds = @()
+if ($null -ne $softErrorsProp) { $softErrorIds = @($softErrorsProp.Value | ForEach-Object { $_.Job['Id'] } | Sort-Object) }
+Test-Assert (($softErrorIds -join ',') -eq '1,2') ("and lands in Errors with its job (" + ($softErrorIds -join ',') + ")")
 Reset-Harness
 Write-Host ""
 
@@ -3100,6 +3104,45 @@ $kwLabeled = 'unset'
 $kwLeft = Get-LimitPingCount 35
 Stop-StrayPings 35
 Test-Assert ($kwLabeled -eq 'unset' -and $kwLeft -eq 0) ("a labeled break out of a callback leaves the call and kills its programs (" + $kwLeft + " left)")
+Reset-Harness
+Write-Host ""
+
+Write-Host "=== AI: a worker's non-terminating errors are recorded with their job ===" -ForegroundColor Cyan
+
+Reset-Harness
+$errOut = [System.Collections.Generic.List[object]]::new()
+$errRun = Invoke-PkRunspaceJobs -MaxParallel 2 -JobParams (New-JobList -Jobs @(@{ Id = 1 }, @{ Id = 2 }, @{ Id = 3 })) -WorkerScript {
+    param([int]$Id)
+    if ($Id -eq 2) { Write-Error "soft two"; Write-Error "soft two again" }
+    return $Id
+} -ResultHandler { param($r) $errOut.Add($r) }.GetNewClosure()
+$errProp = $errRun.PSObject.Properties['Errors']   # read safely: strict mode throws on a missing property
+$errList = @()
+if ($null -ne $errProp) { $errList = @($errProp.Value) }
+$errOk = ($errList.Count -eq 2)
+foreach ($e in $errList) { if ($e.Job['Id'] -ne 2 -or $e.Error -isnot [System.Management.Automation.ErrorRecord] -or ([string]$e.Error) -notlike 'soft two*') { $errOk = $false } }
+Test-Assert ($errOk -and $errRun.CrashedCount -eq 0 -and $errOut.Count -eq 3) ("a worker's non-terminating errors land in Errors, each with its job and ErrorRecord (" + $errList.Count + " entries)")
+$errPrinted = @($script:messages | Where-Object { $_.Level -eq 'Error' -and $_.Message -like 'Runspace error: soft two*' }).Count
+Test-Assert ($errPrinted -eq 2) ("and are still printed (" + $errPrinted + ")")
+
+# A worker that writes an error and then throws: the error it wrote is
+# printed and recorded too, and the throw is a crash, not an Errors entry.
+Reset-Harness
+$errRun = Invoke-PkRunspaceJobs -MaxParallel 1 -JobParams (New-JobList -Jobs @(@{ Id = 7 })) -WorkerScript {
+    param([int]$Id)
+    Write-Error "soft before the crash"
+    throw "hard crash"
+}
+$errProp = $errRun.PSObject.Properties['Errors']
+$errList = @()
+if ($null -ne $errProp) { $errList = @($errProp.Value) }
+$errPrinted = @($script:messages | Where-Object { $_.Message -like 'Runspace error: soft before the crash*' }).Count
+Test-Assert ($errRun.CrashedCount -eq 1 -and $errList.Count -eq 1 -and $errList[0].Job['Id'] -eq 7 -and ([string]$errList[0].Error) -like 'soft before the crash*' -and $errPrinted -eq 1) ("a crashed worker's earlier non-terminating error is printed and recorded (" + $errList.Count + " entries, printed " + $errPrinted + ")")
+
+# An empty job list returns the same shape.
+$errEmpty = Invoke-PkRunspaceJobs -MaxParallel 1 -JobParams @() -WorkerScript { param($Id) }
+$errProp = $errEmpty.PSObject.Properties['Errors']
+Test-Assert ($null -ne $errProp -and @($errProp.Value).Count -eq 0) "an empty run has an empty Errors list"
 Reset-Harness
 Write-Host ""
 
