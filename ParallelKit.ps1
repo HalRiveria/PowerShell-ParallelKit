@@ -1222,6 +1222,10 @@ function Invoke-PkProcessWithTimeout {
         }
         return Complete-PkProcess -Job $job -StreamTimeoutMs $StreamTimeoutMs
     } finally {
+        # Still running here only when PowerShell is stopping the script
+        # (that skips catch blocks, not finally ones): kill it before the
+        # process object goes. Best effort, as above.
+        try { if (-not $job['Proc'].HasExited) { $null = Stop-PkProcessTree -Process $job['Proc'] } } catch { }
         $job['Proc'].Dispose()
     }
 }
@@ -1508,6 +1512,14 @@ function Invoke-PkProcessDispatchCore {
         JobStarterFailedCount = 0
     }
 
+    # The job -JobStarter is working on: not in $pkRunning yet, but it may
+    # already have a program and a shared slot.
+    $pkStarting = $null
+    # Teardown is in a finally, guarded by this flag, not in a catch: when
+    # PowerShell stops the script (Ctrl+C outside Invoke-PkRun, the runspace
+    # engine force-stopping a worker) catch blocks are skipped and only
+    # finally blocks run.
+    $pkLoopDone = $false
     try {
     while ((-not $pkCancelToken.IsCancellationRequested) -and `
            (-not $pkProviderExhausted -or $pkActiveGroupCount -gt 0 -or $pkPending.Count -gt 0 -or $pkRunning.Count -gt 0)) {
@@ -1563,6 +1575,7 @@ function Invoke-PkProcessDispatchCore {
                     $pkJob['Proc'] = $null; $pkJob['StdoutTask'] = $null; $pkJob['StderrTask'] = $null; $pkJob['Stopwatch'] = $null
                 }
                 $pkJob['SlotReleased'] = $false
+                $pkStarting = $pkJob
                 # Before starting, so a bad key never leaves a program running.
                 $pkStartFailureText = "ProcessDispatch: a job couldn't start: "
                 $pkJob['TimeLimit'] = Get-PkJobTimeLimit -Job $pkJob -DefaultTimeoutSeconds $pkTimeoutSeconds
@@ -1580,10 +1593,13 @@ function Invoke-PkProcessDispatchCore {
                 $pkJob['TimedOut'] = $false
                 if ($pkJob['TimeLimit'] -gt 0 -and $null -eq $pkJob['Stopwatch']) { $pkJob['Stopwatch'] = [System.Diagnostics.Stopwatch]::StartNew() }
                 $pkRunning.Add($pkJob)
+                $pkStarting = $null
             } catch {
                 # Release BEFORE reporting: if reporting throws, the slot
                 # would otherwise leak (this job never reached $pkRunning, so
-                # the outer cleanup can't find it).
+                # the outer cleanup can't find it). Cleared first, so the
+                # teardown can't release the same slot again.
+                $pkStarting = $null
                 if ($pkIsSharedBudget) { $null = $pkMaxConcurrent.Release() }
                 # The batch sets this key on its own jobs: it reports start failures itself.
                 if (-not $pkJob['StartFailureReported']) { Write-PkMessage ($pkStartFailureText + $_) -Level Error }
@@ -1662,150 +1678,145 @@ function Invoke-PkProcessDispatchCore {
 
         if ($pkIsSharedBudget -or -not $pkAnyFinished) { Wait-PkRunningJobs -Jobs $pkRunning -CancelToken $pkCancelToken -TimeoutMs 50 }
     }
-    } catch {
-        # Best-effort teardown on the way out; the original error is rethrown.
-        Stop-PkJobProcesses -Jobs $pkRunning
-        foreach ($pkJob in $pkRunning) {
-            try { if ($pkJob['Proc']) { $null = $pkJob['Proc'].WaitForExit(5000) } } catch { }
-            if (-not $pkJob['SlotReleased']) {
-                try { $null = & $pkJobAbortCleanup $pkJob } catch { }
-                if ($pkIsSharedBudget) { try { $null = $pkMaxConcurrent.Release() } catch { } }
-            }
-            try { if ($pkJob['Proc']) { $pkJob['Proc'].Dispose() } } catch { }
-        }
-        throw
-    }
 
     if ($pkCancelToken.IsCancellationRequested -and $pkRunning.Count -gt 0) {
-        try {
-            $pkAbortDeadline = [System.Diagnostics.Stopwatch]::StartNew()
-            while ($pkRunning.Count -gt 0 -and -not [PkConsoleCtrl]::IsCloseEvent -and -not [PkConsoleCtrl]::SkipDrain -and $pkAbortDeadline.Elapsed.TotalSeconds -lt $pkAbortTimeoutSeconds) {
-                # ---- BLOCK: graceful-wait loop ---- (keep in sync with the
-                # main poll pass above and the final pass below)
-                $pkStillWaiting = [System.Collections.Generic.List[hashtable]]::new()
-                foreach ($pkJob in $pkRunning) {
-                    if ($pkJob['TimeLimit'] -gt 0) { Stop-PkTimedOutJob -Job $pkJob }
-                    if (& $pkJobPollCompleted $pkJob) {
-                        $pkPendingBefore = $pkPending.Count
-                        $null = & $pkJobFinalize $pkJob $pkPending
-                        try { if ($pkJob['Proc']) { $pkJob['Proc'].Dispose() } } catch { }
-                        if ($pkIsSharedBudget) { $null = $pkMaxConcurrent.Release() }
-                        $pkJob['SlotReleased'] = $true
-                        # Whatever JobFinalize queued (a retry, follow-up steps) is counted
-                        # into its group HERE, by looking at the queue - not by trusting a
-                        # returned flag. A flag with nothing queued would hang the group
-                        # forever; two follow-ups would let it finish early.
-                        # Only when the queue actually grew - walking it on every finished
-                        # job would cost a full pass over a large batch each time.
-                        if ($pkPending.Count -gt $pkPendingBefore) {
-                            $pkQueuedIndex = 0
-                            foreach ($pkQueued in $pkPending) {
-                                if ($pkQueuedIndex -ge $pkPendingBefore) {
-                                    if ($null -eq $pkQueued['GroupKey']) { $pkQueued['GroupKey'] = $pkJob['GroupKey']; if (-not $pkQueued.ContainsKey('Group')) { $pkQueued['Group'] = $pkJob['Group'] } }
-                                    if ($pkGroupStates.ContainsKey($pkQueued['GroupKey'])) { $pkGroupStates[$pkQueued['GroupKey']].Outstanding++ }
-                                }
-                                $pkQueuedIndex++
-                            }
-                        }
-                        if ($null -ne $pkJob['GroupKey']) {
-                            $pkKey = $pkJob['GroupKey']
-                            if ($pkGroupStates.ContainsKey($pkKey)) {
-                                $pkState = $pkGroupStates[$pkKey]
-                                $pkState.Outstanding--
-                                if ($pkState.Outstanding -le 0 -and -not $pkState.Completed) {
-                                    $null = & $pkGroupCompleteCallback $pkState.GroupInfo
-                                    $pkState.Completed = $true
-                                    $pkActiveGroupCount--
-                                    $pkGroupResults.Add([pscustomobject][ordered]@{ GroupInfo = $pkState.GroupInfo; Completed = $true; Aborted = $false })
-                                }
-                            } else {
-                                Write-PkMessage ("ProcessDispatch: invariant violation - job's GroupKey is not registered (graceful-wait loop). This should be unreachable.") -Level Error
-                            }
-                        }
-                    } else {
-                        $pkStillWaiting.Add($pkJob)
-                    }
-                }
-                $pkRunning = $pkStillWaiting
-                if ($pkRunning.Count -gt 0) { [System.Threading.Thread]::Sleep(250) }
-            }
-
-            # ---- BLOCK: mandatory final completion-check pass ----
-            # A window-close can exit the loop above before a single poll, and
-            # a job can finish in the last 250ms before the deadline. One more
-            # pass so a finished job is never thrown away as "force-stopped".
-            # (keep in sync with the two blocks above, except the time limit:
-            # whatever is still running is force-stopped together just below)
-            if ($pkRunning.Count -gt 0) {
-                $pkStillWaiting = [System.Collections.Generic.List[hashtable]]::new()
-                foreach ($pkJob in $pkRunning) {
-                    if (& $pkJobPollCompleted $pkJob) {
-                        $pkPendingBefore = $pkPending.Count
-                        $null = & $pkJobFinalize $pkJob $pkPending
-                        try { if ($pkJob['Proc']) { $pkJob['Proc'].Dispose() } } catch { }
-                        if ($pkIsSharedBudget) { $null = $pkMaxConcurrent.Release() }
-                        $pkJob['SlotReleased'] = $true
-                        # Whatever JobFinalize queued (a retry, follow-up steps) is counted
-                        # into its group HERE, by looking at the queue - not by trusting a
-                        # returned flag. A flag with nothing queued would hang the group
-                        # forever; two follow-ups would let it finish early.
-                        # Only when the queue actually grew - walking it on every finished
-                        # job would cost a full pass over a large batch each time.
-                        if ($pkPending.Count -gt $pkPendingBefore) {
-                            $pkQueuedIndex = 0
-                            foreach ($pkQueued in $pkPending) {
-                                if ($pkQueuedIndex -ge $pkPendingBefore) {
-                                    if ($null -eq $pkQueued['GroupKey']) { $pkQueued['GroupKey'] = $pkJob['GroupKey']; if (-not $pkQueued.ContainsKey('Group')) { $pkQueued['Group'] = $pkJob['Group'] } }
-                                    if ($pkGroupStates.ContainsKey($pkQueued['GroupKey'])) { $pkGroupStates[$pkQueued['GroupKey']].Outstanding++ }
-                                }
-                                $pkQueuedIndex++
-                            }
-                        }
-                        if ($null -ne $pkJob['GroupKey']) {
-                            $pkKey = $pkJob['GroupKey']
-                            if ($pkGroupStates.ContainsKey($pkKey)) {
-                                $pkState = $pkGroupStates[$pkKey]
-                                $pkState.Outstanding--
-                                if ($pkState.Outstanding -le 0 -and -not $pkState.Completed) {
-                                    $null = & $pkGroupCompleteCallback $pkState.GroupInfo
-                                    $pkState.Completed = $true
-                                    $pkActiveGroupCount--
-                                    $pkGroupResults.Add([pscustomobject][ordered]@{ GroupInfo = $pkState.GroupInfo; Completed = $true; Aborted = $false })
-                                }
-                            } else {
-                                Write-PkMessage ("ProcessDispatch: invariant violation - job's GroupKey is not registered (final pass). This should be unreachable.") -Level Error
-                            }
-                        }
-                    } else {
-                        $pkStillWaiting.Add($pkJob)
-                    }
-                }
-                $pkRunning = $pkStillWaiting
-            }
-
-            if ($pkRunning.Count -gt 0) {
-                $pkDispatchResult.ForceKilledCount = $pkRunning.Count
-                Write-PkMessage ("ProcessDispatch: force-stopping " + $pkRunning.Count + " job(s)" + (Get-PkForceStopReason -TimeoutSeconds $pkAbortTimeoutSeconds) + ".") -Level Warn
-                Stop-PkJobProcesses -Jobs $pkRunning
-                foreach ($pkJob in $pkRunning) {
-                    try { if ($pkJob['Proc']) { $null = $pkJob['Proc'].WaitForExit(5000) } } catch { }
-                    try { $null = & $pkJobAbortCleanup $pkJob } catch { }
+        $pkAbortDeadline = [System.Diagnostics.Stopwatch]::StartNew()
+        while ($pkRunning.Count -gt 0 -and -not [PkConsoleCtrl]::IsCloseEvent -and -not [PkConsoleCtrl]::SkipDrain -and $pkAbortDeadline.Elapsed.TotalSeconds -lt $pkAbortTimeoutSeconds) {
+            # ---- BLOCK: graceful-wait loop ---- (keep in sync with the
+            # main poll pass above and the final pass below)
+            $pkStillWaiting = [System.Collections.Generic.List[hashtable]]::new()
+            foreach ($pkJob in $pkRunning) {
+                if ($pkJob['TimeLimit'] -gt 0) { Stop-PkTimedOutJob -Job $pkJob }
+                if (& $pkJobPollCompleted $pkJob) {
+                    $pkPendingBefore = $pkPending.Count
+                    $null = & $pkJobFinalize $pkJob $pkPending
                     try { if ($pkJob['Proc']) { $pkJob['Proc'].Dispose() } } catch { }
-                    if ($pkIsSharedBudget) { try { $null = $pkMaxConcurrent.Release() } catch { } }
+                    if ($pkIsSharedBudget) { $null = $pkMaxConcurrent.Release() }
                     $pkJob['SlotReleased'] = $true
+                    # Whatever JobFinalize queued (a retry, follow-up steps) is counted
+                    # into its group HERE, by looking at the queue - not by trusting a
+                    # returned flag. A flag with nothing queued would hang the group
+                    # forever; two follow-ups would let it finish early.
+                    # Only when the queue actually grew - walking it on every finished
+                    # job would cost a full pass over a large batch each time.
+                    if ($pkPending.Count -gt $pkPendingBefore) {
+                        $pkQueuedIndex = 0
+                        foreach ($pkQueued in $pkPending) {
+                            if ($pkQueuedIndex -ge $pkPendingBefore) {
+                                if ($null -eq $pkQueued['GroupKey']) { $pkQueued['GroupKey'] = $pkJob['GroupKey']; if (-not $pkQueued.ContainsKey('Group')) { $pkQueued['Group'] = $pkJob['Group'] } }
+                                if ($pkGroupStates.ContainsKey($pkQueued['GroupKey'])) { $pkGroupStates[$pkQueued['GroupKey']].Outstanding++ }
+                            }
+                            $pkQueuedIndex++
+                        }
+                    }
+                    if ($null -ne $pkJob['GroupKey']) {
+                        $pkKey = $pkJob['GroupKey']
+                        if ($pkGroupStates.ContainsKey($pkKey)) {
+                            $pkState = $pkGroupStates[$pkKey]
+                            $pkState.Outstanding--
+                            if ($pkState.Outstanding -le 0 -and -not $pkState.Completed) {
+                                $null = & $pkGroupCompleteCallback $pkState.GroupInfo
+                                $pkState.Completed = $true
+                                $pkActiveGroupCount--
+                                $pkGroupResults.Add([pscustomobject][ordered]@{ GroupInfo = $pkState.GroupInfo; Completed = $true; Aborted = $false })
+                            }
+                        } else {
+                            Write-PkMessage ("ProcessDispatch: invariant violation - job's GroupKey is not registered (graceful-wait loop). This should be unreachable.") -Level Error
+                        }
+                    }
+                } else {
+                    $pkStillWaiting.Add($pkJob)
                 }
             }
-        } catch {
+            $pkRunning = $pkStillWaiting
+            if ($pkRunning.Count -gt 0) { [System.Threading.Thread]::Sleep(250) }
+        }
+
+        # ---- BLOCK: mandatory final completion-check pass ----
+        # A window-close can exit the loop above before a single poll, and
+        # a job can finish in the last 250ms before the deadline. One more
+        # pass so a finished job is never thrown away as "force-stopped".
+        # (keep in sync with the two blocks above, except the time limit:
+        # whatever is still running is force-stopped together just below)
+        if ($pkRunning.Count -gt 0) {
+            $pkStillWaiting = [System.Collections.Generic.List[hashtable]]::new()
+            foreach ($pkJob in $pkRunning) {
+                if (& $pkJobPollCompleted $pkJob) {
+                    $pkPendingBefore = $pkPending.Count
+                    $null = & $pkJobFinalize $pkJob $pkPending
+                    try { if ($pkJob['Proc']) { $pkJob['Proc'].Dispose() } } catch { }
+                    if ($pkIsSharedBudget) { $null = $pkMaxConcurrent.Release() }
+                    $pkJob['SlotReleased'] = $true
+                    # Whatever JobFinalize queued (a retry, follow-up steps) is counted
+                    # into its group HERE, by looking at the queue - not by trusting a
+                    # returned flag. A flag with nothing queued would hang the group
+                    # forever; two follow-ups would let it finish early.
+                    # Only when the queue actually grew - walking it on every finished
+                    # job would cost a full pass over a large batch each time.
+                    if ($pkPending.Count -gt $pkPendingBefore) {
+                        $pkQueuedIndex = 0
+                        foreach ($pkQueued in $pkPending) {
+                            if ($pkQueuedIndex -ge $pkPendingBefore) {
+                                if ($null -eq $pkQueued['GroupKey']) { $pkQueued['GroupKey'] = $pkJob['GroupKey']; if (-not $pkQueued.ContainsKey('Group')) { $pkQueued['Group'] = $pkJob['Group'] } }
+                                if ($pkGroupStates.ContainsKey($pkQueued['GroupKey'])) { $pkGroupStates[$pkQueued['GroupKey']].Outstanding++ }
+                            }
+                            $pkQueuedIndex++
+                        }
+                    }
+                    if ($null -ne $pkJob['GroupKey']) {
+                        $pkKey = $pkJob['GroupKey']
+                        if ($pkGroupStates.ContainsKey($pkKey)) {
+                            $pkState = $pkGroupStates[$pkKey]
+                            $pkState.Outstanding--
+                            if ($pkState.Outstanding -le 0 -and -not $pkState.Completed) {
+                                $null = & $pkGroupCompleteCallback $pkState.GroupInfo
+                                $pkState.Completed = $true
+                                $pkActiveGroupCount--
+                                $pkGroupResults.Add([pscustomobject][ordered]@{ GroupInfo = $pkState.GroupInfo; Completed = $true; Aborted = $false })
+                            }
+                        } else {
+                            Write-PkMessage ("ProcessDispatch: invariant violation - job's GroupKey is not registered (final pass). This should be unreachable.") -Level Error
+                        }
+                    }
+                } else {
+                    $pkStillWaiting.Add($pkJob)
+                }
+            }
+            $pkRunning = $pkStillWaiting
+        }
+
+        if ($pkRunning.Count -gt 0) {
+            $pkDispatchResult.ForceKilledCount = $pkRunning.Count
+            Write-PkMessage ("ProcessDispatch: force-stopping " + $pkRunning.Count + " job(s)" + (Get-PkForceStopReason -TimeoutSeconds $pkAbortTimeoutSeconds) + ".") -Level Warn
             Stop-PkJobProcesses -Jobs $pkRunning
             foreach ($pkJob in $pkRunning) {
                 try { if ($pkJob['Proc']) { $null = $pkJob['Proc'].WaitForExit(5000) } } catch { }
-                if (-not $pkJob['SlotReleased']) {
-                    try { $null = & $pkJobAbortCleanup $pkJob } catch { }
-                    if ($pkIsSharedBudget) { try { $null = $pkMaxConcurrent.Release() } catch { } }
-                }
+                try { $null = & $pkJobAbortCleanup $pkJob } catch { }
+                try { if ($pkJob['Proc']) { $pkJob['Proc'].Dispose() } } catch { }
+                if ($pkIsSharedBudget) { try { $null = $pkMaxConcurrent.Release() } catch { } }
+                $pkJob['SlotReleased'] = $true
+            }
+        }
+    }
+    $pkLoopDone = $true
+    } finally {
+        if (-not $pkLoopDone) {
+            # Best-effort teardown on the way out of an error or a stop; an
+            # error carries on up by itself. A job with SlotReleased set was
+            # already finalized or force-stopped, and its process disposed:
+            # left alone, since a disposed Process makes Stop-PkProcessTree
+            # throw part-way through.
+            $pkTearDown = [System.Collections.Generic.List[hashtable]]::new()
+            foreach ($pkJob in $pkRunning) { if (-not $pkJob['SlotReleased']) { $pkTearDown.Add($pkJob) } }
+            if ($null -ne $pkStarting -and -not $pkTearDown.Contains($pkStarting)) { $pkTearDown.Add($pkStarting) }
+            Stop-PkJobProcesses -Jobs $pkTearDown
+            foreach ($pkJob in $pkTearDown) {
+                try { if ($pkJob['Proc']) { $null = $pkJob['Proc'].WaitForExit(5000) } } catch { }
+                try { $null = & $pkJobAbortCleanup $pkJob } catch { }
+                if ($pkIsSharedBudget) { try { $null = $pkMaxConcurrent.Release() } catch { } }
+                $pkJob['SlotReleased'] = $true
                 try { if ($pkJob['Proc']) { $pkJob['Proc'].Dispose() } } catch { }
             }
-            throw
         }
     }
 
