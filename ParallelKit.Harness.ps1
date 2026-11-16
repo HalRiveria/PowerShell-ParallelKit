@@ -337,7 +337,7 @@ $dispatch = Invoke-PkProcessDispatch -MaxConcurrent 2 -MaxQueueAhead 2 `
         for ($i = 0; $i -lt $group.Count; $i++) { $jobs.Add(@{ FilePath = $pingExe; Arguments = '-n 2 127.0.0.1'; Retry = [bool]$group.Retry }) }
         return $jobs
     }.GetNewClosure() `
-    -AbortPollCallback { param($running) if ($running.Count -gt $track.Max) { $track.Max = $running.Count } }.GetNewClosure() `
+    -PollCallback { param($running) if ($running.Count -gt $track.Max) { $track.Max = $running.Count } }.GetNewClosure() `
     -JobFinalize {
         param($job, $pending)
         $r = Complete-PkProcess -Job $job
@@ -391,7 +391,7 @@ $dispatch = Invoke-PkProcessDispatch -MaxConcurrent 1 -MaxQueueAhead 2 `
     -JobBuilder { param($g) return @() } `
     -JobFinalize { param($job, $pending) } `
     -GroupReleaseCheck { param($g) return $released.Contains($g.Id) }.GetNewClosure() `
-    -AbortPollCallback {
+    -PollCallback {
         param($running)
         $ticks.Count++
         if ($ticks.Count -eq 4) { $pulledAtFirstRelease.Value = $feed.Index }
@@ -413,7 +413,7 @@ $dispatch = Invoke-PkProcessDispatch -MaxConcurrent 2 -AbortTimeoutSeconds 1 `
     -JobBuilder { param($g) return @(1..5 | ForEach-Object { @{ FilePath = $pingExe; Arguments = '-n 30 127.0.0.1' } }) }.GetNewClosure() `
     -JobFinalize { param($job, $pending) $null = Complete-PkProcess -Job $job } `
     -JobAbortCleanup { param($job) $cleaned.Count++ }.GetNewClosure() `
-    -AbortPollCallback { param($running) $ticks.Count++; if ($ticks.Count -eq 6) { Request-PkAbort } }.GetNewClosure()
+    -PollCallback { param($running) $ticks.Count++; if ($ticks.Count -eq 6) { Request-PkAbort } }.GetNewClosure()
 $sw.Stop()
 Test-Assert ($dispatch.Aborted) "an abort mid-dispatch is reported as Aborted"
 Test-Assert ($dispatch.ForceKilledCount -eq 2) "the 2 running processes are force-killed after the abort timeout"
@@ -436,7 +436,7 @@ $engine = {
     $dispatch = Invoke-PkProcessDispatch -MaxConcurrent $Budget `
         -GroupProvider { if ($feed.Index -ge 2) { return $null }; $feed.Index++; return @{ Id = $feed.Index } }.GetNewClosure() `
         -JobBuilder { param($g) return @(@{ FilePath = $PingExe; Arguments = '-n 2 127.0.0.1' }, @{ FilePath = $PingExe; Arguments = '-n 2 127.0.0.1' }) }.GetNewClosure() `
-        -AbortPollCallback { param($running) $inUse = 2 - $Budget.CurrentCount; if ($inUse -gt $Peak.Max) { $Peak.Max = $inUse } }.GetNewClosure() `
+        -PollCallback { param($running) $inUse = 2 - $Budget.CurrentCount; if ($inUse -gt $Peak.Max) { $Peak.Max = $inUse } }.GetNewClosure() `
         -JobFinalize { param($job, $pending) $r = Complete-PkProcess -Job $job; if ($r.ExitCode -eq 0) { $done.Count++ } }.GetNewClosure()
     Write-PkMessage ("engine " + $Name + " finished " + $done.Count)
     return @{ Name = $Name; Done = $done.Count; Aborted = $dispatch.Aborted }
@@ -622,8 +622,8 @@ $noisy = Invoke-PkProcessDispatch -MaxConcurrent 1 -AbortTimeoutSeconds 1 `
     -JobFinalize { param($job, $pending) $null = Complete-PkProcess -Job $job } `
     -JobAbortCleanup { param($job) "noise"; $true } `
     -GroupCompleteCallback { param($group) "noise"; 1 } `
-    -AbortPollCallback { param($running) $ticks.Count++; if ($ticks.Count -eq 5) { Request-PkAbort }; "noise" }.GetNewClosure()
-Test-Assert ($noisy -is [System.Management.Automation.PSCustomObject] -and $noisy.ForceKilledCount -eq 1) "dispatch: noisy -JobAbortCleanup/-GroupCompleteCallback/-AbortPollCallback don't corrupt the result"
+    -PollCallback { param($running) $ticks.Count++; if ($ticks.Count -eq 5) { Request-PkAbort }; "noise" }.GetNewClosure()
+Test-Assert ($noisy -is [System.Management.Automation.PSCustomObject] -and $noisy.ForceKilledCount -eq 1) "dispatch: noisy -JobAbortCleanup/-GroupCompleteCallback/-PollCallback don't corrupt the result"
 
 Reset-Harness
 $noisyBatch = Invoke-PkProcessBatch -Commands @(@{ FilePath = $cmdExe; Arguments = '/c exit 0' }) -MaxConcurrent 1 -OnComplete { param($c, $r) "noise"; $true }
@@ -724,7 +724,7 @@ $d = Invoke-PkProcessDispatch -MaxConcurrent 1 -AbortTimeoutSeconds 1 -CancelTok
     -GroupProvider { if ($feed.Given) { return $null }; $feed.Given = $true; return @{ Name = 'c' } }.GetNewClosure() `
     -JobBuilder { param($g) return @(1..3 | ForEach-Object { @{ FilePath = $pingExe; Arguments = '-n 30 127.0.0.1' } }) }.GetNewClosure() `
     -JobFinalize { param($job, $pending) $null = Complete-PkProcess -Job $job } `
-    -AbortPollCallback { param($running) $ticks.Count++; if ($ticks.Count -eq 5) { Request-PkAbort } }.GetNewClosure()
+    -PollCallback { param($running) $ticks.Count++; if ($ticks.Count -eq 5) { Request-PkAbort } }.GetNewClosure()
 $sw.Stop()
 Test-Assert ($d.Aborted -and $sw.Elapsed.TotalSeconds -lt 15) "dispatch: an abort stops a run that was given the caller's own -CancelToken"
 Test-Assert (-not $mine.IsCancellationRequested) "without cancelling the caller's own token"
@@ -737,7 +737,7 @@ $d = Invoke-PkProcessDispatch -MaxConcurrent 1 -AbortTimeoutSeconds 1 -CancelTok
     -GroupProvider { if ($feed.Given) { return $null }; $feed.Given = $true; return @{ Name = 'c2' } }.GetNewClosure() `
     -JobBuilder { param($g) return @(@{ FilePath = $pingExe; Arguments = '-n 30 127.0.0.1' }) }.GetNewClosure() `
     -JobFinalize { param($job, $pending) $null = Complete-PkProcess -Job $job } `
-    -AbortPollCallback { param($running) $ticks.Count++; if ($ticks.Count -eq 5) { $mine.Cancel() } }.GetNewClosure()
+    -PollCallback { param($running) $ticks.Count++; if ($ticks.Count -eq 5) { $mine.Cancel() } }.GetNewClosure()
 Test-Assert ($d.Aborted -and $d.ForceKilledCount -eq 1) "dispatch: cancelling the caller's own token still stops the run"
 $mine.Dispose()
 
@@ -1867,7 +1867,7 @@ function Get-HarnessCd {
     $wd.WithTimeout = (Invoke-PkProcessWithTimeout -FilePath $cmdExe -Arguments '/c cd').Stdout.Trim()
     $started = Start-PkProcess -FilePath $cmdExe -Arguments '/c cd'
     $null = Wait-PkProcess -Process $started['Proc'] -TimeoutMs 10000
-    $wd.StartProcess = (Complete-PkProcess -Job $started -Dispose $true).Stdout.Trim()
+    $wd.StartProcess = (Complete-PkProcess -Job $started -Dispose).Stdout.Trim()
     $out = @{ Text = $null }
     $feed = @{ Given = $false }
     $null = Invoke-PkProcessDispatch -MaxConcurrent 1 `
@@ -2187,7 +2187,7 @@ function Test-HarnessFunctionDrive {
     try {
         $started = Start-PkProcess -FilePath $cmdExe -Arguments '/c cd' -WorkingDirectory 'PkFnDrive:\sub'
         $null = Wait-PkProcess -Process $started['Proc'] -TimeoutMs 10000
-        & $check 'start' (Complete-PkProcess -Job $started -Dispose $true).Stdout
+        & $check 'start' (Complete-PkProcess -Job $started -Dispose).Stdout
     } catch { $wrong.Add('start threw') }
     $batch = Invoke-PkProcessBatch -Commands @(@{ FilePath = $cmdExe; Arguments = '/c cd'; WorkingDirectory = 'PkFnDrive:\sub' })
     & $check 'batch' $batch.Results[0].Stdout
@@ -3061,8 +3061,8 @@ $kwOk = ($d.Result.Aborted -and $d.Done -eq 1 -and $kwCount.N -eq 2); $kwDetail 
 $d = Invoke-KwDispatch -Jobs 0 -Extra @{ JobBuilder = { param($g) }; GroupReleaseCheck = { param($g) $kwCount.N++; if ($kwCount.N -ge 3) { return $true }; KEYWORD } }
 $kwOk = ($d.Result.GroupResults.Count -eq 1 -and $kwCount.N -ge 3); $kwDetail = "checks " + $kwCount.N
 '@
-    '-AbortPollCallback' = @'
-$d = Invoke-KwDispatch -Extra @{ AbortPollCallback = { param($running) $kwCount.N++; KEYWORD } }
+    '-PollCallback (dispatcher)' = @'
+$d = Invoke-KwDispatch -Extra @{ PollCallback = { param($running) $kwCount.N++; KEYWORD } }
 $kwOk = ($d.Done -eq 2 -and $d.Result.GroupResults.Count -eq 1); $kwDetail = "done " + $d.Done
 '@
     '-GroupProvider' = @'
@@ -3262,6 +3262,58 @@ $null = Invoke-PkProcessDispatch -MaxConcurrent 1 -TimeoutSeconds 1 `
     } `
     -JobFinalize { param($job, $q) $tkLog.Add(@{ TimedOut = $job['TimedOut']; Protected = ($null -ne $job['Child']) }); if ($null -ne $job['Child']) { $job['Child'].Dispose() } }.GetNewClosure()
 Test-Assert ($tkLog.Count -eq 1 -and $tkLog[0].Protected -and $tkLog[0].TimedOut -eq $true) ("a job killed for its time limit has TimedOut = `$true even when part of its tree survives (" + (@($tkLog | ForEach-Object { 'TimedOut=' + $_.TimedOut + ', child protected=' + $_.Protected }) -join '; ') + ")")
+Reset-Harness
+Write-Host ""
+
+Write-Host "=== AK: 3.0 parameter changes ===" -ForegroundColor Cyan
+
+# Complete-PkProcess -Dispose is a switch, and only -Job binds by position, so
+# the old -Dispose $true is an error instead of a 1 ms -StreamTimeoutMs.
+Reset-Harness
+$apiStarted = Start-PkProcess -FilePath $cmdExe -Arguments '/c echo pk-api'
+$null = $apiStarted.Proc.WaitForExit(10000)
+$threw = $null
+try { $null = Complete-PkProcess -Job $apiStarted -Dispose $true } catch { $threw = [string]$_ }
+Test-Assert ($threw -like "*positional parameter*'True'*") ("Complete-PkProcess -Dispose `$true is an error (" + $threw + ")")
+$threw = $null
+try { $null = Complete-PkProcess $apiStarted 5000 } catch { $threw = [string]$_ }
+Test-Assert ($threw -like "*positional parameter*'5000'*") ("a -StreamTimeoutMs by position is an error (" + $threw + ")")
+$apiDone = Complete-PkProcess $apiStarted -Dispose
+Test-Assert ($apiDone.ExitCode -eq 0 -and ([string]$apiDone.Stdout).Trim() -eq 'pk-api') "Complete-PkProcess `$job -Dispose works, -Job by position"
+
+# Write-PkMessage -Level: Info, Warn, Error, or Warning as Warn; a handler
+# only ever sees those three, spelled that way. Anything else is an error.
+Reset-Harness
+Write-PkMessage 'pk-level-1' -Level Warning
+Write-PkMessage 'pk-level-2' -Level warn
+Write-PkMessage 'pk-level-3' -Level ERROR
+Write-PkMessage 'pk-level-4' -Level info
+$apiLevels = (@($script:messages | Where-Object { $_.Message -like 'pk-level-*' } | ForEach-Object { $_.Level }) -join ',')
+Test-Assert ($apiLevels -ceq 'Warn,Warn,Error,Info') ("Write-PkMessage passes Warning on as Warn, and normalizes the case (" + $apiLevels + ")")
+$threw = $null
+try { Write-PkMessage 'pk-level-bad' -Level Debug } catch { $threw = [string]$_ }
+Test-Assert ($threw -like '*Level*Debug*' -and (Get-StartMessageCount '*pk-level-bad*') -eq 0) ("an unknown -Level is an error (" + $threw + ")")
+Reset-Harness
+$null = Invoke-PkRunspaceJobs -MaxParallel 1 -JobParams (New-JobList -Jobs @(@{ Id = 1 })) -WorkerScript { param($Id) Write-PkMessage 'pk-level-worker' -Level Warning }
+$apiLevels = (@($script:messages | Where-Object { $_.Message -eq 'pk-level-worker' } | ForEach-Object { $_.Level }) -join ',')
+Test-Assert ($apiLevels -ceq 'Warn') ("and the same from a worker (" + $apiLevels + ")")
+
+# The dispatcher's -PollCallback, the runspace engine's name for the same
+# every-pass role. Its old name, -AbortPollCallback, still works.
+Reset-Harness
+foreach ($apiName in 'PollCallback', 'AbortPollCallback') {
+    $apiFeed = @{ Given = $false; Polls = 0 }
+    $apiParams = @{
+        MaxConcurrent = 1
+        GroupProvider = { if ($apiFeed.Given) { return $null }; $apiFeed.Given = $true; return 'g' }.GetNewClosure()
+        JobBuilder    = { param($g) return @(@{ FilePath = $cmdExe; Arguments = '/c exit 0' }) }.GetNewClosure()
+        JobFinalize   = { param($job, $q) $null = Complete-PkProcess -Job $job }
+    }
+    $apiParams[$apiName] = { param($running) $apiFeed.Polls++ }.GetNewClosure()
+    $apiRun = Invoke-PkProcessDispatch @apiParams
+    Test-Assert ($apiFeed.Polls -gt 0 -and $apiRun.GroupResults.Count -eq 1) ("the dispatcher takes -" + $apiName + " (" + $apiFeed.Polls + " passes)")
+}
+Test-Assert ((Get-Command Invoke-PkProcessDispatch).Parameters['PollCallback'].Aliases -contains 'AbortPollCallback') "-AbortPollCallback is an alias of -PollCallback"
 Reset-Harness
 Write-Host ""
 

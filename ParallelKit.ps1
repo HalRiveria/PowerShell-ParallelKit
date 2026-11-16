@@ -417,13 +417,23 @@ function Write-PkMessage {
     # .PARAMETER Message
     # The text.
     # .PARAMETER Level
-    # Info (the default), Warn or Error.
+    # Info (the default), Warn or Error. Warning also works and is passed on as
+    # Warn. Anything else is an error.
     param(
         [Parameter(Mandatory)]
         [AllowEmptyString()]
         [string]$Message,
+        [ValidateSet('Info', 'Warn', 'Error', 'Warning')]
         [string]$Level = 'Info'
     )
+    # A message handler only ever sees Info, Warn or Error, spelled that way:
+    # ValidateSet ignores case, and Warning means Warn. Before a worker queues
+    # it, so it holds there too.
+    switch ($Level) {
+        'Error' { $Level = 'Error' }
+        'Info'  { $Level = 'Info' }
+        default { $Level = 'Warn' }
+    }
     if ($null -ne $global:PkWorkerQueue) {
         $global:PkWorkerQueue.Enqueue(@{ Message = $Message; Level = $Level })
         return
@@ -1209,14 +1219,19 @@ function Complete-PkProcess {
     # .PARAMETER StreamTimeoutMs
     # How long to wait for the output after the program exits (default 15000).
     # .PARAMETER Dispose
-    # Dispose the process object afterwards (default $false).
+    # Dispose the process object afterwards.
     # .OUTPUTS
     # An object with ExitCode, Stdout, Stderr, StreamTimedOut and StreamError.
+
+    # Only -Job by position: with -Dispose a switch, the old `-Dispose $true`
+    # would otherwise hand its $true to -StreamTimeoutMs (1 ms) and cut the
+    # output off without an error. This way it's an error.
+    [CmdletBinding(PositionalBinding = $false)]
     param(
-        [Parameter(Mandatory)]
+        [Parameter(Mandatory, Position = 0)]
         [hashtable]$Job,
         [int]$StreamTimeoutMs = 15000,
-        [bool]$Dispose = $false
+        [switch]$Dispose
     )
     $result = [ordered]@{ ExitCode = $null; Stdout = $null; Stderr = $null; StreamTimedOut = $false; StreamError = $null }
     # A job started by a custom starter may have no read tasks, and a read
@@ -1354,8 +1369,9 @@ function Invoke-PkProcessDispatch {
     # .PARAMETER MaxConcurrent
     # How many programs run at once: an int, or a SemaphoreSlim shared by several
     # dispatchers that must stay under one combined limit. -MaxParallel also works.
-    # .PARAMETER AbortPollCallback
+    # .PARAMETER PollCallback
     # { param($runningJobs) } run on every loop pass, with the jobs currently running.
+    # -AbortPollCallback (its name before 3.0) also works.
     # .PARAMETER CancelToken
     # Stops the dispatcher when cancelled. An abort stops it either way, without
     # cancelling this token.
@@ -1391,7 +1407,8 @@ function Invoke-PkProcessDispatch {
         [Parameter(Mandatory)]
         [Alias('MaxParallel')]
         $MaxConcurrent,
-        [scriptblock]$AbortPollCallback = $null,
+        [Alias('AbortPollCallback')]
+        [scriptblock]$PollCallback = $null,
         [System.Threading.CancellationToken]$CancelToken,
         [Alias('DrainTimeoutSeconds')]
         [int]$AbortTimeoutSeconds = 60,
@@ -1410,13 +1427,13 @@ function Invoke-PkProcessDispatch {
     $pkJobAbortCleanup = $JobAbortCleanup
     $pkGroupCompleteCallback = $GroupCompleteCallback
     $pkMaxConcurrent = $MaxConcurrent
-    $pkAbortPollCallback = $AbortPollCallback
+    $pkPollCallback = $PollCallback
     $pkCancelToken = $CancelToken
     $pkAbortTimeoutSeconds = $AbortTimeoutSeconds
     $pkMaxQueueAhead = $MaxQueueAhead
     $pkGroupReleaseCheck = $GroupReleaseCheck
     $pkTimeoutSeconds = $TimeoutSeconds
-    Remove-Variable -Name GroupProvider, JobBuilder, JobStarter, JobPollCompleted, JobFinalize, JobAbortCleanup, GroupCompleteCallback, MaxConcurrent, AbortPollCallback, CancelToken, AbortTimeoutSeconds, MaxQueueAhead, GroupReleaseCheck, TimeoutSeconds -Scope Local
+    Remove-Variable -Name GroupProvider, JobBuilder, JobStarter, JobPollCompleted, JobFinalize, JobAbortCleanup, GroupCompleteCallback, MaxConcurrent, PollCallback, CancelToken, AbortTimeoutSeconds, MaxQueueAhead, GroupReleaseCheck, TimeoutSeconds -Scope Local
 
     # 0 or less would never start a job (or pull a group) and spin forever.
     if ($pkMaxConcurrent -isnot [System.Threading.SemaphoreSlim]) {
@@ -1481,7 +1498,7 @@ function Invoke-PkProcessDispatch {
     try {
         return Invoke-PkProcessDispatchCore -GroupProvider $pkGroupProvider -JobBuilder $pkJobBuilder -JobStarter $pkJobStarter `
             -JobPollCompleted $pkJobPollCompleted -JobFinalize $pkJobFinalize -JobAbortCleanup $pkJobAbortCleanup `
-            -GroupCompleteCallback $pkGroupCompleteCallback -MaxConcurrent $pkMaxConcurrent -AbortPollCallback $pkAbortPollCallback `
+            -GroupCompleteCallback $pkGroupCompleteCallback -MaxConcurrent $pkMaxConcurrent -PollCallback $pkPollCallback `
             -CancelToken $pkCancelToken -AbortTimeoutSeconds $pkAbortTimeoutSeconds -MaxQueueAhead $pkMaxQueueAhead `
             -GroupReleaseCheck $pkGroupReleaseCheck -RequireProc $pkRequireProc -TimeoutSeconds $pkTimeoutSeconds
     } finally {
@@ -1548,7 +1565,7 @@ function Invoke-PkProcessDispatchCore {
         [scriptblock]$JobAbortCleanup,
         [scriptblock]$GroupCompleteCallback,
         $MaxConcurrent,
-        [scriptblock]$AbortPollCallback,
+        [scriptblock]$PollCallback,
         [System.Threading.CancellationToken]$CancelToken,
         [int]$AbortTimeoutSeconds,
         [int]$MaxQueueAhead,
@@ -1567,14 +1584,14 @@ function Invoke-PkProcessDispatchCore {
     $pkJobAbortCleanup = $JobAbortCleanup
     $pkGroupCompleteCallback = $GroupCompleteCallback
     $pkMaxConcurrent = $MaxConcurrent
-    $pkAbortPollCallback = $AbortPollCallback
+    $pkPollCallback = $PollCallback
     $pkCancelToken = $CancelToken
     $pkAbortTimeoutSeconds = $AbortTimeoutSeconds
     $pkMaxQueueAhead = $MaxQueueAhead
     $pkGroupReleaseCheck = $GroupReleaseCheck
     $pkRequireProc = $RequireProc
     $pkTimeoutSeconds = $TimeoutSeconds
-    Remove-Variable -Name GroupProvider, JobBuilder, JobStarter, JobPollCompleted, JobFinalize, JobAbortCleanup, GroupCompleteCallback, MaxConcurrent, AbortPollCallback, CancelToken, AbortTimeoutSeconds, MaxQueueAhead, GroupReleaseCheck, RequireProc, TimeoutSeconds -Scope Local
+    Remove-Variable -Name GroupProvider, JobBuilder, JobStarter, JobPollCompleted, JobFinalize, JobAbortCleanup, GroupCompleteCallback, MaxConcurrent, PollCallback, CancelToken, AbortTimeoutSeconds, MaxQueueAhead, GroupReleaseCheck, RequireProc, TimeoutSeconds -Scope Local
 
     $pkIsSharedBudget = ($pkMaxConcurrent -is [System.Threading.SemaphoreSlim])
 
@@ -1638,7 +1655,7 @@ function Invoke-PkProcessDispatchCore {
         # Main thread: this is what notices an abort and cancels the token.
         # Worker: just reads the flag; the main thread cancels the token.
         $null = Test-PkAbortSignal
-        if ($pkAbortPollCallback) { $null = Invoke-PkCallback -PkCallback $pkAbortPollCallback -PkArgs @(,@($pkRunning)) -PkName 'ProcessDispatch: -AbortPollCallback' -PkWarned $pkCallbackWarned }
+        if ($pkPollCallback) { $null = Invoke-PkCallback -PkCallback $pkPollCallback -PkArgs @(,@($pkRunning)) -PkName 'ProcessDispatch: -PollCallback' -PkWarned $pkCallbackWarned }
 
         while ($pkPending.Count -gt 0 -and (-not $pkCancelToken.IsCancellationRequested) -and `
                $(if ($pkIsSharedBudget) { $pkMaxConcurrent.Wait(0) } else { $pkRunning.Count -lt $pkMaxConcurrent })) {
