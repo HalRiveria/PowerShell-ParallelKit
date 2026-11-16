@@ -2707,6 +2707,47 @@ if ($compiled) {
     }
     try { [System.IO.File]::Delete($batFile) } catch { }  # temp file only; best effort
 
+    # A quote inside a list element for a .bat/.cmd program. cmd.exe reads the
+    # command line first and counts every quote, \" included, so with \" an
+    # element like a" & <command> & " ran that command. The kit writes "" for
+    # those programs instead. The batch file itself does nothing, so only
+    # cmd.exe's own reading of the command line could create the marker.
+    $injDir = Join-Path $env:TEMP ("pk-inj-" + [guid]::NewGuid().ToString("N"))
+    $null = New-Item -ItemType Directory -Path $injDir
+    $injMarker = Join-Path $injDir 'marker.txt'
+    $injBat = Join-Path $injDir 'noop.cmd'
+    [System.IO.File]::WriteAllText($injBat, "@rem does nothing`r`n")
+    $injPayloads = @('a" & echo x>{M} & "', 'a"&echo x>{M}&"', '"&echo x>{M}', 'a\" & echo x>{M} & \"', 'a\\" & echo x>{M} & "', 'a"^&echo x>{M}', 'a"""&echo x>{M}&"""')
+    $injHits = 0
+    foreach ($payload in $injPayloads) {
+        try { $null = Invoke-PkProcessWithTimeout -FilePath $injBat -Arguments @($payload.Replace('{M}', $injMarker)) -TimeoutMs 10000 } catch { Write-Host "  injection probe threw: $_" }
+        if ([System.IO.File]::Exists($injMarker)) { $injHits++; [System.IO.File]::Delete($injMarker) }
+    }
+    Test-Assert ($injHits -eq 0) ("a quote in a list element can't make a .cmd program run another command (" + $injHits + " of " + $injPayloads.Count + " did)")
+    $injUpper = Join-Path $injDir 'NOOP.BAT'
+    [System.IO.File]::WriteAllText($injUpper, "@rem does nothing`r`n")
+    $null = Invoke-PkProcessBatch -MaxConcurrent 1 -Commands @(@{ FilePath = $injUpper; Arguments = @($injPayloads[0].Replace('{M}', $injMarker)) })
+    Test-Assert (-not [System.IO.File]::Exists($injMarker)) "the same through the batch, for a .BAT in capitals"
+
+    # And a batch file that passes %* on to a program still gets every
+    # argument to it exactly: the C runtime reads "" inside quotes as one quote.
+    $fwdBat = Join-Path $injDir 'fwd.cmd'
+    [System.IO.File]::WriteAllText($fwdBat, ('@"' + $argvExe + '" %*' + "`r`n"))
+    $fwdArgs = @('say "hi"', 'a\"b', 'C:\dir with space\', 'a" & echo x & "', '""', '"', 'a\\"b', 'a&b', 'plain')
+    $text = $null
+    try { $text = Get-ArgvText (Invoke-PkProcessWithTimeout -FilePath $fwdBat -Arguments $fwdArgs -TimeoutMs 10000).Stdout } catch { $text = "threw: $_" }
+    $fwdExpected = (@($fwdArgs | ForEach-Object { '[' + $_ + ']' }) -join '')
+    Test-Assert ($text -ceq $fwdExpected) ("a .cmd that passes %* on gets the list through exactly (" + $text + ")")
+
+    # A line break would end cmd.exe's command line and drop the rest, so it's
+    # refused for a batch file, and still fine for any other program.
+    $nlError = ''
+    try { $null = Invoke-PkProcessWithTimeout -FilePath $fwdBat -Arguments @('a', ("b" + "`n" + "c")) -TimeoutMs 10000 } catch { $nlError = [string]$_ }
+    $nlBatch = (Invoke-PkProcessBatch -MaxConcurrent 1 -Commands @(@{ FilePath = $fwdBat; Arguments = @(("b" + "`r" + "c")) })).Results[0]
+    Test-Assert ($nlError -like '*element 2*line break*' -and [string]$nlBatch.StartError -like '*line break*') ("a line break in a list element for a .cmd is refused with a clear error (" + $nlError + ")")
+    Test-Assert ((Get-BatchArgvText @(("b" + "`n" + "c"))) -eq ("[b" + "`n" + "c]")) "and still reaches an ordinary program"
+    try { [System.IO.Directory]::Delete($injDir, $true) } catch { }  # temp folder only; best effort
+
     # A string is still exactly as written.
     Test-Assert ((Get-BatchArgvText '"C:\My Files\a.png" out.jxl') -eq $spacedText) "a string is still passed exactly as written"
     # The documented change: list elements are values, not pieces of a command line.

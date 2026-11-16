@@ -735,12 +735,13 @@ function ConvertTo-PkArgumentString {
     # These are the C runtime's rules, which most Windows programs use; cmd.exe /c
     # parses its own way. An argument with one of & | < > ^ ( ) , ; is quoted
     # too, so a .bat or .cmd program, which runs through cmd.exe, gets it as one
-    # argument instead of cmd acting on it. Not covered for those programs: cmd
-    # expands %NAME% inside quotes, splits batch arguments at = (left unquoted,
-    # since some programs read NAME=value themselves), and counts a \" as a
-    # quote, so an argument containing a quote can end up partly unquoted. The
-    # kit's -Arguments and Arguments values do this themselves when given a
-    # list.
+    # argument instead of cmd acting on it. The kit's -Arguments and Arguments
+    # values do this themselves when given a list, and for a .bat or .cmd
+    # program they also write a quote as "" instead of \", which cmd.exe can't
+    # be tricked by. This function's own output uses \": for a .bat or .cmd,
+    # give the kit the list instead. Not covered for those programs either way:
+    # cmd expands %NAME% inside quotes, and splits batch arguments at = (left
+    # unquoted, since some programs read NAME=value themselves).
     # .PARAMETER Arguments
     # The arguments, in order. A $null one is left out; an empty string is passed
     # as "". A file or folder object (from Get-ChildItem or Get-Item) is its full
@@ -763,6 +764,24 @@ function ConvertTo-PkArgumentString {
         # $null element into '' before it can be left out.
         [object[]]$Arguments
     )
+    return (ConvertTo-PkArgumentStringCore -Arguments $Arguments)
+}
+
+function ConvertTo-PkArgumentStringCore {
+    # ConvertTo-PkArgumentString's body. -ForBatchFile is for a .bat or .cmd
+    # program, whose command line cmd.exe reads first: a quote inside an
+    # argument is written "" instead of \". cmd.exe counts every quote, and to
+    # it \" is an ordinary quote that ends the quoted part, so an argument like
+    # a" & del ... & " ran its second command. "" keeps cmd's count even, and a
+    # program the batch file passes %* on to still reads "" as one quote (the C
+    # runtime does). A line break would end cmd.exe's command line there and
+    # silently drop the rest, so it's refused.
+    param(
+        [AllowNull()]
+        [AllowEmptyCollection()]
+        [object[]]$Arguments,
+        [switch]$ForBatchFile
+    )
     $parts = [System.Collections.Generic.List[string]]::new()
     $position = 0
     foreach ($item in $Arguments) {
@@ -774,6 +793,9 @@ function ConvertTo-PkArgumentString {
         }
         # On 5.1 a FileInfo from Get-ChildItem casts to its bare name.
         if ($item -is [System.IO.FileSystemInfo]) { $arg = $item.FullName } else { $arg = [string]$item }
+        if ($ForBatchFile -and $arg.IndexOfAny([char[]]@("`r", "`n")) -ge 0) {
+            throw ("Arguments element " + $position + " contains a line break, which can't be passed to a .bat or .cmd program: cmd.exe would end the command line there and drop the rest. Pass it another way (a file, an environment variable).")
+        }
         # The C runtime only needs quotes around whitespace and quotes. The rest
         # are cmd.exe's: it runs a .bat/.cmd program's command line, acting on
         # & | < > ^ ( ) outside quotes and splitting batch arguments at , ;
@@ -788,9 +810,15 @@ function ConvertTo-PkArgumentString {
         foreach ($ch in $arg.ToCharArray()) {
             if ($ch -eq '\') { $backslashes++; continue }
             if ($ch -eq '"') {
-                # Each backslash before a quote is doubled, then the quote escaped.
-                $null = $sb.Append('\', 2 * $backslashes + 1)
-                $null = $sb.Append('"')
+                # Each backslash before a quote is doubled, then the quote
+                # escaped: \" normally, "" for a batch file (see above).
+                if ($ForBatchFile) {
+                    $null = $sb.Append('\', 2 * $backslashes)
+                    $null = $sb.Append('""')
+                } else {
+                    $null = $sb.Append('\', 2 * $backslashes + 1)
+                    $null = $sb.Append('"')
+                }
             } else {
                 if ($backslashes -gt 0) { $null = $sb.Append('\', $backslashes) }
                 $null = $sb.Append($ch)
@@ -809,14 +837,20 @@ function Resolve-PkArguments {
     # -Arguments / Arguments as given -> the command line. A string is used as
     # written; a list is quoted one argument per element, so a path with a space
     # stays whole (a plain [string] cast would join it with spaces, or $OFS). A
-    # lone file or folder object is one argument, its full path.
-    param($Arguments)
+    # lone file or folder object is one argument, its full path. -FilePath is
+    # the program: a list for a .bat or .cmd is quoted for cmd.exe (see
+    # ConvertTo-PkArgumentStringCore). A bare name only ever finds an .exe,
+    # so a batch file always has its extension here.
+    param($Arguments, [string]$FilePath = '')
     if ($null -eq $Arguments) { return '' }
     if ($Arguments -is [string]) { return $Arguments }
     if ($Arguments -is [System.Collections.IDictionary]) {
         throw ("Arguments must be one string or a list of arguments (got a " + $Arguments.GetType().Name + ").")
     }
-    if ($Arguments -is [System.Collections.IEnumerable] -or $Arguments -is [System.IO.FileSystemInfo]) { return (ConvertTo-PkArgumentString -Arguments @($Arguments)) }
+    if ($Arguments -is [System.Collections.IEnumerable] -or $Arguments -is [System.IO.FileSystemInfo]) {
+        $forBatchFile = ($FilePath.TrimEnd() -match '\.(bat|cmd)$')
+        return (ConvertTo-PkArgumentStringCore -Arguments @($Arguments) -ForBatchFile:$forBatchFile)
+    }
     return [string]$Arguments
 }
 
@@ -931,7 +965,7 @@ function Start-PkProcessCore {
         [System.Management.Automation.SessionState]$CallerState
     )
     $encoding = Resolve-PkEncoding -Encoding $OutputEncoding
-    $commandLine = Resolve-PkArguments -Arguments $Arguments
+    $commandLine = Resolve-PkArguments -Arguments $Arguments -FilePath $FilePath
     # Self-starting: a caller who never ran Initialize-ParallelKit still
     # gets children that die with the script, and output reads that
     # aren't starved of threads. Both are cheap no-ops once done.
@@ -2116,7 +2150,7 @@ function Get-PkWorkerSafeFunctionNames {
     return @('Write-PkMessage', 'Test-PkAbortSignal', 'Test-PkCancelRequested', 'Initialize-PkThreadPool', 'Stop-PkProcessTree', 'Stop-PkJobProcesses', 'Resolve-PkEncoding',
              'Start-PkProcess', 'Wait-PkProcess', 'Wait-PkRunningJobs', 'Complete-PkProcess', 'Invoke-PkProcessWithTimeout',
              'Invoke-PkProcessDispatch', 'Invoke-PkProcessDispatchCore', 'Invoke-PkProcessBatch',
-             'Register-PkCancellationSource', 'Unregister-PkCancellationSource', 'New-PkBatchResult', 'ConvertTo-PkArgumentString', 'Get-PkForceStopReason', 'Resolve-PkFileSystemPath', 'Add-PkDispatchGroupJobs', 'Start-PkProcessCore', 'Get-PkJobTimeLimit', 'Stop-PkTimedOutJob', 'Get-PkStartFailureCause', 'Resolve-PkArguments', 'Invoke-PkCallback')
+             'Register-PkCancellationSource', 'Unregister-PkCancellationSource', 'New-PkBatchResult', 'ConvertTo-PkArgumentString', 'Get-PkForceStopReason', 'Resolve-PkFileSystemPath', 'Add-PkDispatchGroupJobs', 'Start-PkProcessCore', 'Get-PkJobTimeLimit', 'Stop-PkTimedOutJob', 'Get-PkStartFailureCause', 'Resolve-PkArguments', 'Invoke-PkCallback', 'ConvertTo-PkArgumentStringCore')
 }
 
 function Get-PkHandlerParamCount {
