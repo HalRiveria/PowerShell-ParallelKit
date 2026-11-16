@@ -2711,23 +2711,29 @@ if ($compiled) {
     # command line first and counts every quote, \" included, so with \" an
     # element like a" & <command> & " ran that command. The kit writes "" for
     # those programs instead. The batch file itself does nothing, so only
-    # cmd.exe's own reading of the command line could create the marker.
+    # cmd.exe's own reading of the command line could create the marker. The
+    # marker is a bare name in the working folder, so a space in %TEMP% can't
+    # make the injected command write somewhere else and the check pass anyway.
     $injDir = Join-Path $env:TEMP ("pk-inj-" + [guid]::NewGuid().ToString("N"))
     $null = New-Item -ItemType Directory -Path $injDir
-    $injMarker = Join-Path $injDir 'marker.txt'
+    $injMarker = Join-Path $injDir 'pk-marker.txt'
     $injBat = Join-Path $injDir 'noop.cmd'
     [System.IO.File]::WriteAllText($injBat, "@rem does nothing`r`n")
-    $injPayloads = @('a" & echo x>{M} & "', 'a"&echo x>{M}&"', '"&echo x>{M}', 'a\" & echo x>{M} & \"', 'a\\" & echo x>{M} & "', 'a"^&echo x>{M}', 'a"""&echo x>{M}&"""')
+    $injPayloads = @('a" & echo x>pk-marker.txt & "', 'a"&echo x>pk-marker.txt&"', '"&echo x>pk-marker.txt', 'a\" & echo x>pk-marker.txt & \"', 'a\\" & echo x>pk-marker.txt & "', 'a"^&echo x>pk-marker.txt', 'a"""&echo x>pk-marker.txt&"""')
     $injHits = 0
     foreach ($payload in $injPayloads) {
-        try { $null = Invoke-PkProcessWithTimeout -FilePath $injBat -Arguments @($payload.Replace('{M}', $injMarker)) -TimeoutMs 10000 } catch { Write-Host "  injection probe threw: $_" }
+        try { $null = Invoke-PkProcessWithTimeout -FilePath $injBat -Arguments @($payload) -WorkingDirectory $injDir -TimeoutMs 10000 } catch { Write-Host "  injection probe threw: $_" }
         if ([System.IO.File]::Exists($injMarker)) { $injHits++; [System.IO.File]::Delete($injMarker) }
     }
     Test-Assert ($injHits -eq 0) ("a quote in a list element can't make a .cmd program run another command (" + $injHits + " of " + $injPayloads.Count + " did)")
     $injUpper = Join-Path $injDir 'NOOP.BAT'
     [System.IO.File]::WriteAllText($injUpper, "@rem does nothing`r`n")
-    $null = Invoke-PkProcessBatch -MaxConcurrent 1 -Commands @(@{ FilePath = $injUpper; Arguments = @($injPayloads[0].Replace('{M}', $injMarker)) })
+    $null = Invoke-PkProcessBatch -MaxConcurrent 1 -Commands @(@{ FilePath = $injUpper; WorkingDirectory = $injDir; Arguments = @($injPayloads[0]) })
     Test-Assert (-not [System.IO.File]::Exists($injMarker)) "the same through the batch, for a .BAT in capitals"
+    # Windows drops trailing dots and spaces from a file name, so 'noop.cmd.'
+    # still goes through cmd.exe.
+    try { $null = Invoke-PkProcessWithTimeout -FilePath ($injBat + '.') -Arguments @($injPayloads[0]) -WorkingDirectory $injDir -TimeoutMs 10000 } catch { Write-Host "  injection probe threw: $_" }
+    Test-Assert (-not [System.IO.File]::Exists($injMarker)) "and for a .cmd path written with a trailing dot"
 
     # And a batch file that passes %* on to a program still gets every
     # argument to it exactly: the C runtime reads "" inside quotes as one quote.

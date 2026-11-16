@@ -848,7 +848,9 @@ function Resolve-PkArguments {
         throw ("Arguments must be one string or a list of arguments (got a " + $Arguments.GetType().Name + ").")
     }
     if ($Arguments -is [System.Collections.IEnumerable] -or $Arguments -is [System.IO.FileSystemInfo]) {
-        $forBatchFile = ($FilePath.TrimEnd() -match '\.(bat|cmd)$')
+        # Windows drops trailing dots and spaces from a file name, so
+        # 'run.cmd.' still runs through cmd.exe.
+        $forBatchFile = ($FilePath.Trim().Trim('"').TrimEnd(' ', '.') -match '\.(bat|cmd)$')
         return (ConvertTo-PkArgumentStringCore -Arguments @($Arguments) -ForBatchFile:$forBatchFile)
     }
     return [string]$Arguments
