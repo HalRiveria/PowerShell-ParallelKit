@@ -537,14 +537,14 @@ function Register-PkCancellationSource {
     # .SYNOPSIS
     # Adds your own CancellationTokenSource to the set an abort cancels.
     # .DESCRIPTION
-    # Every registered source is cancelled the moment an abort is detected. If an
+    # Every registered source is canceled the moment an abort is detected. If an
     # abort is still in force when you register (see Reset-PkAbortState), the source
-    # is cancelled straight away. A -Cts passed to Invoke-PkRunspaceJobs is
+    # is canceled right away. A -Cts passed to Invoke-PkRunspaceJobs is
     # registered for you. Remove it with Unregister-PkCancellationSource when done.
     # .PARAMETER Cts
     # The source to cancel on an abort.
 
-    # Cancelling a source registered while an old abort is still in force
+    # Canceling a source registered while an old abort is still in force
     # matters: otherwise a later run would start normally while its workers,
     # seeing the old flag, quietly did nothing.
     param([Parameter(Mandatory)][System.Threading.CancellationTokenSource]$Cts)
@@ -568,7 +568,7 @@ function Reset-PkAbortState {
     # Clears a finished abort so the engines run again.
     # .DESCRIPTION
     # An abort stays in force until this is called: until then every engine returns
-    # straight away with Aborted = $true. Invoke-PkRun calls it at the start of each
+    # right away with Aborted = $true. Invoke-PkRun calls it at the start of each
     # run, so you only need it to call an engine again outside Invoke-PkRun after an
     # abort.
 
@@ -632,7 +632,7 @@ function Test-PkAbortSignal {
 
 function Test-PkCancelRequested {
     # .SYNOPSIS
-    # For worker code: returns $true once this run is being cancelled or aborted.
+    # For worker code: returns $true once this run is being canceled or aborted.
     # .DESCRIPTION
     # Check it before any step that can't be undone (deleting a source file, say)
     # and skip the step if it's true: a worker that was force-stopped isn't killed,
@@ -1165,9 +1165,9 @@ function Wait-PkProcess {
 
 function Wait-PkRunningJobs {
     # The dispatch loop's pause: until a running program exits, the token is
-    # cancelled, or TimeoutMs passes. Only programs that haven't exited are waited
+    # canceled, or TimeoutMs passes. Only programs that haven't exited are waited
     # on: a -JobPollCompleted can keep saying "not done" after the exit, and the
-    # signalled handle would make every wait return at once and spin a core.
+    # signaled handle would make every wait return at once and spin a core.
     # A job with no real process, or past the 63 handles WaitAny can hold on an STA
     # thread (one of them the token), is only noticed when the time is up. With
     # nothing to wait on, a plain sleep. Same handle wrapping as Wait-PkProcess.
@@ -1260,7 +1260,7 @@ function Invoke-PkProcessWithTimeout {
     # Runs one program to completion, with a hard time limit.
     # .DESCRIPTION
     # Throws if the program had to be killed: because it ran past -TimeoutMs, or
-    # because the run was aborted or cancelled while it was going. Anything the
+    # because the run was aborted or canceled while it was going. Anything the
     # program started is killed with it.
     # .PARAMETER FilePath
     # The program to run.
@@ -1373,8 +1373,8 @@ function Invoke-PkProcessDispatch {
     # { param($runningJobs) } run on every loop pass, with the jobs currently running.
     # -AbortPollCallback (its name before 3.0) also works.
     # .PARAMETER CancelToken
-    # Stops the dispatcher when cancelled. An abort stops it either way, without
-    # cancelling this token.
+    # Stops the dispatcher when canceled. An abort stops it either way, without
+    # canceling this token.
     # .PARAMETER AbortTimeoutSeconds
     # How long an abort waits for running jobs before force-stopping them
     # (default 60). A force-stopped program is killed along with anything it
@@ -1486,7 +1486,7 @@ function Invoke-PkProcessDispatch {
         # The caller's own token: nothing would cancel it on Ctrl+C. Run on
         # a linked source that an abort DOES cancel (and that still follows
         # the caller's token). In a worker it also follows the run's token,
-        # so the run being cancelled for any reason stops this dispatcher.
+        # so the run being canceled for any reason stops this dispatcher.
         $pkLinkTokens = [System.Collections.Generic.List[System.Threading.CancellationToken]]::new()
         $pkLinkTokens.Add($pkCancelToken)
         if ($null -ne $global:PkCancelToken) { $pkLinkTokens.Add($global:PkCancelToken) }
@@ -2001,7 +2001,7 @@ function Invoke-PkProcessBatch {
     # TimeoutSeconds (overrides -TimeoutSeconds) and any keys of your own, which
     # come back on the result's Command. Inside
     # Invoke-PkRun, Ctrl+C lets running programs finish (up to -AbortTimeoutSeconds)
-    # and starts no new ones; a second Ctrl+C kills them straight away. Every
+    # and starts no new ones; a second Ctrl+C kills them right away. Every
     # command is tried, and one that can't start gets a StartError on its result.
     # Repeats of the same failure for the same program are reported once, with a
     # count at the end.
@@ -2621,7 +2621,7 @@ function Invoke-PkRunspaceJobs {
             }
             $handles = $stillPending
             if ($handles.Count -gt 0 -and ($scanExhausted -or $handles.Count -ge $MaxParallel)) {
-                # Until a worker finishes or the token is cancelled. The 100 ms cap
+                # Until a worker finishes or the token is canceled. The 100 ms cap
                 # keeps worker messages, -PollCallback and the abort flag moving.
                 # WaitAny holds 63 handles at most on an STA thread, one of them the
                 # token; a worker past that is only noticed when the time is up.

@@ -6,7 +6,7 @@ Run thousands of command-line programs, or blocks of PowerShell code, in paralle
 
 - **Process dispatch** - run many external programs, a set number at a time, with their output captured.
 - **Runspace jobs** - run a PowerShell worker script many times in parallel.
-- **Graceful abort** - Ctrl+C lets in-flight work finish and stops cleanly, instead of killing everything mid-write. Closing the window stops what's left straight away, since Windows allows only a few seconds.
+- **Graceful abort** - Ctrl+C lets in-flight work finish and stops cleanly, instead of killing everything mid-write. Closing the window stops what's left right away, since Windows allows only a few seconds.
 - **No orphans** - programs the script started die with it, even if it's force-closed.
 
 Built with Claude Code.
@@ -93,7 +93,7 @@ If your machines only run signed scripts (the `AllSigned` execution policy), the
 
 It works whether or not your script uses `Set-StrictMode`.
 
-The version is in the comment block at the top of the file, so a copy kept in your project still says which one it is. That block also carries the licence notice; keep it with the file.
+The version is in the comment block at the top of the file, so a copy kept in your project still says which one it is. That block also carries the license notice; keep it with the file.
 
 Dot-source it. It loads itself as an in-memory module named `ParallelKit`: nothing is installed and nothing goes on `$env:PSModulePath`, but `Get-Module` lists it while it's loaded. Dot-sourcing it again replaces the copy already loaded.
 
@@ -248,10 +248,10 @@ All of these callbacks run on whichever thread called the dispatcher: the main t
 - Supply `-JobStarter { param($job) ... }` to start jobs yourself. It must set `$job.Proc` and should return the job. A starter that is just `Start-PkProcess ...` works too: its result is folded into your job. Throw to report a job that couldn't start.
 - Whatever your callbacks output is thrown away, apart from the return values listed here. They can't corrupt the dispatcher's result by accident.
 - `-MaxConcurrent` can be a `SemaphoreSlim` shared by several dispatchers that must stay under one combined limit. It works inside workers, so two runspace jobs can each run a dispatcher against one shared budget.
-- `-GroupReleaseCheck { param($group) }` makes a group with zero jobs keep its queue-ahead slot until the check returns true. Use it to stop one dispatcher racing ahead of another that it's paired with. The dispatcher doesn't return until every held group has been released, unless the run is cancelled or aborted. It runs on every loop pass, so keep it cheap.
+- `-GroupReleaseCheck { param($group) }` makes a group with zero jobs keep its queue-ahead slot until the check returns true. Use it to stop one dispatcher racing ahead of another that it's paired with. The dispatcher doesn't return until every held group has been released, unless the run is canceled or aborted. It runs on every loop pass, so keep it cheap.
 - `-JobPollCompleted { param($job) }` replaces the default "has the process exited" check. Use it for a custom starter whose job isn't a plain process.
 - `-PollCallback { param($runningJobs) }` runs on every loop pass, with the jobs currently running (`-AbortPollCallback`, its name before 3.0, also works). That's about every 50 ms, and can be many times more often when programs finish quickly, so keep it cheap.
-- `-CancelToken` stops the dispatcher when cancelled. An abort stops it either way, without cancelling your token.
+- `-CancelToken` stops the dispatcher when canceled. An abort stops it either way, without canceling your token.
 - An exception from one of your callbacks stops the dispatcher: running processes are killed and the exception is rethrown.
 - Returns an object with `GroupResults`, `Aborted`, `ForceKilledCount` and `JobStarterFailedCount`. `GroupResults` holds one object with `GroupInfo`, `Completed` and `Aborted` per group, where `GroupInfo` is the group value.
 
@@ -293,19 +293,19 @@ Inside `Invoke-PkRun { ... }`, Ctrl+C:
 3. waits for in-flight work (`-AbortTimeoutSeconds`, default 60; every engine also takes it as `-DrainTimeoutSeconds`),
 4. force-stops whatever is left, calling `-JobAbortCleanup` for each killed or never-started process job.
 
-Press Ctrl+C again to skip step 3: whatever is still running is force-stopped straight away, and your script carries on. A third press stops the script the way Ctrl+C normally does. Presses less than a second apart count as one, and Ctrl+Break works the same as Ctrl+C.
+Press Ctrl+C again to skip step 3: whatever is still running is force-stopped right away, and your script carries on. A third press stops the script the way Ctrl+C normally does. Presses less than a second apart count as one, and Ctrl+Break works the same as Ctrl+C.
 
-Closing the window does the same minus step 3: Windows allows only a few seconds, so leftovers are stopped straight away.
+Closing the window does the same minus step 3: Windows allows only a few seconds, so leftovers are stopped right away.
 
 Three things to know:
 
 - **Inside `Invoke-PkRun`, Ctrl+C no longer kills anything by itself.** It only raises a flag. The kit's engines watch that flag. A long step of your own in there has to check `Test-PkAbortSignal` now and then and stop when it's true, or Ctrl+C will seem to do nothing until that step ends.
-- **An abort stays in force until it's reset.** `Invoke-PkRun` resets it at the start of each run. If you call an engine again outside `Invoke-PkRun` after an abort, it returns straight away with `Aborted = $true`. Call `Reset-PkAbortState` first if you mean to carry on.
+- **An abort stays in force until it's reset.** `Invoke-PkRun` resets it at the start of each run. If you call an engine again outside `Invoke-PkRun` after an abort, it returns right away with `Aborted = $true`. Call `Reset-PkAbortState` first if you mean to carry on.
 - **Your script carries on after an abort.** The engines return with `Aborted = $true` and the rest of your script runs. If an abort should end it, say so: `if ($batch.Aborted) { exit 1 }`.
 
 `Invoke-PkRun` also turns off the console's QuickEdit mode for the length of the run (`-DisableQuickEdit $false` to opt out). With QuickEdit on in the classic console window, one stray click starts a text selection, and the script freezes at its next console write until the selection is cleared. That looks exactly like a hang. It's turned back on afterwards if it was on before.
 
-Other pieces: `Request-PkAbort` triggers the same abort from code. `Test-PkAbortSignal` asks whether one is under way. `Register-PkCancellationSource` adds your own `CancellationTokenSource` to the set an abort cancels, and `Unregister-PkCancellationSource` takes it back out (a `-Cts` you pass to `Invoke-PkRunspaceJobs` is added automatically; a `-CancelToken` you pass to the dispatcher isn't cancelled by an abort, but the dispatcher stops either way). `Get-PkAbortTriggerLabel` says which kind of abort it was.
+Other pieces: `Request-PkAbort` triggers the same abort from code. `Test-PkAbortSignal` asks whether one is under way. `Register-PkCancellationSource` adds your own `CancellationTokenSource` to the set an abort cancels, and `Unregister-PkCancellationSource` takes it back out (a `-Cts` you pass to `Invoke-PkRunspaceJobs` is added automatically; a `-CancelToken` you pass to the dispatcher isn't canceled by an abort, but the dispatcher stops either way). `Get-PkAbortTriggerLabel` says which kind of abort it was.
 
 ## Choosing limits
 
@@ -378,7 +378,7 @@ No. Nothing it does needs elevation.
 
 **What happens to running programs when I press Ctrl+C?**
 
-Inside `Invoke-PkRun`, no new ones start, and the running ones get up to 60 seconds by default to finish. Anything still running after that is killed, and `-JobAbortCleanup` is called for each so you can delete its partial output. Press Ctrl+C again to kill them straight away instead of waiting. See [Abort](#abort).
+Inside `Invoke-PkRun`, no new ones start, and the running ones get up to 60 seconds by default to finish. Anything still running after that is killed, and `-JobAbortCleanup` is called for each so you can delete its partial output. Press Ctrl+C again to kill them right away instead of waiting. See [Abort](#abort).
 
 **And if the script is killed outright, from Task Manager say?**
 
@@ -406,7 +406,7 @@ No. Programs start without a window, in a hidden console of their own, so Ctrl+C
 
 **Was this written by AI?**
 
-It was built with Claude Code, as the top of this page says. The worker rules and abort behaviour come from hangs and bugs reproduced in real runs, and the test harness runs real processes and runspaces, with nothing mocked, on every change.
+It was built with Claude Code, as the top of this page says. The worker rules and abort behavior come from hangs and bugs reproduced in real runs, and the test harness runs real processes and runspaces, with nothing mocked, on every change.
 
 ## Bugs and questions
 

@@ -703,7 +703,7 @@ Write-Host ""
 # ==============================================================================
 Write-Host "=== O: aborts and the caller's own tokens ===" -ForegroundColor Cyan
 Reset-Harness
-# A caller-supplied source is cancelled by an abort, and left registered nowhere.
+# A caller-supplied source is canceled by an abort, and left registered nowhere.
 $mine = [System.Threading.CancellationTokenSource]::new()
 $poll = @{ Count = 0 }
 $results = [System.Collections.Generic.List[object]]::new()
@@ -727,7 +727,7 @@ $d = Invoke-PkProcessDispatch -MaxConcurrent 1 -AbortTimeoutSeconds 1 -CancelTok
     -PollCallback { param($running) $ticks.Count++; if ($ticks.Count -eq 5) { Request-PkAbort } }.GetNewClosure()
 $sw.Stop()
 Test-Assert ($d.Aborted -and $sw.Elapsed.TotalSeconds -lt 15) "dispatch: an abort stops a run that was given the caller's own -CancelToken"
-Test-Assert (-not $mine.IsCancellationRequested) "without cancelling the caller's own token"
+Test-Assert (-not $mine.IsCancellationRequested) "without canceling the caller's own token"
 Test-Assert ([PkState]::SourceCount -eq 0) "and nothing is left registered"
 
 # ...and the caller's token still works as a cancel.
@@ -738,7 +738,7 @@ $d = Invoke-PkProcessDispatch -MaxConcurrent 1 -AbortTimeoutSeconds 1 -CancelTok
     -JobBuilder { param($g) return @(@{ FilePath = $pingExe; Arguments = '-n 30 127.0.0.1' }) }.GetNewClosure() `
     -JobFinalize { param($job, $pending) $null = Complete-PkProcess -Job $job } `
     -PollCallback { param($running) $ticks.Count++; if ($ticks.Count -eq 5) { $mine.Cancel() } }.GetNewClosure()
-Test-Assert ($d.Aborted -and $d.ForceKilledCount -eq 1) "dispatch: cancelling the caller's own token still stops the run"
+Test-Assert ($d.Aborted -and $d.ForceKilledCount -eq 1) "dispatch: canceling the caller's own token still stops the run"
 $mine.Dispose()
 
 # An abort stays in force until it is reset.
@@ -1152,7 +1152,7 @@ $d = Invoke-PkProcessDispatch -MaxConcurrent 1 `
         $watches.Add($job.Stopwatch)
         if (-not $state.Retried) { $state.Retried = $true; $pending.Enqueue($job) }
     }.GetNewClosure()
-Test-Assert ($watches.Count -eq 2 -and $null -ne $watches[1] -and -not [object]::ReferenceEquals($watches[0], $watches[1])) "a job that goes round again gets a fresh stopwatch"
+Test-Assert ($watches.Count -eq 2 -and $null -ne $watches[1] -and -not [object]::ReferenceEquals($watches[0], $watches[1])) "a job that goes around again gets a fresh stopwatch"
 
 # A large batch isn't slowed by per-job queue walks. No processes: the
 # starter/poll are stubs, so this times the dispatcher's own bookkeeping.
@@ -1314,7 +1314,7 @@ $ownTokenEngine = {
         -GroupProvider { if ($feed.Given) { return $null }; $feed.Given = $true; return 'g' }.GetNewClosure() `
         -JobBuilder { param($g) return @(@{ FilePath = $PingExe; Arguments = '-n 30 127.0.0.1' }, @{ FilePath = $PingExe; Arguments = '-n 30 127.0.0.1' }) }.GetNewClosure() `
         -JobFinalize { param($job, $pending) $null = Complete-PkProcess -Job $job }
-    return @{ Aborted = $d.Aborted; OwnCancelled = $mineInWorker.IsCancellationRequested }
+    return @{ Aborted = $d.Aborted; OwnCanceled = $mineInWorker.IsCancellationRequested }
 }
 $results = [System.Collections.Generic.List[hashtable]]::new()
 $poll = @{ Count = 0 }
@@ -1324,7 +1324,7 @@ $out = Invoke-PkRunspaceJobs -WorkerScript $ownTokenEngine -JobParams @{ PingExe
     -PollCallback { $poll.Count++; if ($poll.Count -eq 15) { Request-PkAbort } }.GetNewClosure()
 $sw.Stop()
 Test-Assert ($out.ForceStoppedCount -eq 0 -and $results.Count -eq 1 -and $results[0].Aborted) ("a dispatcher in a worker with its own -CancelToken stops on an abort (force-stopped " + $out.ForceStoppedCount + ", " + [int]$sw.Elapsed.TotalSeconds + "s)")
-Test-Assert ($results.Count -eq 1 -and -not $results[0].OwnCancelled) "without cancelling the worker's own token"
+Test-Assert ($results.Count -eq 1 -and -not $results[0].OwnCanceled) "without canceling the worker's own token"
 Test-Assert ([PkState]::SourceCount -eq 0) "and nothing is left registered"
 
 # Every batch result has every documented field, so a strict-mode caller
@@ -1483,7 +1483,7 @@ $notice = @($script:messages | Where-Object { $_.Message -like '*Abort requested
 Test-Assert ($notice.Count -eq 1 -and (Get-PkAbortTriggerLabel) -eq 'Request-PkAbort') ("an abort from code isn't announced as Ctrl+C (label: " + (Get-PkAbortTriggerLabel) + ")")
 # Once an abort from code is under way, a single press skips the wait.
 $null = [PkConsoleCtrl]::OnInterrupt('Ctrl+C')
-Test-Assert ([PkConsoleCtrl]::SkipDrain) "a press during an abort started from code skips the drain straight away"
+Test-Assert ([PkConsoleCtrl]::SkipDrain) "a press during an abort started from code skips the drain right away"
 
 # The force-stop notice says why.
 Reset-Harness
@@ -1517,7 +1517,7 @@ $batch = Invoke-PkRun {
 }.GetNewClosure()
 $sw.Stop()
 $null = $presser.PS.EndInvoke($presser.Handle); $presser.PS.Dispose()
-Test-Assert ($batch.Aborted -and $batch.ForceKilledCount -eq 3 -and $sw.Elapsed.TotalSeconds -lt 8 -and $after.Ran) ("batch: a second Ctrl+C force-stops running programs straight away (" + [math]::Round($sw.Elapsed.TotalSeconds, 1) + "s, killed " + $batch.ForceKilledCount + "; the programs run 15s)")
+Test-Assert ($batch.Aborted -and $batch.ForceKilledCount -eq 3 -and $sw.Elapsed.TotalSeconds -lt 8 -and $after.Ran) ("batch: a second Ctrl+C force-stops running programs right away (" + [math]::Round($sw.Elapsed.TotalSeconds, 1) + "s, killed " + $batch.ForceKilledCount + "; the programs run 15s)")
 Test-Assert (@($script:messages | Where-Object { $_.Message -like '*force-stopping 3 job(s) now: Ctrl+C was pressed again*' }).Count -eq 1) "and the force-stop says why"
 
 # Runspace jobs: the same, and the workers are force-stopped.
@@ -1530,7 +1530,7 @@ $rsOut = Invoke-PkRun {
 }.GetNewClosure()
 $sw.Stop()
 $null = $presser.PS.EndInvoke($presser.Handle); $presser.PS.Dispose()
-Test-Assert ($rsOut.Aborted -and $rsOut.ForceStoppedCount -eq 3 -and $sw.Elapsed.TotalSeconds -lt 8) ("runspace jobs: a second Ctrl+C force-stops running workers straight away (" + [math]::Round($sw.Elapsed.TotalSeconds, 1) + "s, stopped " + $rsOut.ForceStoppedCount + "; the workers run 15s)")
+Test-Assert ($rsOut.Aborted -and $rsOut.ForceStoppedCount -eq 3 -and $sw.Elapsed.TotalSeconds -lt 8) ("runspace jobs: a second Ctrl+C force-stops running workers right away (" + [math]::Round($sw.Elapsed.TotalSeconds, 1) + "s, stopped " + $rsOut.ForceStoppedCount + "; the workers run 15s)")
 
 # The handler thread a window close parks stays parked until the run ends,
 # not just the drain, so the rest of the run gets Windows' few seconds.
@@ -2295,7 +2295,7 @@ for ($try = 0; $try -lt 3 -and $bestPerJob -ge 70; $try++) {
 Test-Assert ($bestPerJob -lt 70) ("short workers aren't held back by the poll (best average " + [int]$bestPerJob + " ms each)")
 
 # A -JobPollCompleted that keeps saying "not done" after a process exits must
-# not leave that process's signalled handle in the wait, or the loop spins:
+# not leave that process's signaled handle in the wait, or the loop spins:
 # first while the second program still runs, then with both exited.
 $spinState = @{ Given = $false; Polls = 0 }
 $spinRun = Invoke-PkProcessDispatch -MaxConcurrent 2 `
