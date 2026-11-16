@@ -198,7 +198,7 @@ Each worker runs in its own runspace: a separate PowerShell session inside the s
 - Don't call `exit` in a worker. It ends that job quietly (not as a crash) and sets your whole script's exit code.
 - `-MaxParallel` has no default; you choose it. `-DrainTimeoutSeconds` (how long Ctrl+C waits for running workers) defaults to 60. The process engines' names, `-MaxConcurrent` and `-AbortTimeoutSeconds`, work here too.
 - If `-ResultHandler`, `-PollCallback` or `-NextJobProvider` throws, the run stops: workers still going are told to stop and the exception comes out of the call.
-- Returns an object with `ForceStoppedCount`, `CrashedCount`, `Aborted`, `Crashed`, which lists the `Job` and `Error` of each worker that threw, and `Errors`, which lists the `Job` and `Error` of each non-terminating error a worker wrote (including any a worker wrote before it threw). A worker that was force-stopped is in neither list.
+- Returns an object with `ForceStoppedCount`, `CrashedCount`, `Aborted`, `Crashed`, which lists the `Job` and `Error` of each worker that threw, and `Errors`, which lists the `Job` and `Error` of each non-terminating error a worker wrote (including any a worker wrote before it threw). A worker that was force-stopped is in neither list. Every entry is kept until the call returns, so a worker that can write thousands of errors (walking a tree full of folders it can't read, say) should handle them itself, e.g. with `-ErrorAction SilentlyContinue -ErrorVariable`.
 
 ## The two rules for worker code
 
