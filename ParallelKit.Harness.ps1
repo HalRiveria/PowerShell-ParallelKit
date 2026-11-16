@@ -3040,8 +3040,8 @@ $kwOk = ($kwCount.N -eq 2 -and $o.CrashedCount -eq 2); $kwDetail = "handler call
 '@
     'message handler' = @'
 Set-PkMessageHandler { param($Message, $Level) $kwList.Add($Message); KEYWORD }
-$b = Invoke-PkProcessBatch -MaxConcurrent 1 -Commands @(@{ FilePath = 'cmd.exe'; Arguments = '/c exit 0' }, @{ FilePath = 'pk-no-such-program.exe' }, @{ FilePath = 'cmd.exe'; Arguments = '/c exit 0' })
-$kwOk = ($b.Results.Count -eq 3 -and $kwList.Count -ge 1); $kwDetail = "results " + $b.Results.Count
+$b = Invoke-PkProcessBatch -MaxConcurrent 1 -Commands @(@{ FilePath = 'cmd.exe'; Arguments = '/c exit 0' }, @{ FilePath = 'pk-no-such-program.exe' }, @{ FilePath = 'pk-no-such-other.exe' }, @{ FilePath = 'cmd.exe'; Arguments = '/c exit 0' })
+$kwOk = ($b.Results.Count -eq 4 -and $kwList.Count -ge 2); $kwDetail = "results " + $b.Results.Count + ", messages " + $kwList.Count
 '@
 }
 $kwEpilogue = @'
@@ -3067,8 +3067,9 @@ foreach ($kwName in $kwCases.Keys) {
         # The case set its own handler in this process's shared state: put the harness's back.
         [PkState]::MessageHandler = $kwSavedHandler
         if ($kwName -eq 'message handler') {
-            # Its warning can't go through the handler that broke, so it goes to the console.
-            $kwWarned = $kwConsole -like "*'continue' or 'break'*"
+            # Its warning can't go through the handler that broke, so it goes
+            # to the console, once however many messages the handler got.
+            $kwWarned = ([regex]::Matches($kwConsole, "'continue' or 'break'")).Count -eq 1
         } else {
             $kwWarned = ($null -ne $kwOut -and $kwOut.Warned -eq 1)
         }
@@ -3076,6 +3077,29 @@ foreach ($kwName in $kwCases.Keys) {
         Test-Assert ($kwFinished -and $null -ne $kwOut -and $kwOut.Ok -and $kwWarned) ("'" + $kwKeyword + "' in " + $kwName + " ends only the callback, with one warning (" + $kwDetailText + ")")
     }
 }
+
+# The wrap hands back what a callback returned as it was: a one-element
+# array returned whole (`,@(...)`) is still that array.
+Reset-Harness
+$kwFeed = @{ Given = $false }
+$kwShape = $null
+$kwRun = Invoke-PkProcessDispatch -MaxConcurrent 1 `
+    -GroupProvider { if ($kwFeed.Given) { return $null }; $kwFeed.Given = $true; return ,@('only') }.GetNewClosure() `
+    -JobBuilder { param($g) return @() } `
+    -GroupCompleteCallback { param($g) $kwFeed.Shape = $g.GetType().Name + ':' + @($g).Count }.GetNewClosure() `
+    -JobFinalize { param($job, $q) }
+$kwShape = $kwFeed['Shape']
+Test-Assert ($kwShape -eq 'Object[]:1' -and $kwRun.GroupResults[0].GroupInfo -is [array]) ("a group returned whole as a one-element array stays an array (" + $kwShape + ")")
+
+# A labeled break to the caller's own loop leaves the call: it stops there
+# and kills its programs.
+$kwLabeled = 'unset'
+:kwOuter foreach ($kwI in 1..1) {
+    $kwLabeled = Invoke-PkProcessBatch -MaxConcurrent 2 -Commands @(@{ FilePath = $cmdExe; Arguments = '/c exit 0' }, @{ FilePath = $pingExe; Arguments = '-n 35 127.0.0.1' }) -OnComplete { param($c, $r) break kwOuter }
+}
+$kwLeft = Get-LimitPingCount 35
+Stop-StrayPings 35
+Test-Assert ($kwLabeled -eq 'unset' -and $kwLeft -eq 0) ("a labeled break out of a callback leaves the call and kills its programs (" + $kwLeft + " left)")
 Reset-Harness
 Write-Host ""
 

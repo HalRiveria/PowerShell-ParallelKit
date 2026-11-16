@@ -386,13 +386,17 @@ function Invoke-PkMessageHandler {
     if ($null -ne $handler) {
         try {
             # A `continue` or `break` in the handler stops at this do/while
-            # instead of in whichever kit loop wrote the message. The same
-            # idea as Invoke-PkCallback, which can't be used here: its
-            # warning is itself a message.
+            # instead of in whichever kit loop wrote the message, and counts
+            # as `return`. The same idea as Invoke-PkCallback, which can't be
+            # used here: its warning is itself a message. This one goes to
+            # the console, once per handler (a note on the scriptblock).
             $handlerDone = $false
             do { $null = & $handler $Message $Level; $handlerDone = $true } while ($false)   # a handler's stray output must not become our caller's output
-            if ($handlerDone) { return }
-            Write-Host "[ParallelKit] message handler used 'continue' or 'break' (use 'return' to leave it early) - showing the message here instead:" -ForegroundColor Yellow
+            if (-not $handlerDone -and $null -eq $handler.PSObject.Properties['PkLoopWarned']) {
+                $handler.PSObject.Properties.Add([psnoteproperty]::new('PkLoopWarned', $true))
+                Write-Host "[ParallelKit] the message handler used 'continue' or 'break'. PowerShell sends those to the nearest loop, which here is one of the kit's, so the kit stopped the handler there instead. Use 'return' to leave it early." -ForegroundColor Yellow
+            }
+            return
         } catch {
             # A handler that fails (a locked log file, say) must not take
             # the run down with it. Fall back to the console for this one
@@ -461,7 +465,9 @@ function Invoke-PkCallback {
         if ($null -ne $PkWarned) { $PkWarned[$PkName] = $true }
         Write-PkMessage ($PkName + " used 'continue' or 'break' outside a loop of its own. PowerShell sends those to the nearest loop, which here is one of the kit's, so the kit stopped the callback there instead. Use 'return' to leave a callback early.") -Level Warn
     }
-    if ($null -ne $pkOutput) { return $pkOutput }
+    # The comma hands back exactly what the callback gave, as a direct call
+    # would: a collection it returned whole (`return ,$list`) stays one value.
+    if ($null -ne $pkOutput) { return ,$pkOutput }
 }
 
 # ==============================================================================
