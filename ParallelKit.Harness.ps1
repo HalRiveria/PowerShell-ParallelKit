@@ -3233,6 +3233,23 @@ try { $null = Complete-PkProcess $apiStarted 5000 } catch { $threw = [string]$_ 
 Test-Assert ($threw -like "*positional parameter*'5000'*") ("a -StreamTimeoutMs by position is an error (" + $threw + ")")
 $apiDone = Complete-PkProcess $apiStarted -Dispose
 Test-Assert ($apiDone.ExitCode -eq 0 -and ([string]$apiDone.Stdout).Trim() -eq 'pk-api') "Complete-PkProcess `$job -Dispose works, -Job by position"
+
+# Write-PkMessage -Level: Info, Warn, Error, or Warning as Warn; a handler
+# only ever sees those three, spelled that way. Anything else is an error.
+Reset-Harness
+Write-PkMessage 'pk-level-1' -Level Warning
+Write-PkMessage 'pk-level-2' -Level warn
+Write-PkMessage 'pk-level-3' -Level ERROR
+Write-PkMessage 'pk-level-4' -Level info
+$apiLevels = (@($script:messages | Where-Object { $_.Message -like 'pk-level-*' } | ForEach-Object { $_.Level }) -join ',')
+Test-Assert ($apiLevels -ceq 'Warn,Warn,Error,Info') ("Write-PkMessage passes Warning on as Warn, and normalizes the case (" + $apiLevels + ")")
+$threw = $null
+try { Write-PkMessage 'pk-level-bad' -Level Debug } catch { $threw = [string]$_ }
+Test-Assert ($threw -like '*Level*Debug*' -and (Get-StartMessageCount '*pk-level-bad*') -eq 0) ("an unknown -Level is an error (" + $threw + ")")
+Reset-Harness
+$null = Invoke-PkRunspaceJobs -MaxParallel 1 -JobParams (New-JobList -Jobs @(@{ Id = 1 })) -WorkerScript { param($Id) Write-PkMessage 'pk-level-worker' -Level Warning }
+$apiLevels = (@($script:messages | Where-Object { $_.Message -eq 'pk-level-worker' } | ForEach-Object { $_.Level }) -join ',')
+Test-Assert ($apiLevels -ceq 'Warn') ("and the same from a worker (" + $apiLevels + ")")
 Reset-Harness
 Write-Host ""
 

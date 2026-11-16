@@ -276,7 +276,7 @@ All of these are safe in worker code.
 
 ## Messages
 
-Workers can't safely write to the console. `Write-PkMessage "text" -Level Info|Warn|Error` works from anywhere: in a worker it's queued and delivered on the main thread. By default messages go to `Write-Host`. To route them into your own logging:
+Workers can't safely write to the console. `Write-PkMessage "text" -Level Info|Warn|Error` works from anywhere: in a worker it's queued and delivered on the main thread. `-Level Warning` also works and arrives as `Warn`; any other level is an error. By default messages go to `Write-Host`. To route them into your own logging:
 
 ```powershell
 Set-PkMessageHandler { param($Message, $Level) Write-MyLog $Message $Level }

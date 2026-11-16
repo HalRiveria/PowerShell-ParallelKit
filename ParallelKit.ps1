@@ -417,13 +417,23 @@ function Write-PkMessage {
     # .PARAMETER Message
     # The text.
     # .PARAMETER Level
-    # Info (the default), Warn or Error.
+    # Info (the default), Warn or Error. Warning also works and is passed on as
+    # Warn. Anything else is an error.
     param(
         [Parameter(Mandatory)]
         [AllowEmptyString()]
         [string]$Message,
+        [ValidateSet('Info', 'Warn', 'Error', 'Warning')]
         [string]$Level = 'Info'
     )
+    # A message handler only ever sees Info, Warn or Error, spelled that way:
+    # ValidateSet ignores case, and Warning means Warn. Before a worker queues
+    # it, so it holds there too.
+    switch ($Level) {
+        'Error' { $Level = 'Error' }
+        'Info'  { $Level = 'Info' }
+        default { $Level = 'Warn' }
+    }
     if ($null -ne $global:PkWorkerQueue) {
         $global:PkWorkerQueue.Enqueue(@{ Message = $Message; Level = $Level })
         return
