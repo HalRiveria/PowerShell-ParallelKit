@@ -3146,6 +3146,78 @@ Test-Assert ($null -ne $errProp -and @($errProp.Value).Count -eq 0) "an empty ru
 Reset-Harness
 Write-Host ""
 
+Write-Host "=== AJ: a tree kill counts a program it killed, even if taskkill reports failure ===" -ForegroundColor Cyan
+
+# taskkill /T exits non-zero when any process in the tree couldn't be killed,
+# even though the program itself was. A child that refuses PROCESS_TERMINATE
+# (its DACL denies it) makes that happen every time. The Job Object still
+# ends it when this process exits, and it's a short ping anyway. An elevated
+# taskkill may ignore the DACL; then the child dies too, and the check below
+# still holds but doesn't exercise the failure path (the message says so).
+if (-not ([System.Management.Automation.PSTypeName]'PkHarnessProcSec').Type) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Security.AccessControl;
+using System.Security.Principal;
+public static class PkHarnessProcSec {
+    [DllImport("advapi32.dll")]
+    static extern uint SetSecurityInfo(IntPtr handle, int objectType, uint securityInfo, IntPtr owner, IntPtr group, byte[] dacl, IntPtr sacl);
+    // Everyone: everything but PROCESS_TERMINATE. Returns the Win32 error, 0 = done.
+    public static uint DenyTerminate(IntPtr handle) {
+        var everyone = new SecurityIdentifier(WellKnownSidType.WorldSid, null);
+        var dacl = new RawAcl(2, 2);
+        dacl.InsertAce(0, new CommonAce(AceFlags.None, AceQualifier.AccessAllowed, 0x1FFFFE, everyone, false, null));
+        dacl.InsertAce(0, new CommonAce(AceFlags.None, AceQualifier.AccessDenied, 0x0001, everyone, false, null));
+        byte[] bytes = new byte[dacl.BinaryLength];
+        dacl.GetBinaryForm(bytes, 0);
+        return SetSecurityInfo(handle, 6 /* SE_KERNEL_OBJECT */, 4 /* DACL_SECURITY_INFORMATION */, IntPtr.Zero, IntPtr.Zero, bytes, IntPtr.Zero);
+    }
+}
+'@
+}
+function Protect-HarnessPingChild {
+    # Waits for the ping that $Parent started and makes it refuse to be
+    # terminated. Returns its Process, or $null if it couldn't.
+    param([System.Diagnostics.Process]$Parent)
+    $child = $null
+    for ($i = 0; $i -lt 50 -and $null -eq $child; $i++) {
+        Start-Sleep -Milliseconds 100
+        $child = Get-CimInstance Win32_Process -Filter ("ParentProcessId = " + $Parent.Id + " AND Name = 'PING.EXE'")
+    }
+    if ($null -eq $child) { return $null }
+    $childProc = [System.Diagnostics.Process]::GetProcessById([int]$child.ProcessId)
+    if ([PkHarnessProcSec]::DenyTerminate($childProc.Handle) -ne 0) { return $null }
+    return $childProc
+}
+
+Reset-Harness
+$tkStart = Start-PkProcess -FilePath $cmdExe -Arguments ('/c ""' + $pingExe + '" -n 7 127.0.0.1"')
+$tkChild = Protect-HarnessPingChild -Parent $tkStart.Proc
+$tkKilled = Stop-PkProcessTree -Process $tkStart.Proc
+$tkNote = if ($null -ne $tkChild -and -not $tkChild.HasExited) { "the protected child survived" } else { "taskkill killed the child anyway, so this run doesn't exercise the failure path" }
+Test-Assert ($null -ne $tkChild -and $tkKilled -and $tkStart.Proc.HasExited) ("Stop-PkProcessTree returns `$true for a program it killed when part of its tree couldn't be (returned " + $tkKilled + "; " + $tkNote + ")")
+$tkStart.Proc.Dispose()
+if ($null -ne $tkChild) { $tkChild.Dispose() }
+
+# The symptom: a job killed for its time limit showed TimedOut = $false.
+$tkFeed = @{ Given = $false }
+$tkLog = [System.Collections.Generic.List[object]]::new()
+$null = Invoke-PkProcessDispatch -MaxConcurrent 1 -TimeoutSeconds 1 `
+    -GroupProvider { if ($tkFeed.Given) { return $null }; $tkFeed.Given = $true; return 'g' }.GetNewClosure() `
+    -JobBuilder { param($g) return @(@{ FilePath = $cmdExe; Arguments = ('/c ""' + $pingExe + '" -n 7 127.0.0.1"') }) }.GetNewClosure() `
+    -JobStarter {
+        param($job)
+        $s = Start-PkProcess -FilePath $job['FilePath'] -Arguments $job['Arguments']
+        $job['Proc'] = $s.Proc; $job['StdoutTask'] = $s.StdoutTask; $job['StderrTask'] = $s.StderrTask; $job['Stopwatch'] = $s.Stopwatch
+        $job['Child'] = Protect-HarnessPingChild -Parent $s.Proc
+        return $job
+    } `
+    -JobFinalize { param($job, $q) $tkLog.Add(@{ TimedOut = $job['TimedOut']; Protected = ($null -ne $job['Child']) }); if ($null -ne $job['Child']) { $job['Child'].Dispose() } }.GetNewClosure()
+Test-Assert ($tkLog.Count -eq 1 -and $tkLog[0].Protected -and $tkLog[0].TimedOut -eq $true) ("a job killed for its time limit has TimedOut = `$true even when part of its tree survives (" + (@($tkLog | ForEach-Object { 'TimedOut=' + $_.TimedOut + ', child protected=' + $_.Protected }) -join '; ') + ")")
+Reset-Harness
+Write-Host ""
+
 Set-PkMessageHandler -Handler $null
 Reset-PkAbortState
 
