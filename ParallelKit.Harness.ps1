@@ -3198,6 +3198,7 @@ $tkKilled = Stop-PkProcessTree -Process $tkStart.Proc
 $tkNote = if ($null -ne $tkChild -and -not $tkChild.HasExited) { "the protected child survived" } else { "taskkill killed the child anyway, so this run doesn't exercise the failure path" }
 Test-Assert ($null -ne $tkChild -and $tkKilled -and $tkStart.Proc.HasExited) ("Stop-PkProcessTree returns `$true for a program it killed when part of its tree couldn't be (returned " + $tkKilled + "; " + $tkNote + ")")
 $tkStart.Proc.Dispose()
+if ($null -ne $tkChild) { $tkChild.Dispose() }
 
 # The symptom: a job killed for its time limit showed TimedOut = $false.
 $tkFeed = @{ Given = $false }
@@ -3212,8 +3213,8 @@ $null = Invoke-PkProcessDispatch -MaxConcurrent 1 -TimeoutSeconds 1 `
         $job['Child'] = Protect-HarnessPingChild -Parent $s.Proc
         return $job
     } `
-    -JobFinalize { param($job, $q) $tkLog.Add(@{ TimedOut = $job['TimedOut']; Protected = ($null -ne $job['Child']) }) }.GetNewClosure()
-Test-Assert ($tkLog.Count -eq 1 -and $tkLog[0].Protected -and $tkLog[0].TimedOut -eq $true) ("a job killed for its time limit has TimedOut = `$true even when part of its tree survives (" + (@($tkLog | ForEach-Object { 'TimedOut=' + $_.TimedOut }) -join ',') + ")")
+    -JobFinalize { param($job, $q) $tkLog.Add(@{ TimedOut = $job['TimedOut']; Protected = ($null -ne $job['Child']) }); if ($null -ne $job['Child']) { $job['Child'].Dispose() } }.GetNewClosure()
+Test-Assert ($tkLog.Count -eq 1 -and $tkLog[0].Protected -and $tkLog[0].TimedOut -eq $true) ("a job killed for its time limit has TimedOut = `$true even when part of its tree survives (" + (@($tkLog | ForEach-Object { 'TimedOut=' + $_.TimedOut + ', child protected=' + $_.Protected }) -join '; ') + ")")
 Reset-Harness
 Write-Host ""
 

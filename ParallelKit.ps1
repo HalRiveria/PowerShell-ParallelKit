@@ -1029,7 +1029,8 @@ function Stop-PkProcessTree {
     # killed its child, which it does first), or a child it wasn't allowed
     # to kill. Count it as killing them if any listed process is now gone.
     # A program that exited on its own in the moment since the check above
-    # counts as killed too; the callers only kill one that ran too long.
+    # counts as killed too. Of the kit's callers only Stop-PkTimedOutJob reads
+    # the result, and it only kills a program already past its time limit.
     if (-not $killed) {
         foreach ($p in $alive) { if ($p.HasExited) { $killed = $true; break } }
     }
