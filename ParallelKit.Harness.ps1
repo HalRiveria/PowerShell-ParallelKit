@@ -593,7 +593,6 @@ Write-Host "=== L: message handler ===" -ForegroundColor Cyan
 Reset-Harness
 Write-PkMessage "main-thread message" -Level Warn
 Test-Assert ($script:messages.Count -eq 1 -and $script:messages[0].Level -eq 'Warn') "on the main thread, Write-PkMessage goes straight to the handler"
-# Called from inside a closure, where a $script:-based handler would have vanished.
 $closure = { Write-PkMessage "from a closure" }.GetNewClosure()
 & $closure
 Test-Assert ($script:messages.Count -eq 2) "the handler is still found when called from inside a .GetNewClosure()'d block"
@@ -977,10 +976,9 @@ try {
 [System.Threading.Thread]::Sleep(300)
 Test-Assert ($threw -and $ran.Count -eq 0) ("a bad key in -JobParams is reported before any worker starts (workers run: " + $ran.Count + ")")
 
-# Callbacks built WITHOUT .GetNewClosure() see the kit's locals by dynamic
-# scope. A caller's $results.Add($r) in one used to land in the kit's own
-# worker-output collection, which the kit was looping over: an endless loop.
-# The guard throws instead of hanging the harness if that comes back.
+# A callback built without .GetNewClosure() must add to the caller's
+# $results, not to a collection of the kit's: if it were the one the kit
+# loops over, the loop would never end. The guard throws instead of hanging.
 Reset-Harness
 $results = [System.Collections.Generic.List[object]]::new()
 $loopGuard = @{ Calls = 0 }
@@ -1021,8 +1019,7 @@ try {
 $drained = @($script:messages | Where-Object { $_.Message -like '*Waiting for current jobs*' }).Count -eq 1
 Test-Assert ($null -eq $threw -and $loopGuard.Calls -eq 2 -and $results.Count -eq 2 -and $drained) ("a -ResultHandler without a closure doesn't loop during an abort drain either (calls=" + $loopGuard.Calls + ", count=" + $results.Count + ", drained=" + $drained + ", threw=" + $threw + ")")
 
-# A -JobCrashedHandler without a closure used to find the kit's $null
-# $results instead of the caller's, and the error was swallowed.
+# A -JobCrashedHandler without a closure sees the caller's $results.
 Reset-Harness
 $results = [System.Collections.Generic.List[object]]::new()
 $null = Invoke-PkRunspaceJobs -MaxParallel 1 -JobParams (New-JobList -Jobs @(@{ Id = 1 })) -WorkerScript { param([int]$Id) throw "x" } -JobCrashedHandler { param($e) $results.Add($e) }
@@ -1259,10 +1256,8 @@ $stale = Invoke-PkProcessWithTimeout -FilePath $selfExe -Arguments ('-NoProfile 
 Test-Assert ($stale.Stdout -like '*REFUSED:*older version of the kit*start a new one*') "loading the kit over an older copy's types is refused with a clear message"
 
 # Invoke-PkRun keeps the PC from idle-sleeping only while it runs. Checked
-# on this thread itself: SetThreadExecutionState returns the thread's
-# previous state, so re-setting the same value reads it back. (The
-# system-wide flag can't tell us anything - any other program keeping the
-# PC awake already holds it.)
+# on this thread: SetThreadExecutionState returns the thread's previous
+# state. The system-wide flag says nothing, since other programs may hold it.
 if (-not ([System.Management.Automation.PSTypeName]'PkThreadStateProbe').Type) {
     Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class PkThreadStateProbe { [DllImport("kernel32.dll")] public static extern uint SetThreadExecutionState(uint f); }'
 }
@@ -1410,8 +1405,7 @@ $killedSeveral = Stop-PkProcessTree -Process @($several | ForEach-Object { $_.Pr
 Test-Assert ($killedSeveral -and (Get-HarnessPingCount 45) -eq 0 -and (Get-HarnessPingCount 46) -eq 0 -and (Get-HarnessPingCount 47) -eq 0 -and @($several | Where-Object { -not $_.Proc.HasExited }).Count -eq 0) "Stop-PkProcessTree kills several programs and their children in one call"
 foreach ($j in $several) { $j.Proc.Dispose() }
 # A parent and its own child in the same call: both die, and the call says
-# it killed them. (The case this guards - taskkill failing for one PID that
-# exited a moment before - is a race this can't set up on demand.)
+# it killed them. Section AJ covers taskkill failing for part of a tree.
 $parentJob = Start-PkProcess -FilePath $cmdExe -Arguments (& $nestedPing 48)
 $childProc = $null
 $waitChild = [System.Diagnostics.Stopwatch]::StartNew()
@@ -1948,7 +1942,7 @@ $cleanWorker = {
         EAP      = [string]$ErrorActionPreference
         Data     = (Get-Content -LiteralPath '.\data.txt' -ErrorAction SilentlyContinue)
     }
-    # Everything that used to carry over to the next job on the same runspace.
+    # Everything that could carry over to the next job on the same runspace.
     Set-Location -LiteralPath $env:SystemRoot
     $pkHarnessLeak = "from job " + $Id
     $ErrorActionPreference = 'Stop'
@@ -1988,7 +1982,7 @@ Write-Host "=== Y: output that's been dropped is freed during the run ===" -Fore
 # handled shouldn't have the kit keep it alive until the run ends. Weak
 # references show what a full GC can free while the last job is finishing.
 # A few of the most recent jobs can still be referenced from the dispatch
-# loop (5-7 at -MaxConcurrent 4, however long the run); before the fix all were.
+# loop (5-7 at -MaxConcurrent 4, however long the run).
 Reset-Harness
 $chatty = @(1..30 | ForEach-Object { @{ FilePath = $cmdExe; Arguments = ('/c for /l %i in (1,1,1500) do @echo ' + ('x' * 100)) } })
 $batchWeak = [System.Collections.Generic.List[System.WeakReference]]::new()
@@ -2691,8 +2685,7 @@ if ($compiled) {
 
     # cmd.exe's special characters. A .bat/.cmd program runs through cmd.exe,
     # which acts on & | < > ^ outside quotes and splits batch arguments at , ;
-    # so an element holding one is quoted even without a space. 'a&ver' used to
-    # reach a batch file as 'a' and run ver.
+    # so an element holding one is quoted even without a space.
     $special = @('a&b', 'a|b', 'a<b', 'a>b', 'a^b', '(x)', 'a,b', 'a;b')
     Test-Assert ((ConvertTo-PkArgumentString $special) -eq '"a&b" "a|b" "a<b" "a>b" "a^b" "(x)" "a,b" "a;b"') "an element with a cmd.exe special character is quoted"
     Test-Assert ((Get-BatchArgvText $special) -eq '[a&b][a|b][a<b][a>b][a^b][(x)][a,b][a;b]') "and an ordinary program still gets it exactly"
@@ -2707,13 +2700,12 @@ if ($compiled) {
     }
     try { [System.IO.File]::Delete($batFile) } catch { }  # temp file only; best effort
 
-    # A quote inside a list element for a .bat/.cmd program. cmd.exe reads the
-    # command line first and counts every quote, \" included, so with \" an
-    # element like a" & <command> & " ran that command. The kit writes "" for
-    # those programs instead. The batch file itself does nothing, so only
-    # cmd.exe's own reading of the command line could create the marker. The
-    # marker is a bare name in the working folder, so a space in %TEMP% can't
-    # make the injected command write somewhere else and the check pass anyway.
+    # A quote in a list element for a .bat/.cmd: cmd.exe counts every quote,
+    # \" included, so with \" an element like a" & <command> & " runs that
+    # command; the kit writes "" instead. The batch file does nothing, so only
+    # cmd.exe's reading of the command line could create the marker. It's a
+    # bare name in the working folder, so a space in %TEMP% can't send it
+    # elsewhere and let the check pass anyway.
     $injDir = Join-Path $env:TEMP ("pk-inj-" + [guid]::NewGuid().ToString("N"))
     $null = New-Item -ItemType Directory -Path $injDir
     $injMarker = Join-Path $injDir 'pk-marker.txt'
@@ -2756,10 +2748,10 @@ if ($compiled) {
 
     # A string is still exactly as written.
     Test-Assert ((Get-BatchArgvText '"C:\My Files\a.png" out.jxl') -eq $spacedText) "a string is still passed exactly as written"
-    # The documented change: list elements are values, not pieces of a command line.
+    # List elements are values, not pieces of a command line.
     Test-Assert ((Get-BatchArgvText @('"two words"', 'x')) -eq '["two words"][x]') "quotes already in a list element reach the program as quotes"
 
-    # The join used to follow $OFS.
+    # The join doesn't follow $OFS.
     $OFS = ','
     try { $text = Get-BatchArgvText $spaced } finally { Remove-Variable -Name OFS }
     Test-Assert ($text -eq $spacedText) ("`$OFS doesn't change a list (" + $text + ")")
@@ -2772,7 +2764,7 @@ if ($compiled) {
     try { $null = Invoke-PkProcessWithTimeout -FilePath $argvExe -Arguments @{ a = 1 } } catch { $thrown = [string]$_ }
     Test-Assert ($thrown -like '*Arguments must be*') "and a clear error from the direct functions"
 
-    # A list inside the list used to become one argument, joined with $OFS.
+    # A list inside the list is an error, not one argument.
     Reset-Harness
     $nestedBatch = Invoke-PkProcessBatch -Commands @(@{ FilePath = $argvExe; Arguments = @('a', @('b', 'c')) }) -MaxConcurrent 1
     Test-Assert ($nestedBatch.Results[0].StartError -like '*element 2 is itself a list*' -and $null -eq $nestedBatch.Results[0].ExitCode) ("a list inside an Arguments list is that command's StartError (" + $nestedBatch.Results[0].StartError + ")")
@@ -2781,7 +2773,7 @@ if ($compiled) {
     Test-Assert ($thrown -like '*element 2 is itself a list*') "and ConvertTo-PkArgumentString refuses one too, a hashtable included"
 
     # File and folder objects are their full path. On 5.1 a FileInfo from
-    # Get-ChildItem casts to its bare name, so the program got 'a b.txt'.
+    # Get-ChildItem casts to its bare name.
     $fsDir = Join-Path $env:TEMP ("pk fs " + [guid]::NewGuid().ToString("N"))
     $null = New-Item -ItemType Directory -Force -Path $fsDir
     [System.IO.File]::WriteAllText((Join-Path $fsDir 'a b.txt'), 'x')
@@ -3247,7 +3239,7 @@ Test-Assert ($null -ne $tkChild -and $tkKilled -and $tkStart.Proc.HasExited) ("S
 $tkStart.Proc.Dispose()
 if ($null -ne $tkChild) { $tkChild.Dispose() }
 
-# The symptom: a job killed for its time limit showed TimedOut = $false.
+# And a job killed for its time limit has TimedOut = $true.
 $tkFeed = @{ Given = $false }
 $tkLog = [System.Collections.Generic.List[object]]::new()
 $null = Invoke-PkProcessDispatch -MaxConcurrent 1 -TimeoutSeconds 1 `
@@ -3268,7 +3260,7 @@ Write-Host ""
 Write-Host "=== AK: 3.0 parameter changes ===" -ForegroundColor Cyan
 
 # Complete-PkProcess -Dispose is a switch, and only -Job binds by position, so
-# the old -Dispose $true is an error instead of a 1 ms -StreamTimeoutMs.
+# -Dispose $true is an error instead of a 1 ms -StreamTimeoutMs.
 Reset-Harness
 $apiStarted = Start-PkProcess -FilePath $cmdExe -Arguments '/c echo pk-api'
 $null = $apiStarted.Proc.WaitForExit(10000)
@@ -3298,8 +3290,7 @@ $null = Invoke-PkRunspaceJobs -MaxParallel 1 -JobParams (New-JobList -Jobs @(@{ 
 $apiLevels = (@($script:messages | Where-Object { $_.Message -eq 'pk-level-worker' } | ForEach-Object { $_.Level }) -join ',')
 Test-Assert ($apiLevels -ceq 'Warn') ("and the same from a worker (" + $apiLevels + ")")
 
-# The dispatcher's -PollCallback, the runspace engine's name for the same
-# every-pass role. Its old name, -AbortPollCallback, still works.
+# The dispatcher's -PollCallback, and its alias -AbortPollCallback.
 Reset-Harness
 foreach ($apiName in 'PollCallback', 'AbortPollCallback') {
     $apiFeed = @{ Given = $false; Polls = 0 }
