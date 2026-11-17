@@ -2,7 +2,7 @@
 # graceful Ctrl+C/window-close handling for Windows PowerShell 5.1 and
 # PowerShell 7.
 #
-# Version 3.0 - https://github.com/HalRiveria/PowerShell-ParallelKit
+# Version 3.1 - https://github.com/HalRiveria/PowerShell-ParallelKit
 # Copyright (c) 2026 HalRiveria. MIT License: keep this notice with any copy;
 # the full text is in LICENSE in the repository.
 #
