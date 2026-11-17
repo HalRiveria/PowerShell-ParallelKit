@@ -258,7 +258,8 @@ public sealed class PkStreamReadTask : Task<string>
     private sealed class Buffer
     {
         private readonly TextReader _reader;
-        private readonly StringBuilder _text = new StringBuilder();
+        private StringBuilder _text = new StringBuilder();
+        private string _final;
         private readonly object _gate = new object();
         public Buffer(TextReader reader) { _reader = reader; }
         public string Pump()
@@ -269,10 +270,11 @@ public sealed class PkStreamReadTask : Task<string>
             {
                 lock (_gate) { _text.Append(chunk, 0, n); }
             }
-            return Snapshot();
+            // The builder goes once the text is final, so it isn't held twice.
+            lock (_gate) { _final = _text.ToString(); _text = null; return _final; }
         }
         // Locked: the reader may be appending while Complete-PkProcess takes it.
-        public string Snapshot() { lock (_gate) { return _text.ToString(); } }
+        public string Snapshot() { lock (_gate) { return _final != null ? _final : _text.ToString(); } }
     }
 
     private readonly Buffer _buffer;

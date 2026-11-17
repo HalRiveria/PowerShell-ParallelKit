@@ -4356,7 +4356,7 @@ Write-Host ""
 
 Write-Host "=== AX: output held open by a leftover child is cut short, not lost ===" -ForegroundColor Cyan
 # The test program writes "out" and "err", then leaves a copy of itself
-# holding one of the two open for 2 s, writing nothing. The copy is started
+# holding one of the two open for 3 s, writing nothing. The copy is started
 # with a handle list, so it inherits only that pipe: cmd's `start /b`, and
 # even .NET's Process.Start, hand a child both. Modes: stdout / stderr (the
 # stream left held), partial (stdout held, ending in half a UTF-8
@@ -4378,14 +4378,14 @@ public static class PkHold {
     static void Write(Stream s, byte[] b) { s.Write(b, 0, b.Length); s.Flush(); }
     public static int Main(string[] args) {
         string mode = args[0];
-        if (mode == "sleep") { System.Threading.Thread.Sleep(2000); return 0; }
+        if (mode == "sleep") { System.Threading.Thread.Sleep(3000); return 0; }
         Stream o = Console.OpenStandardOutput(), e = Console.OpenStandardError();
         byte[] text = Encoding.ASCII.GetBytes("out");
         if (mode == "partial" || mode == "split") { text = new byte[] { 0x63, 0x61, 0x66, 0xC3 }; }
         Write(o, text);
         Write(e, Encoding.ASCII.GetBytes("err"));
         if (mode == "split") { System.Threading.Thread.Sleep(300); Write(o, new byte[] { 0xA9, 0x20, 0x6F, 0x6B }); return 0; }
-        // A copy of this program sleeps 2 s holding exactly one of the two pipes:
+        // A copy of this program sleeps 3 s holding exactly one of the two pipes:
         // a handle list limits what it inherits to that one.
         IntPtr held = GetStdHandle(mode == "stderr" ? -12 : -11);
         IntPtr size = IntPtr.Zero;
