@@ -1695,7 +1695,10 @@ function Invoke-PkProcessDispatch {
     # argument per element), WorkingDirectory and OutputEncoding from the job. A
     # job's TimeoutSeconds key overrides -TimeoutSeconds.
     # .PARAMETER GroupProvider
-    # { } returning the next group, or $null when there are no more.
+    # { } returning the next group, or $null when there are no more, and
+    # outputting nothing else. Return a list as one group with a comma:
+    # return ,@('a', 'b'). Output ending in $null is taken as the end, with a
+    # warning, so a list group can't end in $null.
     # .PARAMETER JobBuilder
     # { param($group) } returning the group's job hashtable(s), or @() for none.
     # .PARAMETER JobStarter
@@ -1732,6 +1735,7 @@ function Invoke-PkProcessDispatch {
     # .PARAMETER GroupReleaseCheck
     # { param($group) } returning $true to release a zero-job group's queue-ahead
     # slot; until then it holds the slot. Runs on every loop pass, so keep it cheap.
+    # Only its last output value counts.
     # .PARAMETER TimeoutSeconds
     # Kill a job's program, and anything it started, still running after this long
     # (default 0, no limit). A job's own TimeoutSeconds key overrides it, and 0 there
@@ -1972,7 +1976,11 @@ function Invoke-PkProcessDispatchCore {
            (-not $pkProviderExhausted -or $pkActiveGroupCount -gt 0 -or $pkPending.Count -gt 0 -or $pkRunning.Count -gt 0)) {
 
         for ($pkH = $pkHeldGroups.Count - 1; $pkH -ge 0; $pkH--) {
-            if ([bool](Invoke-PkCallback -PkCallback $pkGroupReleaseCheck -PkArgs @(,$pkHeldGroups[$pkH]) -PkName '-GroupReleaseCheck' -PkContext $pkCallbackContext)) {
+            $pkReleased = Invoke-PkCallback -PkCallback $pkGroupReleaseCheck -PkArgs @(,$pkHeldGroups[$pkH]) -PkName '-GroupReleaseCheck' -PkContext $pkCallbackContext
+            # Only the check's last value counts, as with -JobPollCompleted: a
+            # value it leaks first (an ArrayList.Add index) would release the group.
+            if ($pkReleased -is [object[]]) { $pkReleased = $pkReleased[-1] }
+            if ([bool]$pkReleased) {
                 $pkHeldGroups.RemoveAt($pkH)
                 $pkActiveGroupCount--
             }
@@ -1980,6 +1988,16 @@ function Invoke-PkProcessDispatchCore {
 
         while ((-not $pkProviderExhausted) -and $pkActiveGroupCount -lt $pkMaxQueueAhead -and (-not $pkCancelToken.IsCancellationRequested)) {
             $pkGroupInfo = Invoke-PkCallback -PkCallback $pkGroupProvider -PkName '-GroupProvider' -PkContext $pkCallbackContext
+            # A value the provider leaks before `return $null` (an ArrayList.Add
+            # index) arrives as @(<index>, $null). Taken as one more group, the
+            # dispatcher would ask again forever, so output ending in $null is
+            # the end. A list can't be told apart from that (wrapped or not, a
+            # list reaches here as the same array), so a list group can't end
+            # in $null.
+            if ($pkGroupInfo -is [object[]] -and $pkGroupInfo.Count -gt 0 -and $null -eq $pkGroupInfo[-1]) {
+                Write-PkMessage ("ProcessDispatch: -GroupProvider output " + ($pkGroupInfo.Count - 1) + " other value(s) along with `$null, taken as no more groups. Output only the group, or `$null alone to end (`$null = ... discards a value you don't want).") -Level Warn
+                $pkGroupInfo = $null
+            }
             if ($null -eq $pkGroupInfo) { $pkProviderExhausted = $true; break }
             # A fresh key per group, not the group value: two groups that
             # compare equal (the same folder name) mustn't share a job count.
@@ -2721,7 +2739,9 @@ function Invoke-PkRunspaceJobs {
     # -NextJobProvider.
     # .PARAMETER NextJobProvider
     # { } returning the next job hashtable, or $null when there are no more. Runs on
-    # the main thread, so jobs can be produced lazily.
+    # the main thread, so jobs can be produced lazily. Only its last value counts:
+    # $null ends the run, otherwise the last hashtable is the job; anything else
+    # it outputs is ignored, with a warning.
     # .PARAMETER SharedFunctionNames
     # Your functions the worker calls.
     # .PARAMETER MaxParallel
@@ -2910,16 +2930,26 @@ function Invoke-PkRunspaceJobs {
                         $nextJob = $null
                     }
                 } else {
-                    # Same as the dispatcher's builder: take the job
-                    # hashtable, ignore anything else the provider let out.
+                    # A job is one hashtable, so the last value decides: $null
+                    # ends the run, otherwise the last hashtable is the job.
+                    # Anything else the provider let out (a leaked index, or a
+                    # hashtable before its answer) is ignored, with a warning.
                     $nextRaw = Invoke-PkCallback -PkCallback $NextJobProvider -PkName '-NextJobProvider' -PkContext $pkCallbackContext
                     $nextJob = $null
+                    $rawItems = @($nextRaw)   # @($null) is one $null: the end
+                    $jobIndex = -1
+                    if ($null -ne $rawItems[-1]) {
+                        for ($rawIndex = $rawItems.Count - 1; $rawIndex -ge 0 -and $jobIndex -lt 0; $rawIndex--) {
+                            if ($rawItems[$rawIndex] -is [hashtable]) { $jobIndex = $rawIndex }
+                        }
+                    }
+                    if ($jobIndex -ge 0) { $nextJob = $rawItems[$jobIndex] }
                     $strayCount = 0
-                    foreach ($rawItem in @($nextRaw)) {
-                        if ($rawItem -is [hashtable]) { $nextJob = $rawItem } elseif ($null -ne $rawItem) { $strayCount++ }
+                    for ($rawIndex = 0; $rawIndex -lt $rawItems.Count; $rawIndex++) {
+                        if ($rawIndex -ne $jobIndex -and $null -ne $rawItems[$rawIndex]) { $strayCount++ }
                     }
                     if ($strayCount -gt 0) {
-                        Invoke-PkMessageHandler -Level Warn -Message ("Invoke-PkRunspaceJobs: -NextJobProvider returned " + $strayCount + " value(s) that are not a job hashtable - ignored.")
+                        Invoke-PkMessageHandler -Level Warn -Message ("Invoke-PkRunspaceJobs: -NextJobProvider output " + $strayCount + " value(s) besides its job hashtable or `$null - ignored. Output only the next job, or `$null when there are no more (`$null = ... discards a value you don't want).")
                     }
                 }
                 if ($null -eq $nextJob) { $scanExhausted = $true; break }
