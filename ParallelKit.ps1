@@ -1378,9 +1378,10 @@ function Stop-PkProcessTree {
     # .SYNOPSIS
     # Kills one or more programs and every program they started.
     # .DESCRIPTION
-    # Uses one taskkill /T call for all of them, so none is left running and
-    # holding a program's output open; falls back to killing each program
-    # directly.
+    # Uses taskkill /T, in as few calls as Windows' command-line limit allows,
+    # so none is left running and holding a program's output open. If taskkill
+    # can't start, fails, or is still running after 10 seconds (it's killed
+    # then), each program is killed directly.
     # .PARAMETER Process
     # The program(s), such as the Proc that Start-PkProcess returns.
     # .OUTPUTS
@@ -1392,31 +1393,56 @@ function Stop-PkProcessTree {
         [AllowEmptyCollection()]
         [System.Diagnostics.Process[]]$Process
     )
+    return Stop-PkProcessTreeCore -Process $Process
+}
+
+function Stop-PkProcessTreeCore {
+    # Stop-PkProcessTree's body. The other parameters are for the harness: a
+    # stand-in for taskkill, a shorter wait for it, and a shorter limit on its
+    # argument list.
+    param(
+        [AllowEmptyCollection()]
+        [System.Diagnostics.Process[]]$Process,
+        [string]$TaskkillPath = (Join-Path $env:SystemRoot 'System32\taskkill.exe'),
+        [int]$TaskkillWaitMs = 10000,
+        [int]$MaxArgumentLength = 0
+    )
     $alive = [System.Collections.Generic.List[System.Diagnostics.Process]]::new()
     # A disposed Process reads $null for HasExited and Id (no throw), and an
     # empty /PID fails taskkill for the whole list, so it's left out.
     foreach ($p in $Process) { if ($null -ne $p -and $p.HasExited -eq $false -and $null -ne $p.Id) { $alive.Add($p) } }
     if ($alive.Count -eq 0) { return $false }
     $killed = $false
-    $pidArgs = foreach ($p in $alive) { '/PID ' + $p.Id }
-    $psi = [System.Diagnostics.ProcessStartInfo]::new((Join-Path $env:SystemRoot 'System32\taskkill.exe'), ('/T /F ' + ($pidArgs -join ' ')))
-    $psi.UseShellExecute = $false
-    $psi.CreateNoWindow = $true
-    $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError = $true
-    try {
-        $taskkill = [System.Diagnostics.Process]::Start($psi)
+    # One command line for every PID passes Windows' 32,767-character limit at
+    # roughly 2,500-3,000 programs, and then taskkill can't start at all: so as
+    # many taskkill calls as the limit needs.
+    if ($MaxArgumentLength -le 0) { $MaxArgumentLength = 32000 - $TaskkillPath.Length }
+    $ids = [int[]]@(foreach ($p in $alive) { $p.Id })
+    foreach ($taskkillArgs in (Split-PkTaskkillArguments -Ids $ids -MaxLength $MaxArgumentLength)) {
+        $psi = [System.Diagnostics.ProcessStartInfo]::new($TaskkillPath, $taskkillArgs)
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
         try {
-            # Read both pipes while taskkill runs: it prints a line per
-            # process it kills, and on a large kill a full pipe blocks it.
-            $taskkillOut = $taskkill.StandardOutput.ReadToEndAsync()
-            $taskkillErr = $taskkill.StandardError.ReadToEndAsync()
-            if ($taskkill.WaitForExit(10000)) {
-                $killed = ($taskkill.ExitCode -eq 0)
-                try { $null = [System.Threading.Tasks.Task]::WaitAll(@($taskkillOut, $taskkillErr), 2000) } catch { }  # the reads only keep the pipes drained; their text isn't used
-            }
-        } finally { $taskkill.Dispose() }
-    } catch { }  # taskkill missing or blocked: the fallback below still kills each process itself
+            $taskkill = [System.Diagnostics.Process]::Start($psi)
+            try {
+                # Read both pipes while taskkill runs: it prints a line per
+                # process it kills, and on a large kill a full pipe blocks it.
+                $taskkillOut = $taskkill.StandardOutput.ReadToEndAsync()
+                $taskkillErr = $taskkill.StandardError.ReadToEndAsync()
+                if ($taskkill.WaitForExit($TaskkillWaitMs)) {
+                    if ($taskkill.ExitCode -eq 0) { $killed = $true }
+                    try { $null = [System.Threading.Tasks.Task]::WaitAll(@($taskkillOut, $taskkillErr), 2000) } catch { }  # the reads only keep the pipes drained; their text isn't used
+                } else {
+                    # Still running after its wait (hung, or held up by security
+                    # software): killed, so it isn't left running outside the
+                    # Job Object. The fallback below kills the programs.
+                    try { $taskkill.Kill(); $null = $taskkill.WaitForExit(2000) } catch { }  # it exited between the wait and the kill
+                }
+            } finally { $taskkill.Dispose() }
+        } catch { }  # taskkill missing or blocked: the fallback below still kills each process itself
+    }
     # taskkill fails if any process in the trees couldn't be killed, even when
     # it killed the program: one already gone (a child in another listed tree,
     # or a `cmd /c` that ended once taskkill killed its child, which it does
@@ -1437,6 +1463,28 @@ function Stop-PkProcessTree {
         }
     }
     return $killed
+}
+
+function Split-PkTaskkillArguments {
+    # taskkill argument lists ('/T /F /PID 1 /PID 2 ...') for these PIDs, as
+    # few as fit, each at most MaxLength characters (a single PID that doesn't
+    # fit still gets a list of its own). Returns a list of strings.
+    param([int[]]$Ids, [int]$MaxLength)
+    $lists = [System.Collections.Generic.List[string]]::new()
+    $current = [System.Text.StringBuilder]::new('/T /F')
+    $count = 0
+    foreach ($id in $Ids) {
+        $part = ' /PID ' + $id
+        if ($count -gt 0 -and $current.Length + $part.Length -gt $MaxLength) {
+            $lists.Add($current.ToString())
+            $null = $current.Clear().Append('/T /F')
+            $count = 0
+        }
+        $null = $current.Append($part)
+        $count++
+    }
+    if ($count -gt 0) { $lists.Add($current.ToString()) }
+    return ,$lists
 }
 
 function Stop-PkJobProcesses {
@@ -2580,7 +2628,7 @@ function Invoke-PkProcessBatch {
 
 function Get-PkWorkerSafeFunctionNames {
     # Kit functions every worker runspace gets automatically.
-    return @('Write-PkMessage', 'Test-PkAbortSignal', 'Test-PkCancelRequested', 'Initialize-PkThreadPool', 'Stop-PkProcessTree', 'Stop-PkJobProcesses', 'Resolve-PkEncoding',
+    return @('Write-PkMessage', 'Test-PkAbortSignal', 'Test-PkCancelRequested', 'Initialize-PkThreadPool', 'Stop-PkProcessTree', 'Stop-PkProcessTreeCore', 'Split-PkTaskkillArguments', 'Stop-PkJobProcesses', 'Resolve-PkEncoding',
              'Start-PkProcess', 'Wait-PkProcess', 'Wait-PkRunningJobs', 'Complete-PkProcess', 'Invoke-PkProcessWithTimeout',
              'Invoke-PkProcessDispatch', 'Invoke-PkProcessDispatchCore', 'Invoke-PkProcessBatch',
              'Register-PkCancellationSource', 'Unregister-PkCancellationSource', 'New-PkBatchResult', 'ConvertTo-PkArgumentString', 'Get-PkForceStopReason', 'Resolve-PkFileSystemPath', 'Add-PkDispatchGroupJobs', 'Start-PkProcessCore', 'Get-PkJobTimeLimit', 'Stop-PkTimedOutJob', 'Get-PkStartFailureCause', 'Resolve-PkArguments', 'Invoke-PkCallback', 'Write-PkCallbackLoopWarning', 'ConvertTo-PkArgumentStringCore')

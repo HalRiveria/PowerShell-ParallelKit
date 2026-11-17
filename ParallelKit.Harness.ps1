@@ -4206,6 +4206,104 @@ try {
 Test-Assert ($null -eq $tlZero) ("0 is still accepted for -TimeoutMs, -StreamTimeoutMs, -AbortTimeoutSeconds, -DrainTimeoutSeconds and -TimeoutSeconds (error: " + $tlZero + ")")
 Write-Host ""
 
+Write-Host "=== AV: the tree kill with many programs, or a taskkill that hangs ===" -ForegroundColor Cyan
+# One taskkill command line for every program hit Windows' 32,767-character
+# limit at roughly 2,500-3,000 programs, so taskkill couldn't start and only
+# the programs themselves were killed, not their children. And a taskkill
+# still running after its wait was left running. These drive the tree kill's
+# core through its test parameters: a shorter argument limit, a shorter wait,
+# and a stand-in for taskkill that logs its arguments and can hang.
+$tkKit = Get-Module ParallelKit
+$tkIds = [int[]](1000000..1002999)
+$tkLimit = 32000 - (Join-Path $env:SystemRoot 'System32\taskkill.exe').Length
+$tkLists = $null
+try { $tkLists = & $tkKit Split-PkTaskkillArguments -Ids $tkIds -MaxLength $tkLimit } catch { $tkLists = @() }   # a list returned whole: assigned, not wrapped
+$tkSeen = @{}
+$tkTooLong = 0
+foreach ($line in $tkLists) {
+    if ($line.Length -gt $tkLimit -or -not $line.StartsWith('/T /F /PID ')) { $tkTooLong++ }
+    foreach ($m in [regex]::Matches($line, '/PID (\d+)')) { $tkSeen[$m.Groups[1].Value] = 1 + [int]$tkSeen[$m.Groups[1].Value] }
+}
+$tkOnce = @($tkIds | Where-Object { $tkSeen[[string]$_] -eq 1 }).Count
+Test-Assert ($tkLists.Count -ge 2 -and $tkTooLong -eq 0 -and $tkOnce -eq 3000 -and $tkSeen.Count -eq 3000) ("3,000 programs are split across " + $tkLists.Count + " taskkill command lines, each under the limit, every PID exactly once")
+
+$tkExe = Join-Path $env:TEMP ("pk-faketaskkill-" + [guid]::NewGuid().ToString("N") + ".exe")
+$tkSrc = [System.IO.Path]::ChangeExtension($tkExe, '.cs')
+[System.IO.File]::WriteAllText($tkSrc, @'
+public static class PkFakeTaskkill {
+    public static int Main(string[] args) {
+        string log = System.Environment.GetEnvironmentVariable("PK_FAKE_TASKKILL_LOG");
+        if (!string.IsNullOrEmpty(log)) { System.IO.File.AppendAllText(log, string.Join(" ", args) + "\n"); }
+        if (System.Environment.GetEnvironmentVariable("PK_FAKE_TASKKILL_MODE") == "hang") { System.Threading.Thread.Sleep(60000); }
+        return 1;
+    }
+}
+'@)
+$csc = $null
+try { $csc = Invoke-PkProcessWithTimeout -FilePath $cscExe -Arguments (ConvertTo-PkArgumentString @('/nologo', ('/out:' + $tkExe), $tkSrc)) } catch { Write-Host "  csc.exe failed to run: $_" }
+[System.IO.File]::Delete($tkSrc)
+$compiled = ($null -ne $csc -and $csc.ExitCode -eq 0 -and [System.IO.File]::Exists($tkExe))
+Test-Assert $compiled "the stand-in taskkill compiles"
+if ($compiled) {
+    $tkLog = [System.IO.Path]::ChangeExtension($tkExe, '.log')
+    $env:PK_FAKE_TASKKILL_LOG = $tkLog
+    try {
+        # Five programs, an argument limit that fits two PIDs: several
+        # taskkill calls, each under the limit. The stand-in fails, so the
+        # fallback kills the programs.
+        $tkProcs = @(1..5 | ForEach-Object { (Start-PkProcess -FilePath $pingExe -Arguments '-n 30 127.0.0.1')['Proc'] })
+        $null = & $tkKit Stop-PkProcessTreeCore -Process $tkProcs -TaskkillPath $tkExe -MaxArgumentLength 30
+        $tkLines = @()
+        if ([System.IO.File]::Exists($tkLog)) { $tkLines = @([System.IO.File]::ReadAllLines($tkLog) | Where-Object { $_ }) }
+        $tkLogged = @($tkProcs | Where-Object { $p = $_; @($tkLines | Where-Object { $_ -match ('/PID ' + $p.Id + '(\s|$)') }).Count -eq 1 }).Count
+        $tkLongest = 0; foreach ($l in $tkLines) { $tkLongest = [Math]::Max($tkLongest, $l.Length) }
+        $tkDead = @($tkProcs | Where-Object { $_.WaitForExit(5000) }).Count
+        Test-Assert ($tkLines.Count -ge 3 -and $tkLongest -le 30 -and $tkLogged -eq 5 -and $tkDead -eq 5) ("past the argument limit the PIDs go to several taskkill calls, each under it (" + $tkLines.Count + " calls, longest " + $tkLongest + " chars, " + $tkLogged + " of 5 PIDs passed once, " + $tkDead + " of 5 killed)")
+        foreach ($p in $tkProcs) { $p.Dispose() }
+
+        # A taskkill that hangs is killed after its wait, and the fallback runs.
+        $env:PK_FAKE_TASKKILL_MODE = 'hang'
+        $tkProcs = @(1..2 | ForEach-Object { (Start-PkProcess -FilePath $pingExe -Arguments '-n 30 127.0.0.1')['Proc'] })
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $null = & $tkKit Stop-PkProcessTreeCore -Process $tkProcs -TaskkillWaitMs 500 -TaskkillPath $tkExe
+        $sw.Stop()
+        $tkHung = @(Get-CimInstance Win32_Process -Filter "Name='$([System.IO.Path]::GetFileName($tkExe))'")
+        $tkDead = @($tkProcs | Where-Object { $_.WaitForExit(5000) }).Count
+        Test-Assert ($tkHung.Count -eq 0 -and $tkDead -eq 2 -and $sw.Elapsed.TotalSeconds -lt 5) ("a taskkill still running after its wait is killed, and the programs are killed anyway (" + $tkHung.Count + " stand-in(s) left running, " + $tkDead + " of 2 killed, " + [math]::Round($sw.Elapsed.TotalSeconds, 1) + "s)")
+        foreach ($h in $tkHung) { Stop-Process -Id $h.ProcessId -Force -ErrorAction SilentlyContinue }
+        foreach ($p in $tkProcs) { $p.Dispose() }
+    } finally {
+        Remove-Item Env:PK_FAKE_TASKKILL_LOG, Env:PK_FAKE_TASKKILL_MODE -ErrorAction SilentlyContinue
+        try { [System.IO.File]::Delete($tkLog) } catch { }   # temp file only; best effort
+    }
+    # The stand-in can take a moment to let go of its file after it's killed.
+    for ($t = 0; $t -lt 20 -and [System.IO.File]::Exists($tkExe); $t++) {
+        try { [System.IO.File]::Delete($tkExe) } catch { Start-Sleep -Milliseconds 100 }   # still held by the process just killed: try again
+    }
+}
+
+# The real taskkill, one PID per call: each call still kills the whole tree.
+$tkStarted = @(1..3 | ForEach-Object { Start-PkProcess -FilePath $cmdExe -Arguments '/d /c ping -n 30 127.0.0.1 >nul' })
+$tkPings = @()
+foreach ($s in $tkStarted) {
+    $p = $null
+    for ($t = 0; $t -lt 80 -and -not $p; $t++) {
+        $p = Get-CimInstance Win32_Process -Filter ("ParentProcessId=" + $s['Proc'].Id + " AND Name='PING.EXE'")
+        if (-not $p) { Start-Sleep -Milliseconds 25 }
+    }
+    if ($p) { $tkPings += [int]@($p)[0].ProcessId }
+}
+$tkKilled = & $tkKit Stop-PkProcessTreeCore -Process @($tkStarted | ForEach-Object { $_['Proc'] }) -MaxArgumentLength 22
+$tkLeft = $tkPings
+for ($t = 0; $t -lt 30 -and $tkLeft.Count -gt 0; $t++) {
+    Start-Sleep -Milliseconds 100
+    $tkLeft = @($tkLeft | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })
+}
+foreach ($id in $tkLeft) { Stop-Process -Id $id -Force -ErrorAction SilentlyContinue }
+foreach ($s in $tkStarted) { $null = Complete-PkProcess $s -Dispose }
+Test-Assert ($tkKilled -and $tkPings.Count -eq 3 -and $tkLeft.Count -eq 0) ("with one PID per taskkill call, every program's children are still killed (" + $tkPings.Count + " children seen, " + $tkLeft.Count + " left running)")
+Write-Host ""
+
 Set-PkMessageHandler -Handler $null
 Reset-PkAbortState
 
