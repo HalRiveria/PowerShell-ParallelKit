@@ -1450,7 +1450,8 @@ function Stop-PkJobProcesses {
 
 function Get-PkJobTimeLimit {
     # A dispatcher job's time limit in seconds: its own TimeoutSeconds key if it
-    # has one, else the default. 0 = no limit. Throws on a bad key.
+    # has one, else the default. 0 = no limit. Throws on a bad key. The batch
+    # and dispatcher check their -TimeoutSeconds by the same rule.
     param([hashtable]$Job, [double]$DefaultTimeoutSeconds = 0)
     $value = $Job['TimeoutSeconds']
     if ($null -eq $value) { return $DefaultTimeoutSeconds }
@@ -1491,7 +1492,7 @@ function Wait-PkProcess {
     # .PARAMETER Process
     # The program, such as the Proc that Start-PkProcess returns.
     # .PARAMETER TimeoutMs
-    # How long to wait, in milliseconds.
+    # How long to wait, in milliseconds; 0 or more, and 0 just checks.
     # .OUTPUTS
     # [bool] $true if it exited in time.
     param(
@@ -1568,7 +1569,8 @@ function Complete-PkProcess {
     # .PARAMETER Job
     # What Start-PkProcess returned, or a dispatcher job with the same keys.
     # .PARAMETER StreamTimeoutMs
-    # How long to wait for the output after the program exits (default 15000).
+    # How long to wait for the output after the program exits,
+    # in milliseconds (default 15000); 0 or more, and 0 doesn't wait.
     # .PARAMETER Dispose
     # Dispose the process object afterwards.
     # .OUTPUTS
@@ -1626,7 +1628,8 @@ function Invoke-PkProcessWithTimeout {
     # .PARAMETER TimeoutMs
     # The time limit in milliseconds (default 60000), at least 1.
     # .PARAMETER StreamTimeoutMs
-    # How long to wait for the output after the program exits (default 15000).
+    # How long to wait for the output after the program exits,
+    # in milliseconds (default 15000); 0 or more, and 0 doesn't wait.
     # .PARAMETER WorkingDirectory
     # Where to run it, as for Start-PkProcess. Default: your current location.
     # .PARAMETER OutputEncoding
@@ -1808,7 +1811,8 @@ function Invoke-PkProcessDispatch {
     if ($pkMaxQueueAhead -lt 1) { throw "Invoke-PkProcessDispatch: -MaxQueueAhead must be at least 1." }
     # Invoke-PkProcessBatch makes the same -MaxConcurrent, -TimeoutSeconds and
     # -AbortTimeoutSeconds checks, so its errors name the batch: keep the two in
-    # step. NaN and +Infinity pass a `-lt 0` test and acted as no limit.
+    # step. NaN and +Infinity pass a `-lt 0` test and acted as no limit. A job's
+    # own TimeoutSeconds key follows the same rule (Get-PkJobTimeLimit).
     if ([double]::IsNaN($pkTimeoutSeconds) -or [double]::IsInfinity($pkTimeoutSeconds) -or $pkTimeoutSeconds -lt 0) {
         throw ("Invoke-PkProcessDispatch: -TimeoutSeconds must be a number of seconds, 0 (no limit) or more (got " + $pkTimeoutSeconds + ").")
     }
@@ -2453,7 +2457,8 @@ function Invoke-PkProcessBatch {
     # Checked once here, so a bad name fails the call instead of every command.
     $null = Resolve-PkEncoding -Encoding $pkOutputEncoding
     # Invoke-PkProcessDispatch makes the same three checks; these name the
-    # batch. Keep the two in step.
+    # batch. Keep the two in step. Get-PkJobTimeLimit checks a job's own
+    # TimeoutSeconds key by the same rule.
     if ($pkMaxConcurrent -lt 1) { throw ("Invoke-PkProcessBatch: -MaxConcurrent must be at least 1 (got " + $pkMaxConcurrent + ").") }
     if ([double]::IsNaN($pkTimeoutSeconds) -or [double]::IsInfinity($pkTimeoutSeconds) -or $pkTimeoutSeconds -lt 0) {
         throw ("Invoke-PkProcessBatch: -TimeoutSeconds must be a number of seconds, 0 (no limit) or more (got " + $pkTimeoutSeconds + ").")
