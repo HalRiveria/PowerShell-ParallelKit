@@ -1045,7 +1045,14 @@ function Stop-PkProcessTree {
     try {
         $taskkill = [System.Diagnostics.Process]::Start($psi)
         try {
-            if ($taskkill.WaitForExit(10000)) { $killed = ($taskkill.ExitCode -eq 0) }
+            # Read both pipes while taskkill runs: it prints a line per
+            # process it kills, and on a large kill a full pipe blocks it.
+            $taskkillOut = $taskkill.StandardOutput.ReadToEndAsync()
+            $taskkillErr = $taskkill.StandardError.ReadToEndAsync()
+            if ($taskkill.WaitForExit(10000)) {
+                $killed = ($taskkill.ExitCode -eq 0)
+                try { $null = [System.Threading.Tasks.Task]::WaitAll(@($taskkillOut, $taskkillErr), 2000) } catch { }  # the reads only keep the pipes drained; their text isn't used
+            }
         } finally { $taskkill.Dispose() }
     } catch { }  # taskkill missing or blocked: the fallback below still kills each process itself
     # taskkill fails if any process in the trees couldn't be killed, even when
