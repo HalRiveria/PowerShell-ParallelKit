@@ -1561,7 +1561,8 @@ function Complete-PkProcess {
     # .DESCRIPTION
     # A program that exited can still have its output held open by a program it
     # started, so reading the output is time-limited too; StreamTimedOut says when
-    # that limit was hit.
+    # that limit was hit. The stream it gave up on comes back $null: its output
+    # is missing, not cut short.
     # .PARAMETER Job
     # What Start-PkProcess returned, or a dispatcher job with the same keys.
     # .PARAMETER StreamTimeoutMs
@@ -2748,9 +2749,10 @@ function Invoke-PkRunspaceJobs {
     # Check the worker code and job values before starting. On unless you pass
     # -CheckWorkerSafety:$false, whatever Get-Help says the default is.
     # .OUTPUTS
-    # An object with ForceStoppedCount, CrashedCount, Aborted, Crashed (one
-    # @{ Job; Error } entry per worker that threw) and Errors (one @{ Job; Error }
-    # entry per non-terminating error a worker wrote).
+    # An object with ForceStoppedCount (workers an abort stopped waiting for;
+    # one stuck in a .NET call keeps running), CrashedCount, Aborted, Crashed
+    # (one @{ Job; Error } entry per worker that threw) and Errors (one
+    # @{ Job; Error } entry per non-terminating error a worker wrote).
     # .EXAMPLE
     # Invoke-PkRunspaceJobs -MaxParallel 4 -JobParams @(@{ Id = 1 }, @{ Id = 2 }) -WorkerScript { param($Id) $Id * 2 } -ResultHandler { param($r) Write-Host $r }
     param(

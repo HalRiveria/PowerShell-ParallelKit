@@ -143,7 +143,7 @@ Programs run in your current location (`Get-Location`) unless a command says oth
 - `StartError` is set when the program couldn't be started (not found, say). Every command is still tried and gets its own result, but repeats of the same failure for the same program print once, with a count at the end.
 - `Aborted` is `$true` for a command an abort killed or kept from starting.
 - `TimedOut` is `$true` for a program `-TimeoutSeconds` killed.
-- `StreamTimedOut` / `StreamError` mean the output may be incomplete. The output read gives up 15 seconds after the program exits, which only happens when a program it started is still holding the output open.
+- `StreamTimedOut` means the output read gave up 15 seconds after the program exited, which only happens when a program it started is still holding the output open. The stream it gave up on comes back `$null`: what the program wrote there is missing, not cut short. `StreamError` means a read failed, and that stream comes back `$null` too.
 
 `Results` is in the order commands finished, not the order you gave them. Use `Command` to match them up, or give each command your own key (`Index = $n`) and sort on it: `$batch.Results | Sort-Object { $_.Command.Index }`.
 
@@ -207,7 +207,7 @@ Each worker runs in its own runspace: a separate PowerShell session inside the s
 - Don't call `exit` in a worker. It ends that job quietly (not as a crash) and sets your whole script's exit code.
 - `-MaxParallel` has no default; you choose it. `-DrainTimeoutSeconds` (how long Ctrl+C waits for running workers) defaults to 60. The process engines' names, `-MaxConcurrent` and `-AbortTimeoutSeconds`, work here too.
 - If `-ResultHandler`, `-PollCallback` or `-NextJobProvider` throws, the run stops: workers still going are told to stop and the exception comes out of the call.
-- Returns an object with `ForceStoppedCount`, `CrashedCount`, `Aborted`, `Crashed` and `Errors`. `Crashed` lists the `Job` and `Error` of each worker that threw. `Errors` lists the `Job` and `Error` of each non-terminating error a worker wrote, including any written before it threw. A force-stopped worker is in neither list. Every entry is kept until the call returns, so a worker that can write thousands of errors (walking a tree of folders it can't read, say) should handle them itself, e.g. with `-ErrorAction SilentlyContinue -ErrorVariable`.
+- Returns an object with `ForceStoppedCount`, `CrashedCount`, `Aborted`, `Crashed` and `Errors`. `ForceStoppedCount` is how many workers an abort stopped waiting for; one stuck in a .NET call keeps running (see Limits). `Crashed` lists the `Job` and `Error` of each worker that threw. `Errors` lists the `Job` and `Error` of each non-terminating error a worker wrote, including any written before it threw. A force-stopped worker is in neither list. Every entry is kept until the call returns, so a worker that can write thousands of errors (walking a tree of folders it can't read, say) should handle them itself, e.g. with `-ErrorAction SilentlyContinue -ErrorVariable`.
 
 ## The two rules for worker code
 
