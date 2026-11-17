@@ -1691,7 +1691,7 @@ function Invoke-PkProcessDispatchCore {
                 # teardown can't release the slot again.
                 if ($pkJob['Proc'] -is [System.Diagnostics.Process]) {
                     try { $null = Stop-PkProcessTree -Process $pkJob['Proc'] } catch { }   # best effort; the failed start is still reported below
-                    try { $pkJob['Proc'].Dispose() } catch { }
+                    try { $pkJob['Proc'].Dispose() } catch { }   # the failed start is reported either way
                 }
                 $pkStarting = $null
                 if ($pkIsSharedBudget) { $null = $pkMaxConcurrent.Release() }
@@ -1902,11 +1902,11 @@ function Invoke-PkProcessDispatchCore {
             Write-PkMessage ("ProcessDispatch: force-stopping " + $pkRunning.Count + " job(s)" + (Get-PkForceStopReason -TimeoutSeconds $pkAbortTimeoutSeconds) + ".") -Level Warn
             Stop-PkJobProcesses -Jobs $pkRunning
             foreach ($pkJob in $pkRunning) {
-                try { if ($pkJob['Proc']) { $null = $pkJob['Proc'].WaitForExit(5000) } } catch { }
-                try { $null = Invoke-PkCallback -PkCallback $pkJobAbortCleanup -PkArgs @(,$pkJob) -PkName '-JobAbortCleanup' -PkContext $pkCallbackContext } catch { }
-                if ($pkIsSharedBudget) { try { $null = $pkMaxConcurrent.Release() } catch { } }
+                try { if ($pkJob['Proc']) { $null = $pkJob['Proc'].WaitForExit(5000) } } catch { }   # a custom starter's .Proc may not be a Process; the kill above already ran
+                try { $null = Invoke-PkCallback -PkCallback $pkJobAbortCleanup -PkArgs @(,$pkJob) -PkName '-JobAbortCleanup' -PkContext $pkCallbackContext } catch { }   # one job's failed cleanup mustn't skip the others'
+                if ($pkIsSharedBudget) { try { $null = $pkMaxConcurrent.Release() } catch { } }   # best effort: one failed release mustn't stop the other jobs' cleanup
                 $pkJob['SlotReleased'] = $true
-                try { if ($pkJob['Proc']) { $pkJob['Proc'].Dispose() } } catch { }
+                try { if ($pkJob['Proc']) { $pkJob['Proc'].Dispose() } } catch { }   # the job is over either way
             }
         }
     }
@@ -1923,13 +1923,13 @@ function Invoke-PkProcessDispatchCore {
             if ($null -ne $pkStarting -and -not $pkTearDown.Contains($pkStarting)) { $pkTearDown.Add($pkStarting) }
             Stop-PkJobProcesses -Jobs $pkTearDown
             foreach ($pkJob in $pkTearDown) {
-                try { if ($pkJob['Proc']) { $null = $pkJob['Proc'].WaitForExit(5000) } } catch { }
+                try { if ($pkJob['Proc']) { $null = $pkJob['Proc'].WaitForExit(5000) } } catch { }   # a custom starter's .Proc may not be a Process; the kill above already ran
                 if (-not [object]::ReferenceEquals($pkJob, $pkFinalizing)) {
-                    try { $null = Invoke-PkCallback -PkCallback $pkJobAbortCleanup -PkArgs @(,$pkJob) -PkName '-JobAbortCleanup' -PkContext $pkCallbackContext } catch { }
+                    try { $null = Invoke-PkCallback -PkCallback $pkJobAbortCleanup -PkArgs @(,$pkJob) -PkName '-JobAbortCleanup' -PkContext $pkCallbackContext } catch { }   # one job's failed cleanup mustn't skip the others'
                 }
-                if ($pkIsSharedBudget) { try { $null = $pkMaxConcurrent.Release() } catch { } }
+                if ($pkIsSharedBudget) { try { $null = $pkMaxConcurrent.Release() } catch { } }   # best effort: one failed release mustn't stop the other jobs' cleanup
                 $pkJob['SlotReleased'] = $true
-                try { if ($pkJob['Proc']) { $pkJob['Proc'].Dispose() } } catch { }
+                try { if ($pkJob['Proc']) { $pkJob['Proc'].Dispose() } } catch { }   # the job is over either way
             }
         }
     }
@@ -1939,7 +1939,7 @@ function Invoke-PkProcessDispatchCore {
     # never be reported.
     if ($pkPending.Count -gt 0) {
         foreach ($pkJob in $pkPending) {
-            try { $null = Invoke-PkCallback -PkCallback $pkJobAbortCleanup -PkArgs @(,$pkJob) -PkName '-JobAbortCleanup' -PkContext $pkCallbackContext } catch { }
+            try { $null = Invoke-PkCallback -PkCallback $pkJobAbortCleanup -PkArgs @(,$pkJob) -PkName '-JobAbortCleanup' -PkContext $pkCallbackContext } catch { }   # one job's failed cleanup mustn't skip the others'
             $pkKey = $pkJob['GroupKey']
             if ($pkGroupStates.ContainsKey($pkKey)) { $pkGroupStates[$pkKey].Outstanding-- }
         }
@@ -2370,6 +2370,8 @@ function Invoke-PkRunspaceJobs {
     # How many workers run at once. -MaxConcurrent also works.
     # .PARAMETER Cts
     # Your own CancellationTokenSource for the run; an abort cancels it too.
+    # So does any exit that leaves workers running (one of your callbacks
+    # throwing, say), so a worker that checks Test-PkCancelRequested is told.
     # .PARAMETER ResultHandler
     # { param($result) } on the main thread, once per object a worker returns.
     # .PARAMETER PollCallback
@@ -2463,7 +2465,6 @@ function Invoke-PkRunspaceJobs {
     # A fixed list can be checked before a single worker starts.
     if ($null -ne $JobParams) {
         for ($jobIndex = 0; $jobIndex -lt $JobParams.Count; $jobIndex++) {
-            if ($null -eq $JobParams[$jobIndex]) { throw ("Invoke-PkRunspaceJobs: -JobParams entry " + $jobIndex + " is null.") }
             foreach ($key in $JobParams[$jobIndex].Keys) {
                 if (-not $declaredParams.Contains([string]$key)) {
                     throw ("Invoke-PkRunspaceJobs: job " + $jobIndex + " supplies '" + $key + "', but -WorkerScript's param() block doesn't declare it. Nothing was started.")
@@ -2655,7 +2656,7 @@ function Invoke-PkRunspaceJobs {
         foreach ($h in $handles) {
             try {
                 if (-not $h.Handle.IsCompleted) { $stillRunning = $true; $null = $h.PS.BeginStop($null, $null) }
-            } catch { }
+            } catch { }   # one worker that can't be asked to stop mustn't keep the rest from being asked
         }
         if ($null -ne $pool) {
             # A worker stuck in a .NET call can't be stopped, and Dispose()
@@ -2665,12 +2666,12 @@ function Invoke-PkRunspaceJobs {
                 # returns. Cancel the token so one that checks
                 # Test-PkCancelRequested before an irreversible step is told,
                 # even on a non-abort exit (one of your callbacks threw).
-                try { $Cts.Cancel() } catch { }
-                try { $null = $pool.BeginClose($null, $null) } catch { }
+                try { $Cts.Cancel() } catch { }   # already disposed by its owner: nothing left to tell
+                try { $null = $pool.BeginClose($null, $null) } catch { }   # teardown only; the exception in flight, if any, is the one to surface
             }
-            else               { try { $pool.Dispose() } catch { } }
+            else               { try { $pool.Dispose() } catch { } }   # teardown only; the exception in flight, if any, is the one to surface
         }
-        if ($null -ne $messageQueue) { try { Receive-PkWorkerMessages -Queue $messageQueue } catch { } }
+        if ($null -ne $messageQueue) { try { Receive-PkWorkerMessages -Queue $messageQueue } catch { } }   # last messages are best effort; the exception in flight, if any, is the one to surface
         if ($null -ne $ownCts) {
             Unregister-PkCancellationSource -Cts $ownCts
             $ownCts.Dispose()
