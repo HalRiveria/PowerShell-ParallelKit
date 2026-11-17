@@ -7,7 +7,7 @@ Run thousands of command-line programs, or blocks of PowerShell code, in paralle
 - **Process dispatch** - run many external programs, a set number at a time, with their output captured.
 - **Runspace jobs** - run a PowerShell worker script many times in parallel.
 - **Graceful abort** - Ctrl+C lets in-flight work finish and stops cleanly, instead of killing everything mid-write. Closing the window stops what's left right away, since Windows allows only a few seconds.
-- **No orphans** - programs the script started die with it, even if it's force-closed.
+- **No orphans** - programs the script started die with it, even if it's force-closed (with one rare gap, see [Limits](#limits)).
 
 Built with Claude Code.
 
@@ -330,6 +330,7 @@ Other pieces: `Request-PkAbort` triggers the same abort from code. `Test-PkAbort
 - After changing `ParallelKit.ps1` itself, start a new PowerShell window. A session keeps the kit's compiled parts until it closes; the kit tells you if it finds an older copy loaded.
 - One run at a time per process. The abort state is shared. A nested `Invoke-PkRun` just runs inside the outer one.
 - A worker stuck inside a long .NET call can't be interrupted. Force-stop stops waiting for it and returns. The worker is NOT killed: once that call returns it can carry on to the end of its script. Before any step that can't be undone (deleting a source file, say), have the worker check `Test-PkCancelRequested` and skip the step if it's true.
+- A program joins the kit's Job Object just after it starts, so a program it starts straight away can miss it. For example, with `cmd /c tool.exe`, `tool.exe` may already be running when `cmd.exe` is added. If the script is then killed outright (from Task Manager, say), that `tool.exe` keeps running. It's rare: in testing, 1 of 600 `cmd /c ping` jobs on Windows PowerShell 5.1, and none of 600 on PowerShell 7. Ctrl+C, an abort and a timeout aren't affected, since they kill each program's whole process tree.
 - Programs run hidden, and there's no way to send them input. A program that stops to ask a question will sit there until it's killed.
 - A program's output is collected in memory and handed over when it exits; there's no live line-by-line output. A program that prints gigabytes will use that much memory. A batch keeps every result, output included, until it returns, which adds up over thousands of chatty programs. If you only need the output in `-OnComplete`, drop it there with `$result.Stdout = $null; $result.Stderr = $null` and it's freed as the batch goes.
 
@@ -391,7 +392,7 @@ Inside `Invoke-PkRun`, no new ones start, and the running ones get up to 60 seco
 
 **And if the script is killed outright, from Task Manager say?**
 
-The programs it started are killed with it, through a Windows Job Object. There's no waiting period and no cleanup callback in that case, so partial output files can be left behind.
+The programs it started are killed with it, through a Windows Job Object. There's no waiting period and no cleanup callback in that case, so partial output files can be left behind. One rare exception, a program started in its parent's first moment, is under [Limits](#limits).
 
 **Can I show progress?**
 
