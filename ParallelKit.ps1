@@ -1450,7 +1450,8 @@ function Stop-PkJobProcesses {
 
 function Get-PkJobTimeLimit {
     # A dispatcher job's time limit in seconds: its own TimeoutSeconds key if it
-    # has one, else the default. 0 = no limit. Throws on a bad key.
+    # has one, else the default. 0 = no limit. Throws on a bad key. The batch
+    # and dispatcher check their -TimeoutSeconds by the same rule.
     param([hashtable]$Job, [double]$DefaultTimeoutSeconds = 0)
     $value = $Job['TimeoutSeconds']
     if ($null -eq $value) { return $DefaultTimeoutSeconds }
@@ -1491,7 +1492,7 @@ function Wait-PkProcess {
     # .PARAMETER Process
     # The program, such as the Proc that Start-PkProcess returns.
     # .PARAMETER TimeoutMs
-    # How long to wait, in milliseconds.
+    # How long to wait, in milliseconds; 0 or more, and 0 just checks.
     # .OUTPUTS
     # [bool] $true if it exited in time.
     param(
@@ -1500,6 +1501,8 @@ function Wait-PkProcess {
         [Parameter(Mandatory)]
         [int]$TimeoutMs
     )
+    # -1 would wait until the program exits, forever if it never does.
+    if ($TimeoutMs -lt 0) { throw ("Wait-PkProcess: -TimeoutMs must be 0 or more (got " + $TimeoutMs + "). It's how long to wait, in milliseconds; 0 just checks.") }
     # Same handle wrapping as Wait-PkRunningJobs.
     $waitHandle = [System.Threading.ManualResetEvent]::new($false)
     $origHandle = $waitHandle.SafeWaitHandle
@@ -1566,7 +1569,8 @@ function Complete-PkProcess {
     # .PARAMETER Job
     # What Start-PkProcess returned, or a dispatcher job with the same keys.
     # .PARAMETER StreamTimeoutMs
-    # How long to wait for the output after the program exits (default 15000).
+    # How long to wait for the output after the program exits,
+    # in milliseconds (default 15000); 0 or more, and 0 doesn't wait.
     # .PARAMETER Dispose
     # Dispose the process object afterwards.
     # .OUTPUTS
@@ -1581,6 +1585,12 @@ function Complete-PkProcess {
         [int]$StreamTimeoutMs = 15000,
         [switch]$Dispose
     )
+    # A negative wait isn't a limit: -1 waited until the output closed, however
+    # long a leftover child held it. Invoke-PkProcessWithTimeout checks it too,
+    # before starting its program.
+    if ($StreamTimeoutMs -lt 0) {
+        throw ("Complete-PkProcess: -StreamTimeoutMs must be 0 or more (got " + $StreamTimeoutMs + "). It's how long to wait for the output after the program exits, in milliseconds; 0 doesn't wait.")
+    }
     $result = [ordered]@{ ExitCode = $null; Stdout = $null; Stderr = $null; StreamTimedOut = $false; StreamError = $null }
     # A custom starter's job may have no read tasks, and a read can fail.
     # Neither throws: this runs inside JobFinalize, where a throw stops the
@@ -1618,7 +1628,8 @@ function Invoke-PkProcessWithTimeout {
     # .PARAMETER TimeoutMs
     # The time limit in milliseconds (default 60000), at least 1.
     # .PARAMETER StreamTimeoutMs
-    # How long to wait for the output after the program exits (default 15000).
+    # How long to wait for the output after the program exits,
+    # in milliseconds (default 15000); 0 or more, and 0 doesn't wait.
     # .PARAMETER WorkingDirectory
     # Where to run it, as for Start-PkProcess. Default: your current location.
     # .PARAMETER OutputEncoding
@@ -1642,6 +1653,8 @@ function Invoke-PkProcessWithTimeout {
     )
     # Checked before starting anything: 0 or less would kill the program at once.
     if ($TimeoutMs -lt 1) { throw ("Invoke-PkProcessWithTimeout: -TimeoutMs must be at least 1 (got " + $TimeoutMs + "). It's the program's time limit in milliseconds.") }
+    # Complete-PkProcess makes the same check, but only after the program has run.
+    if ($StreamTimeoutMs -lt 0) { throw ("Invoke-PkProcessWithTimeout: -StreamTimeoutMs must be 0 or more (got " + $StreamTimeoutMs + "). It's how long to wait for the output after the program exits, in milliseconds; 0 doesn't wait.") }
     $job = Start-PkProcessCore -FilePath $FilePath -Arguments $Arguments -WorkingDirectory $WorkingDirectory -OutputEncoding $OutputEncoding -CallerState $PSCmdlet.SessionState
     try {
         # Short slices, so an abort or cancel is noticed within a moment.
@@ -1796,8 +1809,16 @@ function Invoke-PkProcessDispatch {
         $pkMaxConcurrent = $pkMaxConcurrentInt
     }
     if ($pkMaxQueueAhead -lt 1) { throw "Invoke-PkProcessDispatch: -MaxQueueAhead must be at least 1." }
-    # Invoke-PkProcessBatch has the same check, so its error names the batch.
-    if ($pkTimeoutSeconds -lt 0) { throw "Invoke-PkProcessDispatch: -TimeoutSeconds must be 0 (no limit) or more." }
+    # Invoke-PkProcessBatch makes the same -MaxConcurrent, -TimeoutSeconds and
+    # -AbortTimeoutSeconds checks, so its errors name the batch: keep the two in
+    # step. NaN and +Infinity pass a `-lt 0` test and acted as no limit. A job's
+    # own TimeoutSeconds key follows the same rule (Get-PkJobTimeLimit).
+    if ([double]::IsNaN($pkTimeoutSeconds) -or [double]::IsInfinity($pkTimeoutSeconds) -or $pkTimeoutSeconds -lt 0) {
+        throw ("Invoke-PkProcessDispatch: -TimeoutSeconds must be a number of seconds, 0 (no limit) or more (got " + $pkTimeoutSeconds + ").")
+    }
+    if ($pkAbortTimeoutSeconds -lt 0) {
+        throw ("Invoke-PkProcessDispatch: -AbortTimeoutSeconds must be 0 or more (got " + $pkAbortTimeoutSeconds + "). It's how long an abort waits for running jobs before force-stopping them; 0 doesn't wait.")
+    }
 
     # Size the thread pool up front. For a shared budget, its free slots now
     # are the best measure of its size.
@@ -2435,9 +2456,16 @@ function Invoke-PkProcessBatch {
 
     # Checked once here, so a bad name fails the call instead of every command.
     $null = Resolve-PkEncoding -Encoding $pkOutputEncoding
-    # Invoke-PkProcessDispatch has the same two checks; these name the batch.
+    # Invoke-PkProcessDispatch makes the same three checks; these name the
+    # batch. Keep the two in step. Get-PkJobTimeLimit checks a job's own
+    # TimeoutSeconds key by the same rule.
     if ($pkMaxConcurrent -lt 1) { throw ("Invoke-PkProcessBatch: -MaxConcurrent must be at least 1 (got " + $pkMaxConcurrent + ").") }
-    if ($pkTimeoutSeconds -lt 0) { throw "Invoke-PkProcessBatch: -TimeoutSeconds must be 0 (no limit) or more." }
+    if ([double]::IsNaN($pkTimeoutSeconds) -or [double]::IsInfinity($pkTimeoutSeconds) -or $pkTimeoutSeconds -lt 0) {
+        throw ("Invoke-PkProcessBatch: -TimeoutSeconds must be a number of seconds, 0 (no limit) or more (got " + $pkTimeoutSeconds + ").")
+    }
+    if ($pkAbortTimeoutSeconds -lt 0) {
+        throw ("Invoke-PkProcessBatch: -AbortTimeoutSeconds must be 0 or more (got " + $pkAbortTimeoutSeconds + "). It's how long an abort waits for running programs before force-stopping them; 0 doesn't wait.")
+    }
 
     $pkResults = [System.Collections.Generic.List[object]]::new()
     $pkState   = @{ Given = $false }
@@ -2803,6 +2831,9 @@ function Invoke-PkRunspaceJobs {
         throw "Invoke-PkRunspaceJobs: supply only one of -JobParams or -NextJobProvider, not both."
     }
     if ($MaxParallel -lt 1) { throw "Invoke-PkRunspaceJobs: -MaxParallel must be at least 1." }
+    if ($DrainTimeoutSeconds -lt 0) {
+        throw ("Invoke-PkRunspaceJobs: -DrainTimeoutSeconds must be 0 or more (got " + $DrainTimeoutSeconds + "). It's how long an abort waits for running workers before force-stopping them; 0 doesn't wait.")
+    }
 
     # A List, an array or a single hashtable: a one-job list built with
     # foreach collapses to a bare hashtable.
