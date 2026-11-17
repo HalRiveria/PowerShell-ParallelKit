@@ -1350,7 +1350,7 @@ Test-Assert ((Get-HarnessShape $shapeJobs) -eq 'ForceStoppedCount,CrashedCount,A
 $shapeFindings = Test-PkWorkerSafety -WorkerScript { param($Id) $null = [Func[int]]{ 1 } }
 $shapeFinding = $shapeFindings[0]
 Test-Assert ((Get-HarnessShape $shapeFinding) -eq 'Rule,Where,Line,Text') ("worker-safety findings are objects (" + (Get-HarnessShape $shapeFinding) + ")")
-Test-Assert ((Get-HarnessShape (Initialize-ParallelKit)) -eq 'AbortHandler,ChildProcessJob,ThreadPool') "Initialize-ParallelKit returns an object"
+Test-Assert ((Get-HarnessShape (Initialize-ParallelKit)) -eq 'AbortHandler,ChildProcessJob,ThreadPool,Version,StartMode') "Initialize-ParallelKit returns an object"
 
 $fields = @('Command', 'ExitCode', 'Stdout', 'Stderr', 'StreamTimedOut', 'StreamError', 'StartError', 'Aborted', 'TimedOut')
 $batch = Invoke-PkProcessBatch -MaxConcurrent 1 -Commands @(
@@ -4302,6 +4302,56 @@ for ($t = 0; $t -lt 30 -and $tkLeft.Count -gt 0; $t++) {
 foreach ($id in $tkLeft) { Stop-Process -Id $id -Force -ErrorAction SilentlyContinue }
 foreach ($s in $tkStarted) { $null = Complete-PkProcess $s -Dispose }
 Test-Assert ($tkKilled -and $tkPings.Count -eq 3 -and $tkLeft.Count -eq 0) ("with one PID per taskkill call, every program's children are still killed (" + $tkPings.Count + " children seen, " + $tkLeft.Count + " left running)")
+Write-Host ""
+
+Write-Host "=== AW: when a program can't be created in the Job Object ===" -ForegroundColor Cyan
+# A start whose setup fails (pipes, the attribute list, the job attribute)
+# falls back to Process.Start and the Job Object just after, with a warning
+# shown once, since that costs the cleanup of a child the program starts
+# straight away. The harness's own switch to that path stays quiet.
+Reset-Harness
+$fbReset = [PkChildProcessJob].GetMethod('TestResetFallbackWarning')
+if ($null -ne $fbReset) { $null = $fbReset.Invoke($null, @()) }
+$fbOk = @(); $fbError = $null
+[PkChildProcessJob]::TestFailSetup = $true
+try {
+    foreach ($i in 1..2) {
+        $s = Start-PkProcess -FilePath $cmdExe -Arguments '/d /c ping -n 2 127.0.0.1 >nul& exit /b 3'
+        $fbInJob = [PkHarnessJobProbe]::InJob($s['Proc'].Id, $jobHandle)
+        $r = Complete-PkProcess $s -Dispose
+        $fbOk += ($r.ExitCode -eq 3 -and $fbInJob -ne $false)
+    }
+} catch { $fbError = [string]$_ } finally { [PkChildProcessJob]::TestFailSetup = $false }
+Test-Assert ($null -eq $fbError -and ($fbOk -join ',') -eq 'True,True') ("a start whose setup fails falls back to Process.Start, still in the Job Object (results: " + ($fbOk -join ',') + ", error: " + $fbError + ")")
+$fbWarnings = @($script:messages | Where-Object { $_.Level -eq 'Warn' -and $_.Message -like '*Process.Start*' })
+Test-Assert ($fbWarnings.Count -eq 1 -and $fbWarnings[0].Message -like '*straight away*') ("and warns once, saying what it costs (" + $fbWarnings.Count + " warning(s))")
+Reset-Harness
+if ($null -ne $fbReset) { $null = $fbReset.Invoke($null, @()) }
+[PkChildProcessJob]::TestUseProcessStart = $true
+try { $null = Complete-PkProcess (Start-PkProcess -FilePath $cmdExe -Arguments '/d /c exit 0') -Dispose } finally { [PkChildProcessJob]::TestUseProcessStart = $false }
+Test-Assert (@($script:messages | Where-Object { $_.Level -eq 'Warn' }).Count -eq 0) "the harness's switch to Process.Start doesn't warn"
+
+# A program whose output readers can't be built isn't left running untracked:
+# the start fails and the program is ended.
+[PkChildProcessJob]::TestFailReaders = $true
+$rdError = $null
+try { $null = Start-PkProcess -FilePath $pingExe -Arguments '-n 59 127.0.0.1' } catch { $rdError = [string]$_ } finally { [PkChildProcessJob]::TestFailReaders = $false }
+$rdLeft = @(Get-CimInstance Win32_Process -Filter "Name='PING.EXE'" | Where-Object { [string]$_.CommandLine -like '* -n 59 *' })
+foreach ($l in $rdLeft) { Stop-Process -Id $l.ProcessId -Force -ErrorAction SilentlyContinue }
+Test-Assert ($rdError -like '*could not start*' -and $rdLeft.Count -eq 0) ("a program whose output readers fail to build is ended and the start reported as failed (" + $rdLeft.Count + " left running, error: " + $rdError + ")")
+
+# Initialize-ParallelKit reports the kit's version and how it starts programs.
+$ipHeader = [regex]::Match([System.IO.File]::ReadAllText((Join-Path $PSScriptRoot 'ParallelKit.ps1')), '(?m)^# Version (\d+\.\d+)').Groups[1].Value
+$ipError = $null; $ip = $null; $ipAdded = $null
+try {
+    $ip = Initialize-ParallelKit
+    [PkChildProcessJob]::TestUseProcessStart = $true
+    try { $ipAdded = (Initialize-ParallelKit).StartMode } finally { [PkChildProcessJob]::TestUseProcessStart = $false }
+} catch { $ipError = [string]$_ }
+$ipVersion = $null; $ipMode = $null
+if ($null -ne $ip -and $null -ne $ip.PSObject.Properties['Version']) { $ipVersion = [string]$ip.Version; $ipMode = $ip.StartMode }
+Test-Assert ($ipHeader -ne '' -and $ipVersion -eq $ipHeader) ("Initialize-ParallelKit's Version matches the header's Version line (" + $ipVersion + " vs " + $ipHeader + ")")
+Test-Assert ($ipMode -eq 'CreatedInJob' -and $ipAdded -eq 'AddedToJob') ("and its StartMode says how programs start: CreatedInJob normally, AddedToJob without the start lock (" + $ipMode + ", " + $ipAdded + ", error: " + $ipError + ")")
 Write-Host ""
 
 Set-PkMessageHandler -Handler $null

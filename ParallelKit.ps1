@@ -3,6 +3,7 @@
 # PowerShell 7.
 #
 # Version 3.2 - https://github.com/HalRiveria/PowerShell-ParallelKit
+# (Initialize-ParallelKit reports the version too: change both together.)
 # Copyright (c) 2026 HalRiveria. MIT License: keep this notice with any copy;
 # the full text is in LICENSE in the repository.
 #
@@ -163,7 +164,7 @@ public static class PkState
 
     // Bump this, and the check after the type definitions, whenever any C#
     // in this file changes: a session keeps the types it compiled first.
-    public const int TypesVersion = 5;
+    public const int TypesVersion = 6;
 
     // Locked: Register-/Unregister-PkCancellationSource are callable from
     // worker runspaces, and List<T> is not safe for concurrent writers.
@@ -523,6 +524,29 @@ public static class PkChildProcessJob
 
     // Harness only: makes TryStart return null, to test the Process.Start path.
     public static bool TestUseProcessStart = false;
+    // Harness only: make a start's setup fail, or building its output readers.
+    public static bool TestFailSetup = false;
+    public static bool TestFailReaders = false;
+
+    // How programs start here, for Initialize-ParallelKit: "CreatedInJob"
+    // (TryStart), "AddedToJob" (Process.Start, then the job: no usable start
+    // lock, or the harness switch), or "NoJob" (the job couldn't be set up,
+    // so nothing is cleaned up on a kill). A single start can still fall back
+    // from CreatedInJob when its setup fails; that warns.
+    public static string StartMode
+    {
+        get
+        {
+            if (_job == IntPtr.Zero) { return "NoJob"; }
+            if (TestUseProcessStart || GetStartLock() == null) { return "AddedToJob"; }
+            return "CreatedInJob";
+        }
+    }
+
+    // The fallback warning is shown once per process: true for the first caller.
+    private static int _fallbackWarned = 0;
+    public static bool ClaimFallbackWarning() { return Interlocked.Exchange(ref _fallbackWarned, 1) == 0; }
+    public static void TestResetFallbackWarning() { Interlocked.Exchange(ref _fallbackWarned, 0); }
 
     private static StringBuilder BuildCommandLine(string fileName, string arguments)
     {
@@ -553,14 +577,17 @@ public static class PkChildProcessJob
     }
 
     // Starts the program in the job, or returns null when it can't do that
-    // safely (no job, no usable start lock): the caller then uses
-    // Process.Start and Assign. Throws Win32Exception when Windows refuses,
-    // as Process.Start does. encoding null: the console's output code page.
-    public static PkStartedProcess TryStart(string fileName, string arguments, string workingDirectory, Encoding encoding)
+    // safely: the caller then uses Process.Start and Assign. fallbackReason
+    // says why, for the caller's one-time warning; it stays null where no
+    // warning is due (no job, which has its own; the harness switch). Throws
+    // Win32Exception when Windows refuses to create the program, as
+    // Process.Start does. encoding null: the console's output code page.
+    public static PkStartedProcess TryStart(string fileName, string arguments, string workingDirectory, Encoding encoding, out string fallbackReason)
     {
+        fallbackReason = null;
         if (TestUseProcessStart || _job == IntPtr.Zero) { return null; }
         StartLock startLock = GetStartLock();
-        if (startLock == null) { return null; }
+        if (startLock == null) { fallbackReason = ".NET's process-start lock isn't where the kit expects it on this .NET version"; return null; }
         if (encoding == null)
         {
             try { encoding = Encoding.GetEncoding((int)GetConsoleOutputCP()); }
@@ -570,7 +597,8 @@ public static class PkChildProcessJob
 
         IntPtr outRead = IntPtr.Zero, outWrite = IntPtr.Zero, errRead = IntPtr.Zero, errWrite = IntPtr.Zero;
         IntPtr attrList = IntPtr.Zero, handleArr = IntPtr.Zero, jobArr = IntPtr.Zero;
-        bool attrReady = false, created = false;
+        bool attrReady = false, created = false, setupFailed = false;
+        IntPtr stdin = IntPtr.Zero;
         PROCESS_INFORMATION pi = new PROCESS_INFORMATION();
 
         startLock.Enter();
@@ -578,35 +606,48 @@ public static class PkChildProcessJob
         {
             try
             {
-                CreateOutputPipe(out outRead, out outWrite);
-                CreateOutputPipe(out errRead, out errWrite);
-
-                // stdin as Process.Start passes it: PowerShell's own. Listed
-                // only if inheritable, the only case the child could use it.
-                IntPtr stdin = GetStdHandle(STD_INPUT_HANDLE);
-                uint hflags;
-                bool stdinInherit = stdin != IntPtr.Zero && stdin != new IntPtr(-1)
-                    && GetHandleInformation(stdin, out hflags) && (hflags & HANDLE_FLAG_INHERIT) != 0;
-                int handleCount = stdinInherit ? 3 : 2;
-                handleArr = Marshal.AllocHGlobal(IntPtr.Size * handleCount);
-                Marshal.WriteIntPtr(handleArr, 0, outWrite);
-                Marshal.WriteIntPtr(handleArr, IntPtr.Size, errWrite);
-                if (stdinInherit) { Marshal.WriteIntPtr(handleArr, 2 * IntPtr.Size, stdin); }
-                jobArr = Marshal.AllocHGlobal(IntPtr.Size);
-                Marshal.WriteIntPtr(jobArr, _job);
-
-                IntPtr size = IntPtr.Zero;
-                InitializeProcThreadAttributeList(IntPtr.Zero, 2, 0, ref size);   // fails by design: returns the size
-                attrList = Marshal.AllocHGlobal(size);
-                if (!InitializeProcThreadAttributeList(attrList, 2, 0, ref size)) { throw new Win32Exception(Marshal.GetLastWin32Error()); }
-                attrReady = true;
-                if (!UpdateProcThreadAttribute(attrList, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, handleArr,
-                        (IntPtr)(IntPtr.Size * handleCount), IntPtr.Zero, IntPtr.Zero)
-                    || !UpdateProcThreadAttribute(attrList, 0, PROC_THREAD_ATTRIBUTE_JOB_LIST, jobArr,
-                        (IntPtr)IntPtr.Size, IntPtr.Zero, IntPtr.Zero))
+                // Setup: a failure here falls back to Process.Start and Assign
+                // (3.1's way) instead of failing the start. Only CreateProcess
+                // itself, below, reports that the program couldn't start.
+                try
                 {
-                    throw new Win32Exception(Marshal.GetLastWin32Error());
+                    CreateOutputPipe(out outRead, out outWrite);
+                    CreateOutputPipe(out errRead, out errWrite);
+
+                    // stdin as Process.Start passes it: PowerShell's own. Listed
+                    // only if inheritable, the only case the child could use it.
+                    stdin = GetStdHandle(STD_INPUT_HANDLE);
+                    uint hflags;
+                    bool stdinInherit = stdin != IntPtr.Zero && stdin != new IntPtr(-1)
+                        && GetHandleInformation(stdin, out hflags) && (hflags & HANDLE_FLAG_INHERIT) != 0;
+                    int handleCount = stdinInherit ? 3 : 2;
+                    handleArr = Marshal.AllocHGlobal(IntPtr.Size * handleCount);
+                    Marshal.WriteIntPtr(handleArr, 0, outWrite);
+                    Marshal.WriteIntPtr(handleArr, IntPtr.Size, errWrite);
+                    if (stdinInherit) { Marshal.WriteIntPtr(handleArr, 2 * IntPtr.Size, stdin); }
+                    jobArr = Marshal.AllocHGlobal(IntPtr.Size);
+                    Marshal.WriteIntPtr(jobArr, _job);
+
+                    IntPtr size = IntPtr.Zero;
+                    InitializeProcThreadAttributeList(IntPtr.Zero, 2, 0, ref size);   // fails by design: returns the size
+                    attrList = Marshal.AllocHGlobal(size);
+                    if (!InitializeProcThreadAttributeList(attrList, 2, 0, ref size)) { throw new Win32Exception(Marshal.GetLastWin32Error()); }
+                    attrReady = true;
+                    if (!UpdateProcThreadAttribute(attrList, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, handleArr,
+                            (IntPtr)(IntPtr.Size * handleCount), IntPtr.Zero, IntPtr.Zero)
+                        || !UpdateProcThreadAttribute(attrList, 0, PROC_THREAD_ATTRIBUTE_JOB_LIST, jobArr,
+                            (IntPtr)IntPtr.Size, IntPtr.Zero, IntPtr.Zero))
+                    {
+                        throw new Win32Exception(Marshal.GetLastWin32Error());
+                    }
+                    if (TestFailSetup) { throw new Win32Exception(5); }
                 }
+                catch (Win32Exception e)
+                {
+                    setupFailed = true;
+                    fallbackReason = "setting up a start inside the Job Object failed (" + e.Message + ")";
+                }
+                if (setupFailed) { return null; }   // the finally blocks below clean up and release the lock
 
                 STARTUPINFOEX si = new STARTUPINFOEX();
                 si.StartupInfo.cb = Marshal.SizeOf(typeof(STARTUPINFOEX));
@@ -645,17 +686,32 @@ public static class PkChildProcessJob
         }
         finally { startLock.Exit(); }
 
+        // Everything up to the resume is guarded, the output readers included:
+        // if any step fails, the program (still suspended) is ended and every
+        // handle released, so nothing is left running untracked.
         Process proc = null;
+        SafeFileHandle outSafe = null, errSafe = null;
+        StreamReader stdoutReader = null, stderrReader = null;
         try
         {
             proc = Process.GetProcessById(pi.dwProcessId);
             IntPtr opened = proc.Handle;   // taken while it's suspended, so ExitCode stays readable however fast it exits
+            outSafe = new SafeFileHandle(outRead, true);
+            errSafe = new SafeFileHandle(errRead, true);
+            if (TestFailReaders) { throw new IOException("Test: building the output readers failed."); }
+            stdoutReader = new StreamReader(new FileStream(outSafe, FileAccess.Read, 4096, false), encoding, true, 4096);
+            stderrReader = new StreamReader(new FileStream(errSafe, FileAccess.Read, 4096, false), encoding, true, 4096);
             if (ResumeThread(pi.hThread) == 0xFFFFFFFF) { throw new Win32Exception(Marshal.GetLastWin32Error()); }
         }
         catch
         {
             TerminateProcess(pi.hProcess, 1);
-            CloseHandle(outRead); CloseHandle(errRead);
+            // A reader owns its handle; a SafeFileHandle not yet in a reader
+            // owns its own; before either, the raw handle is closed directly.
+            if (stdoutReader != null) { stdoutReader.Dispose(); }
+            if (outSafe != null) { outSafe.Dispose(); } else { CloseHandle(outRead); }
+            if (stderrReader != null) { stderrReader.Dispose(); }
+            if (errSafe != null) { errSafe.Dispose(); } else { CloseHandle(errRead); }
             CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
             if (proc != null) { proc.Dispose(); }
             throw;
@@ -665,8 +721,8 @@ public static class PkChildProcessJob
 
         PkStartedProcess r = new PkStartedProcess();
         r.Process = proc;
-        r.Stdout = new StreamReader(new FileStream(new SafeFileHandle(outRead, true), FileAccess.Read, 4096, false), encoding, true, 4096);
-        r.Stderr = new StreamReader(new FileStream(new SafeFileHandle(errRead, true), FileAccess.Read, 4096, false), encoding, true, 4096);
+        r.Stdout = stdoutReader;
+        r.Stderr = stderrReader;
         return r;
     }
 }
@@ -676,7 +732,7 @@ public static class PkChildProcessJob
 # A session that loaded an older copy keeps its compiled types. Say so,
 # rather than fail later with a missing-method error. Keep this number in
 # sync with [PkState]::TypesVersion.
-if ((& { try { [PkState]::TypesVersion } catch { 0 } }) -ne 5) {
+if ((& { try { [PkState]::TypesVersion } catch { 0 } }) -ne 6) {
     throw "ParallelKit: this PowerShell session already loaded an older version of the kit, and its compiled parts can't be swapped out. Close this window and start a new one."
 }
 
@@ -855,13 +911,20 @@ function Initialize-ParallelKit {
     # 0 (the default) sizes it for up to about 48.
     # .OUTPUTS
     # An object with AbortHandler, ChildProcessJob and ThreadPool, each $true if that
-    # part worked.
+    # part worked; Version, the kit's version; and StartMode, how the kit starts
+    # programs here: CreatedInJob (inside the Job Object, so anything they start
+    # is in it too), AddedToJob (started, then added to it just after), or NoJob
+    # (no cleanup if PowerShell is killed). A program whose start can't be set up
+    # in the job falls back to AddedToJob, with a warning.
     [CmdletBinding()]
     param([int]$MaxConcurrentProcesses = 0)
     $handlerOk = Register-PkAbortHandler
     $jobOk     = Initialize-PkChildProcessJob
     $poolOk    = Initialize-PkThreadPool -MaxConcurrentProcesses $MaxConcurrentProcesses
-    return [pscustomobject][ordered]@{ AbortHandler = $handlerOk; ChildProcessJob = $jobOk; ThreadPool = $poolOk }
+    # The header's Version line: the version PR changes both, and the harness
+    # checks they match.
+    $version = [version]'3.2'
+    return [pscustomobject][ordered]@{ AbortHandler = $handlerOk; ChildProcessJob = $jobOk; ThreadPool = $poolOk; Version = $version; StartMode = [PkChildProcessJob]::StartMode }
 }
 
 function Register-PkCancellationSource {
@@ -1346,8 +1409,15 @@ function Start-PkProcessCore {
         # In the job from its first instruction where possible; otherwise
         # Process.Start, and the job just after (a child it starts at once
         # can miss it then).
-        $started = [PkChildProcessJob]::TryStart($psi.FileName, $psi.Arguments, $psi.WorkingDirectory, $encoding)
-        if ($null -eq $started) { $proc = [System.Diagnostics.Process]::Start($psi) }
+        $fallbackReason = $null
+        $started = [PkChildProcessJob]::TryStart($psi.FileName, $psi.Arguments, $psi.WorkingDirectory, $encoding, [ref]$fallbackReason)
+        if ($null -eq $started) {
+            # Once per process: the cost is the same for every program after.
+            if ($null -ne $fallbackReason -and [PkChildProcessJob]::ClaimFallbackWarning()) {
+                Write-PkMessage ("[WARNING] Starting programs with Process.Start and adding them to the Job Object just after, because " + $fallbackReason + ". A child a program starts straight away (cmd /c tool.exe) can escape the cleanup if PowerShell is killed outright. Shown once.") -Level Warn
+            }
+            $proc = [System.Diagnostics.Process]::Start($psi)
+        }
     } catch {
         $tried = ""
         if ($psi.FileName -ne $FilePath) { $tried = " (" + $psi.FileName + ")" }
