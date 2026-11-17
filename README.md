@@ -136,13 +136,14 @@ Only the list form gets this quoting. A string, including one built with `Conver
 
 Programs run in your current location (`Get-Location`) unless a command says otherwise, and a relative `WorkingDirectory`, or a `FilePath` with a folder in it like `.\tools\cjxl.exe`, is relative to that location too. Drives PowerShell knows, like `~` or one made with `New-PSDrive`, work in both. A bare name like `cjxl.exe` is found the way Windows finds programs, mostly on `PATH`. Only an `.exe` is found without its extension (Windows doesn't use `PATHEXT` here), so a `.cmd` wrapper such as `npm` has to be written out: `npm.cmd`. A `.bat` or `.cmd` program can't run in a network-share (`\\server\share`) folder: `cmd.exe` falls back to `C:\Windows` there, so give such commands a local `WorkingDirectory`.
 
-`Invoke-PkProcessBatch` returns an object with `Results`, `Aborted` and `ForceKilledCount`. Each result is an object with `Command`, `ExitCode`, `Stdout`, `Stderr`, `StreamTimedOut`, `StreamError`, `StartError`, `Aborted` and `TimedOut`, every field always present, so `$batch.Results | Format-Table` reads well:
+`Invoke-PkProcessBatch` returns an object with `Results`, `Aborted` and `ForceKilledCount`. Each result is an object with `Command`, `ExitCode`, `Stdout`, `Stderr`, `StreamTimedOut`, `StreamError`, `StartError`, `Aborted`, `TimedOut` and `Duration`, every field always present, so `$batch.Results | Format-Table` reads well:
 
 - `Command` is your original command hashtable, so extra keys like `Source` above come back with it.
 - `ExitCode` is whatever the program returned. The kit doesn't treat a non-zero code as a failure; that's for you to decide.
 - `StartError` is set when the program couldn't be started (not found, say). Every command is still tried and gets its own result, but repeats of the same failure for the same program print once, with a count at the end.
 - `Aborted` is `$true` for a command an abort killed or kept from starting.
 - `TimedOut` is `$true` for a program `-TimeoutSeconds` killed.
+- `Duration` is how long the program ran, from its start to its exit or kill, as a `[TimeSpan]`: not the time it waited for a slot, nor any wait for its output afterwards. It's `$null` for a command that never started. Sorting on it finds the slow ones: `$batch.Results | Sort-Object Duration -Descending | Select-Object -First 10`.
 - `StreamTimedOut` means the output read gave up 15 seconds after the program exited, on stdout, stderr or both, which only happens when a program it started is still holding the output open. Each stream comes back with what arrived before then: one held open is cut short, the other is whole. The read of a held stream carries on in the background until that program lets go of it; it's in the kit's Job Object, so that's when PowerShell exits at the latest. `StreamError` means a read failed, and that stream comes back `$null`.
 
 `Results` is in the order commands finished, not the order you gave them. Use `Command` to match them up, or give each command your own key (`Index = $n`) and sort on it: `$batch.Results | Sort-Object { $_.Command.Index }`.
@@ -273,7 +274,7 @@ To leave any callback early, use `return`. PowerShell sends a `continue` or `bre
 
 | Function | Use |
 |---|---|
-| `Invoke-PkProcessWithTimeout -FilePath -Arguments -TimeoutMs` | Run one program and wait, with a hard time limit (default 60s). Returns an object with `ExitCode`, `Stdout`, `Stderr`, `StreamTimedOut` and `StreamError`. If it overruns, or the run is aborted, the program is killed and this **throws**; add `-IgnoreAbort` for a cleanup step that must finish anyway. |
+| `Invoke-PkProcessWithTimeout -FilePath -Arguments -TimeoutMs` | Run one program and wait, with a hard time limit (default 60s). Returns an object with `ExitCode`, `Stdout`, `Stderr`, `StreamTimedOut`, `StreamError` and `Duration`. If it overruns, or the run is aborted, the program is killed and this **throws**; add `-IgnoreAbort` for a cleanup step that must finish anyway. |
 | `ConvertTo-PkArgumentString @(args)` | Join a list of arguments into one correctly quoted command line. `-Arguments` / `Arguments` also take the list directly, and then also quote it for `cmd.exe` when the program is a `.bat` or `.cmd`. |
 | `Start-PkProcess -FilePath -Arguments` | Start one hidden, with output captured in the background. Returns `@{ Proc; StdoutTask; StderrTask; Stopwatch }`; throws if it can't start. |
 | `Wait-PkProcess -Process -TimeoutMs` | Wait for exit with a timeout that can't overrun. Returns `$true` if it exited. |

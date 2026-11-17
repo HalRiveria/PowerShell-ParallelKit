@@ -1340,9 +1340,9 @@ Reset-Harness
 function Get-HarnessShape($o) { if ($o -isnot [System.Management.Automation.PSCustomObject]) { return '(not an object)' }; return ($o.PSObject.Properties.Name -join ',') }
 $shapeBatch = Invoke-PkProcessBatch -Commands @(@{ FilePath = $cmdExe; Arguments = '/c exit 0' })
 Test-Assert ((Get-HarnessShape $shapeBatch) -eq 'Results,Aborted,ForceKilledCount') ("a batch returns an object (" + (Get-HarnessShape $shapeBatch) + ")")
-Test-Assert ((Get-HarnessShape $shapeBatch.Results[0]) -eq 'Command,ExitCode,Stdout,Stderr,StreamTimedOut,StreamError,StartError,Aborted,TimedOut') ("each batch result is an object, fields in order (" + (Get-HarnessShape $shapeBatch.Results[0]) + ")")
+Test-Assert ((Get-HarnessShape $shapeBatch.Results[0]) -eq 'Command,ExitCode,Stdout,Stderr,StreamTimedOut,StreamError,StartError,Aborted,TimedOut,Duration') ("each batch result is an object, fields in order (" + (Get-HarnessShape $shapeBatch.Results[0]) + ")")
 $shapeOne = Invoke-PkProcessWithTimeout -FilePath $cmdExe -Arguments '/c exit 0'
-Test-Assert ((Get-HarnessShape $shapeOne) -eq 'ExitCode,Stdout,Stderr,StreamTimedOut,StreamError') ("Invoke-PkProcessWithTimeout returns an object (" + (Get-HarnessShape $shapeOne) + ")")
+Test-Assert ((Get-HarnessShape $shapeOne) -eq 'ExitCode,Stdout,Stderr,StreamTimedOut,StreamError,Duration') ("Invoke-PkProcessWithTimeout returns an object (" + (Get-HarnessShape $shapeOne) + ")")
 $shapeDispatch = Invoke-PkProcessDispatch -MaxConcurrent 1 -GroupProvider { return $null } -JobBuilder { param($g) } -JobFinalize { param($j, $p) }
 Test-Assert ((Get-HarnessShape $shapeDispatch) -eq 'GroupResults,Aborted,ForceKilledCount,JobStarterFailedCount') ("the dispatcher returns an object (" + (Get-HarnessShape $shapeDispatch) + ")")
 $shapeJobs = Invoke-PkRunspaceJobs -MaxParallel 1 -JobParams @{ Id = 1 } -WorkerScript { param($Id) }
@@ -1352,7 +1352,7 @@ $shapeFinding = $shapeFindings[0]
 Test-Assert ((Get-HarnessShape $shapeFinding) -eq 'Rule,Where,Line,Text') ("worker-safety findings are objects (" + (Get-HarnessShape $shapeFinding) + ")")
 Test-Assert ((Get-HarnessShape (Initialize-ParallelKit)) -eq 'AbortHandler,ChildProcessJob,ThreadPool,Version,StartMode') "Initialize-ParallelKit returns an object"
 
-$fields = @('Command', 'ExitCode', 'Stdout', 'Stderr', 'StreamTimedOut', 'StreamError', 'StartError', 'Aborted', 'TimedOut')
+$fields = @('Command', 'ExitCode', 'Stdout', 'Stderr', 'StreamTimedOut', 'StreamError', 'StartError', 'Aborted', 'TimedOut', 'Duration')
 $batch = Invoke-PkProcessBatch -MaxConcurrent 1 -Commands @(
     @{ FilePath = $cmdExe; Arguments = '/c exit 0' },
     @{ FilePath = 'C:\definitely\not\here.exe' })
@@ -4441,6 +4441,51 @@ if ($compiled) {
         try { [System.IO.File]::Delete($holdExe) } catch { Start-Sleep -Milliseconds 100 }   # still held by a process just ended: try again
     }
 }
+Write-Host ""
+
+Write-Host "=== AY: Duration: how long each program ran ===" -ForegroundColor Cyan
+# From the program's start to its exit or kill: not the time it waited for a
+# slot, nor the time spent waiting for its output afterwards. The bounds are
+# loose: a busy machine is slow to start programs.
+Reset-Harness
+function Get-HarnessDuration($r) {
+    if ($null -eq $r -or $null -eq $r.PSObject.Properties['Duration']) { return 'missing' }
+    if ($null -eq $r.Duration) { return $null }
+    if ($r.Duration -isnot [TimeSpan]) { return 'not a TimeSpan' }
+    return [math]::Round($r.Duration.TotalSeconds, 2)
+}
+$d = Get-HarnessDuration (Invoke-PkProcessWithTimeout -FilePath $cmdExe -Arguments '/d /c ping -n 3 127.0.0.1 >nul')
+Test-Assert ($d -is [double] -and $d -ge 1.5 -and $d -le 6) ("a program that runs about 2 s has a Duration of about 2 s (" + $d + ")")
+
+# Output held open for 3 s by a leftover child: the call takes the 1 s stream
+# timeout, but the program itself ended at once.
+$sw = [System.Diagnostics.Stopwatch]::StartNew()
+$d = Get-HarnessDuration (Invoke-PkProcessWithTimeout -FilePath $cmdExe -Arguments $heldArgs -StreamTimeoutMs 1000)
+$sw.Stop()
+Test-Assert ($d -is [double] -and $d -lt 0.8 -and $sw.Elapsed.TotalSeconds -ge 0.9) ("time spent waiting for held output isn't counted (Duration " + $d + " s, call " + [math]::Round($sw.Elapsed.TotalSeconds, 1) + " s)")
+
+# One slot, two 1 s programs: the second waited about 1 s for its turn.
+$b = Invoke-PkProcessBatch -MaxConcurrent 1 -Commands @(@{ FilePath = $cmdExe; Arguments = '/d /c ping -n 2 127.0.0.1 >nul'; N = 1 }, @{ FilePath = $cmdExe; Arguments = '/d /c ping -n 2 127.0.0.1 >nul'; N = 2 })
+$dq = @($b.Results | Sort-Object { $_.Command['N'] } | ForEach-Object { Get-HarnessDuration $_ })
+Test-Assert ($dq.Count -eq 2 -and $dq[1] -is [double] -and $dq[1] -ge 0.5 -and $dq[1] -le 1.8) ("time waiting for a slot isn't counted (" + ($dq -join ', ') + ")")
+
+# Killed by -TimeoutSeconds 1: about 1 s.
+$b = Invoke-PkProcessBatch -TimeoutSeconds 1 -Commands @(@{ FilePath = $pingExe; Arguments = '-n 30 127.0.0.1' })
+$d = Get-HarnessDuration $b.Results[0]
+Test-Assert ($b.Results[0].TimedOut -and $d -is [double] -and $d -ge 0.8 -and $d -le 5) ("a program killed by its time limit has the time it ran (" + $d + ")")
+
+# An abort: the running program is force-stopped and gets the time it ran;
+# the one still waiting for a slot, and one that couldn't start, get $null.
+Reset-Harness
+$b = Invoke-PkProcessBatch -MaxConcurrent 2 -AbortTimeoutSeconds 0 -OnComplete { param($c, $r) if ($c['N'] -eq 1) { Request-PkAbort } } -Commands @(
+    @{ FilePath = 'C:\no\such\program.exe'; N = 0 },
+    @{ FilePath = $cmdExe; Arguments = '/d /c ping -n 2 127.0.0.1 >nul'; N = 1 },
+    @{ FilePath = $pingExe; Arguments = '-n 30 127.0.0.1'; N = 2 },
+    @{ FilePath = $pingExe; Arguments = '-n 30 127.0.0.1'; N = 3 })
+Reset-PkAbortState
+$byN = @{}; foreach ($r in $b.Results) { $byN[[int]$r.Command['N']] = $r }
+$dStopped = Get-HarnessDuration $byN[2]; $dWaiting = Get-HarnessDuration $byN[3]; $dFailed = Get-HarnessDuration $byN[0]
+Test-Assert ($byN.Count -eq 4 -and $byN[2].Aborted -and $dStopped -is [double] -and $dStopped -gt 0 -and $dStopped -le 5 -and $byN[3].Aborted -and $null -eq $dWaiting -and $null -eq $dFailed) ("an abort: the force-stopped program has the time it ran, one never started and one that couldn't start have `$null (" + $dStopped + ", " + $dWaiting + ", " + $dFailed + ")")
 Write-Host ""
 
 Set-PkMessageHandler -Handler $null
