@@ -4354,6 +4354,95 @@ Test-Assert ($ipHeader -ne '' -and $ipVersion -eq $ipHeader) ("Initialize-Parall
 Test-Assert ($ipMode -eq 'CreatedInJob' -and $ipAdded -eq 'AddedToJob') ("and its StartMode says how programs start: CreatedInJob normally, AddedToJob without the start lock (" + $ipMode + ", " + $ipAdded + ", error: " + $ipError + ")")
 Write-Host ""
 
+Write-Host "=== AX: output held open by a leftover child is cut short, not lost ===" -ForegroundColor Cyan
+# The test program writes "out" and "err", then leaves a copy of itself
+# holding one of the two open for 2 s, writing nothing. The copy is started
+# with a handle list, so it inherits only that pipe: cmd's `start /b`, and
+# even .NET's Process.Start, hand a child both. Modes: stdout / stderr (the
+# stream left held), partial (stdout held, ending in half a UTF-8
+# character), split (no copy; a UTF-8 character written in two parts,
+# 300 ms apart).
+$holdExe = Join-Path $env:TEMP ("pk-hold-" + [guid]::NewGuid().ToString("N") + ".exe")
+$holdSrc = [System.IO.Path]::ChangeExtension($holdExe, '.cs')
+[System.IO.File]::WriteAllText($holdSrc, @'
+using System; using System.IO; using System.Runtime.InteropServices; using System.Text;
+public static class PkHold {
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)] struct SI { public int cb; public string r, d, t; public int x, y, xs, ys, xc, yc, fill, flags; public short show, r2; public IntPtr r3, hIn, hOut, hErr; }
+    [StructLayout(LayoutKind.Sequential)] struct SIEX { public SI si; public IntPtr attr; }
+    [StructLayout(LayoutKind.Sequential)] struct PI { public IntPtr hp, ht; public int pid, tid; }
+    [DllImport("kernel32.dll")] static extern IntPtr GetStdHandle(int n);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool InitializeProcThreadAttributeList(IntPtr l, int c, int f, ref IntPtr s);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool UpdateProcThreadAttribute(IntPtr l, uint f, IntPtr a, IntPtr v, IntPtr s, IntPtr p, IntPtr r);
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)] static extern bool CreateProcess(string app, StringBuilder cmd, IntPtr pa, IntPtr ta, bool inherit, uint flags, IntPtr env, string dir, ref SIEX si, out PI pi);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+    static void Write(Stream s, byte[] b) { s.Write(b, 0, b.Length); s.Flush(); }
+    public static int Main(string[] args) {
+        string mode = args[0];
+        if (mode == "sleep") { System.Threading.Thread.Sleep(2000); return 0; }
+        Stream o = Console.OpenStandardOutput(), e = Console.OpenStandardError();
+        byte[] text = Encoding.ASCII.GetBytes("out");
+        if (mode == "partial" || mode == "split") { text = new byte[] { 0x63, 0x61, 0x66, 0xC3 }; }
+        Write(o, text);
+        Write(e, Encoding.ASCII.GetBytes("err"));
+        if (mode == "split") { System.Threading.Thread.Sleep(300); Write(o, new byte[] { 0xA9, 0x20, 0x6F, 0x6B }); return 0; }
+        // A copy of this program sleeps 2 s holding exactly one of the two pipes:
+        // a handle list limits what it inherits to that one.
+        IntPtr held = GetStdHandle(mode == "stderr" ? -12 : -11);
+        IntPtr size = IntPtr.Zero;
+        InitializeProcThreadAttributeList(IntPtr.Zero, 1, 0, ref size);
+        IntPtr list = Marshal.AllocHGlobal(size);
+        InitializeProcThreadAttributeList(list, 1, 0, ref size);
+        IntPtr arr = Marshal.AllocHGlobal(IntPtr.Size); Marshal.WriteIntPtr(arr, held);
+        if (!UpdateProcThreadAttribute(list, 0, (IntPtr)0x20002, arr, (IntPtr)IntPtr.Size, IntPtr.Zero, IntPtr.Zero)) { return 10; }
+        SIEX si = new SIEX(); si.si.cb = Marshal.SizeOf(typeof(SIEX)); si.si.flags = 0x100; si.si.hOut = held; si.si.hErr = held; si.attr = list;
+        PI pi;
+        string self = System.Reflection.Assembly.GetExecutingAssembly().Location;
+        if (!CreateProcess(null, new StringBuilder("\"" + self + "\" sleep"), IntPtr.Zero, IntPtr.Zero, true, 0x08080000, IntPtr.Zero, null, ref si, out pi)) { return 11; }
+        CloseHandle(pi.hp); CloseHandle(pi.ht);
+        return 0;
+    }
+}
+'@)
+$csc = $null
+try { $csc = Invoke-PkProcessWithTimeout -FilePath $cscExe -Arguments (ConvertTo-PkArgumentString @('/nologo', ('/out:' + $holdExe), $holdSrc)) } catch { Write-Host "  csc.exe failed to run: $_" }
+[System.IO.File]::Delete($holdSrc)
+$compiled = ($null -ne $csc -and $csc.ExitCode -eq 0 -and [System.IO.File]::Exists($holdExe))
+Test-Assert $compiled "the output-holding test program compiles"
+if ($compiled) {
+    $holdCafe = 'caf' + [char]0xE9 + ' ok'
+    foreach ($holdPath in 'created in the job', 'Process.Start fallback') {
+        [PkChildProcessJob]::TestUseProcessStart = ($holdPath -eq 'Process.Start fallback')
+        try {
+            foreach ($holdMode in 'stdout', 'stderr') {
+                $s = Start-PkProcess -FilePath $holdExe -Arguments $holdMode
+                $null = $s['Proc'].WaitForExit(10000)
+                $r = Complete-PkProcess $s -StreamTimeoutMs 1000
+                $heldTask = $s['StdoutTask']
+                if ($holdMode -eq 'stderr') { $heldTask = $s['StderrTask'] }
+                $stillReading = -not $heldTask.IsCompleted
+                Test-Assert ($r.StreamTimedOut -and $r.Stdout -eq 'out' -and $r.Stderr -eq 'err' -and $null -eq $r.StreamError) ($holdPath + ": with " + $holdMode + " held open past -StreamTimeoutMs, both streams keep their text (Stdout '" + $r.Stdout + "', Stderr '" + $r.Stderr + "', StreamTimedOut " + $r.StreamTimedOut + ")")
+                # The read carries on until the leftover child lets go of the pipe.
+                $endedLater = $heldTask.Wait(8000)
+                Test-Assert ($stillReading -and $endedLater) ($holdPath + ": the held " + $holdMode + " read is still going when the result is handed over, and ends once the child lets go (" + $stillReading + ", " + $endedLater + ")")
+                $s['Proc'].Dispose()
+            }
+            # Half a UTF-8 character at the cut: the text before it, nothing broken.
+            $s = Start-PkProcess -FilePath $holdExe -Arguments 'partial' -OutputEncoding 'utf-8'
+            $null = $s['Proc'].WaitForExit(10000)
+            $r = Complete-PkProcess $s -StreamTimeoutMs 1000
+            $null = $s['StdoutTask'].Wait(8000); $s['Proc'].Dispose()
+            Test-Assert ($r.StreamTimedOut -and $r.Stdout -eq 'caf') ($holdPath + ": output cut off in the middle of a UTF-8 character keeps the whole characters before it ('" + $r.Stdout + "')")
+            # A character split across two writes comes through whole.
+            $r = Invoke-PkProcessWithTimeout -FilePath $holdExe -Arguments 'split' -OutputEncoding 'utf-8'
+            Test-Assert ($r.Stdout -eq $holdCafe -and -not $r.StreamTimedOut) ($holdPath + ": a UTF-8 character written in two parts comes through whole ('" + $r.Stdout + "')")
+        } finally { [PkChildProcessJob]::TestUseProcessStart = $false }
+    }
+    for ($t = 0; $t -lt 20 -and [System.IO.File]::Exists($holdExe); $t++) {
+        try { [System.IO.File]::Delete($holdExe) } catch { Start-Sleep -Milliseconds 100 }   # still held by a process just ended: try again
+    }
+}
+Write-Host ""
+
 Set-PkMessageHandler -Handler $null
 Reset-PkAbortState
 

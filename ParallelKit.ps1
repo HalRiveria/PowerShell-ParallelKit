@@ -164,7 +164,7 @@ public static class PkState
 
     // Bump this, and the check after the type definitions, whenever any C#
     // in this file changes: a session keeps the types it compiled first.
-    public const int TypesVersion = 6;
+    public const int TypesVersion = 7;
 
     // Locked: Register-/Unregister-PkCancellationSource are callable from
     // worker runspaces, and List<T> is not safe for concurrent writers.
@@ -235,6 +235,7 @@ using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
 using Microsoft.Win32.SafeHandles;
 
 public sealed class PkStartedProcess
@@ -242,6 +243,50 @@ public sealed class PkStartedProcess
     public Process Process;
     public StreamReader Stdout;
     public StreamReader Stderr;
+}
+
+// Reads one of a program's output streams to its end, in chunks, so what has
+// arrived can be taken at any time (Snapshot): a program the program started
+// can hold the stream open long after it exits. The task's result is the
+// whole text, at the end of the stream. The reader's decoder carries a
+// character split across two reads over to the next, so a snapshot never
+// ends in half a character. A read blocks a thread-pool thread, as
+// ReadToEndAsync did; it ends when every holder of the stream's write end
+// has let go (at the latest when PowerShell exits: they're in the Job Object).
+public sealed class PkStreamReadTask : Task<string>
+{
+    private sealed class Buffer
+    {
+        private readonly TextReader _reader;
+        private readonly StringBuilder _text = new StringBuilder();
+        private readonly object _gate = new object();
+        public Buffer(TextReader reader) { _reader = reader; }
+        public string Pump()
+        {
+            char[] chunk = new char[4096];
+            int n;
+            while ((n = _reader.Read(chunk, 0, chunk.Length)) > 0)
+            {
+                lock (_gate) { _text.Append(chunk, 0, n); }
+            }
+            return Snapshot();
+        }
+        // Locked: the reader may be appending while Complete-PkProcess takes it.
+        public string Snapshot() { lock (_gate) { return _text.ToString(); } }
+    }
+
+    private readonly Buffer _buffer;
+    private PkStreamReadTask(Buffer buffer) : base(new Func<string>(buffer.Pump)) { _buffer = buffer; }
+
+    public static PkStreamReadTask Run(TextReader reader)
+    {
+        PkStreamReadTask task = new PkStreamReadTask(new Buffer(reader));
+        task.Start(TaskScheduler.Default);
+        return task;
+    }
+
+    // The text that has arrived so far; all of it once the task has finished.
+    public string Snapshot() { return _buffer.Snapshot(); }
 }
 
 // A Windows Job Object with KILL_ON_JOB_CLOSE: every child process assigned
@@ -732,7 +777,7 @@ public static class PkChildProcessJob
 # A session that loaded an older copy keeps its compiled types. Say so,
 # rather than fail later with a missing-method error. Keep this number in
 # sync with [PkState]::TypesVersion.
-if ((& { try { [PkState]::TypesVersion } catch { 0 } }) -ne 6) {
+if ((& { try { [PkState]::TypesVersion } catch { 0 } }) -ne 7) {
     throw "ParallelKit: this PowerShell session already loaded an older version of the kit, and its compiled parts can't be swapped out. Close this window and start a new one."
 }
 
@@ -1427,19 +1472,24 @@ function Start-PkProcessCore {
         # The original goes along as the inner exception: the batch reads Windows' error code from it.
         throw [System.Management.Automation.RuntimeException]::new("Start-PkProcess: could not start '" + $FilePath + "'" + $tried + ": " + $reason, $_.Exception)
     }
+    # The output is read in chunks (PkStreamReadTask), so Complete-PkProcess
+    # can keep what arrived when a stream times out. The two hashtables below
+    # have the same four keys, and the dispatcher's default starter and the
+    # batch's starter copy those keys onto their jobs: a new key goes in all
+    # four places.
     if ($null -ne $started) {
         return @{
             Proc       = $started.Process
-            StdoutTask = $started.Stdout.ReadToEndAsync()
-            StderrTask = $started.Stderr.ReadToEndAsync()
+            StdoutTask = [PkStreamReadTask]::Run($started.Stdout)
+            StderrTask = [PkStreamReadTask]::Run($started.Stderr)
             Stopwatch  = [System.Diagnostics.Stopwatch]::StartNew()
         }
     }
     $null = [PkChildProcessJob]::Assign($proc)
     return @{
         Proc       = $proc
-        StdoutTask = $proc.StandardOutput.ReadToEndAsync()
-        StderrTask = $proc.StandardError.ReadToEndAsync()
+        StdoutTask = [PkStreamReadTask]::Run($proc.StandardOutput)
+        StderrTask = [PkStreamReadTask]::Run($proc.StandardError)
         Stopwatch  = [System.Diagnostics.Stopwatch]::StartNew()
     }
 }
@@ -1682,8 +1732,10 @@ function Complete-PkProcess {
     # .DESCRIPTION
     # A program that exited can still have its output held open by a program it
     # started, so reading the output is time-limited too; StreamTimedOut says when
-    # that limit was hit. The stream it gave up on comes back $null: its output
-    # is missing, not cut short.
+    # that limit was hit. The stream it gave up on comes back with what arrived
+    # before then: cut short, not lost. Its read carries on in the background
+    # until that program lets go of it (it's killed with PowerShell at the
+    # latest). A stream whose read failed (StreamError) comes back $null.
     # .PARAMETER Job
     # What Start-PkProcess returned, or a dispatcher job with the same keys.
     # .PARAMETER StreamTimeoutMs
@@ -1723,9 +1775,18 @@ function Complete-PkProcess {
             $result.StreamError = [string]$_.Exception.Message
         }
     }
+    # The output's end (both streams closed, or the timeout) is separate from
+    # the program's end (the exit code, below): a program it started can hold
+    # a stream open after it exits. A stream still open at the timeout gives
+    # the text that arrived before it, each stream on its own; its read
+    # carries on in the background until that program lets go.
     $ranToCompletion = [System.Threading.Tasks.TaskStatus]::RanToCompletion
-    if ($null -ne $Job['StdoutTask'] -and $Job['StdoutTask'].Status -eq $ranToCompletion) { $result.Stdout = $Job['StdoutTask'].Result }
-    if ($null -ne $Job['StderrTask'] -and $Job['StderrTask'].Status -eq $ranToCompletion) { $result.Stderr = $Job['StderrTask'].Result }
+    foreach ($stream in 'Stdout', 'Stderr') {
+        $task = $Job[$stream + 'Task']
+        if ($null -eq $task) { continue }
+        if ($task.Status -eq $ranToCompletion) { $result[$stream] = $task.Result }
+        elseif (-not $task.IsCompleted -and $task -is [PkStreamReadTask]) { $result[$stream] = $task.Snapshot() }
+    }
     $result.ExitCode = $Job['Proc'].ExitCode
     if ($Dispose) { $Job['Proc'].Dispose() }
     return [pscustomobject]$result
@@ -1950,6 +2011,8 @@ function Invoke-PkProcessDispatch {
         $pkJobStarter = {
             param($pkJob)
             $pkStarted = Start-PkProcessCore -CallerState $pkCallerState -FilePath $pkJob['FilePath'] -Arguments $pkJob['Arguments'] -WorkingDirectory ([string]$pkJob['WorkingDirectory']) -OutputEncoding $pkJob['OutputEncoding']
+            # Start-PkProcessCore's four keys (it builds them in two places); the
+            # batch's starter copies them too: a new key goes in all four.
             $pkJob['Proc'] = $pkStarted.Proc; $pkJob['StdoutTask'] = $pkStarted.StdoutTask; $pkJob['StderrTask'] = $pkStarted.StderrTask
             $pkJob['Stopwatch'] = $pkStarted.Stopwatch
             return $pkJob
@@ -2651,6 +2714,8 @@ function Invoke-PkProcessBatch {
             & $pkReportStartFailure $pkJob['Command'] $_
             throw
         }
+        # Start-PkProcessCore's four keys (it builds them in two places); the
+        # dispatcher's default starter copies them too: a new key goes in all four.
         $pkJob['Proc'] = $pkStarted.Proc; $pkJob['StdoutTask'] = $pkStarted.StdoutTask; $pkJob['StderrTask'] = $pkStarted.StderrTask
         $pkJob['Stopwatch'] = $pkStarted.Stopwatch
         return $pkJob
