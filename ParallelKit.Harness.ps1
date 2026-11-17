@@ -3476,6 +3476,102 @@ foreach ($slotCall in $slotReleases) {
 Test-Assert ($slotReleases.Count -gt 0 -and $slotMarkedFirst -eq $slotReleases.Count) ("every shared-slot release comes after its job is marked done (" + $slotMarkedFirst + " of " + $slotReleases.Count + ")")
 Write-Host ""
 
+Write-Host "=== AM: a program is in the Job Object from its first instruction ===" -ForegroundColor Cyan
+# Start-PkProcess has Windows create the program inside the kit's Job Object,
+# so a child it starts at once (cmd /c tool.exe) is in the job too. The race
+# this closes can't be forced, so these check the mechanism: .NET's start lock
+# is found (without it the kit falls back to Process.Start), grandchildren are
+# in the job, output isn't held open by a plain Process.Start elsewhere, and
+# the fallback still works.
+if (-not ([System.Management.Automation.PSTypeName]'PkHarnessJobProbe').Type) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class PkHarnessJobProbe {
+    [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool IsProcessInJob(IntPtr process, IntPtr job, out bool result);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool CloseHandle(IntPtr h);
+    // null when the process can't be opened (already gone).
+    public static object InJob(int pid, IntPtr job) {
+        IntPtr h = OpenProcess(0x1000, false, pid);   // PROCESS_QUERY_LIMITED_INFORMATION
+        if (h == IntPtr.Zero) { return null; }
+        try { bool r; if (!IsProcessInJob(h, job, out r)) { return null; } return r; }
+        finally { CloseHandle(h); }
+    }
+}
+'@
+}
+$jobHandle = [PkChildProcessJob].GetField('_job', [System.Reflection.BindingFlags]'NonPublic,Static').GetValue($null)
+$lockKind = [PkChildProcessJob]::StartLockKind
+Test-Assert ($lockKind -match '^(Monitor|Lock):s_[Cc]reateProcessLock$') ("the kit holds .NET's process-start lock on this runtime (" + $lockKind + "); if not, a new .NET changed it and the kit is back to Process.Start")
+
+$jobInside = 0; $jobFound = 0
+for ($jobBatch = 0; $jobBatch -lt 2; $jobBatch++) {
+    $jobStarted = @()
+    for ($i = 0; $i -lt 20; $i++) { $jobStarted += Start-PkProcess -FilePath cmd.exe -Arguments '/d /c ping -n 3 127.0.0.1 >nul' }
+    foreach ($s in $jobStarted) {
+        $ping = $null
+        for ($t = 0; $t -lt 40 -and -not $ping; $t++) {
+            $ping = Get-CimInstance Win32_Process -Filter ("ParentProcessId=" + $s['Proc'].Id + " AND Name='PING.EXE'")
+            if (-not $ping) { Start-Sleep -Milliseconds 25 }
+        }
+        if ($ping) {
+            $jobFound++
+            if ([PkHarnessJobProbe]::InJob([int]@($ping)[0].ProcessId, $jobHandle) -eq $true) { $jobInside++ }
+        }
+    }
+    foreach ($s in $jobStarted) { $null = Complete-PkProcess $s -Dispose }
+}
+Test-Assert ($jobFound -eq 40 -and $jobInside -eq 40) ("every cmd /c ping grandchild is in the Job Object (" + $jobInside + " of " + $jobFound + " found, 40 started)")
+
+$jobBad = 0
+for ($i = 0; $i -lt 20; $i++) { $r = Complete-PkProcess (Start-PkProcess -FilePath cmd.exe -Arguments "/d /c exit $i") -Dispose; if ($r.ExitCode -ne $i) { $jobBad++ } }
+Test-Assert ($jobBad -eq 0) "a program that exits at once still reports its exit code (20 runs)"
+
+$s = Start-PkProcess -FilePath ping.exe -Arguments '-n 30 127.0.0.1'
+$jobRunning = $s['Proc'].HasExited -eq $false -and -not $s['Proc'].WaitForExit(200)
+$s['Proc'].Kill(); $null = $s['Proc'].WaitForExit(5000)
+Test-Assert ($jobRunning -and $s['Proc'].HasExited -and $s['StdoutTask'].Wait(5000)) "the Proc is a working Process: HasExited, WaitForExit and Kill, and the output ends after a kill"
+$s['Proc'].Dispose()
+
+$jobMsg = ''
+try { $null = Start-PkProcess -FilePath 'C:\no\such\program.exe' } catch { $jobMsg = $_.ToString() }
+Test-Assert ($jobMsg -like "*could not start*cannot find the file*" -and $jobMsg -notlike '*Exception calling*') ("a start error gives Windows' reason without PowerShell's method-call wrapper: " + $jobMsg)
+
+# A plain Process.Start in another runspace, over and over, must not pick up
+# the pipe ends of a program the kit is starting.
+$jobFlag = [hashtable]::Synchronized(@{ Stop = $false })
+$jobPs = [PowerShell]::Create()
+$null = $jobPs.AddScript({
+    param($flag)
+    while (-not $flag.Stop) {
+        $psi = [System.Diagnostics.ProcessStartInfo]::new((Join-Path $env:SystemRoot 'System32\PING.EXE'), '-n 4 127.0.0.1')
+        $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+        $p = [System.Diagnostics.Process]::Start($psi); $p.Dispose()
+        Start-Sleep -Milliseconds 20
+    }
+}).AddArgument($jobFlag)
+$jobAsync = $jobPs.BeginInvoke()
+Start-Sleep -Milliseconds 300
+$jobLate = 0
+for ($i = 0; $i -lt 40; $i++) {
+    $s = Start-PkProcess -FilePath cmd.exe -Arguments '/d /c echo x'
+    if (-not $s['StdoutTask'].Wait(1500)) { $jobLate++ }
+    $null = Complete-PkProcess $s -Dispose
+}
+$jobFlag.Stop = $true
+$null = $jobPs.EndInvoke($jobAsync); $jobPs.Dispose()
+Test-Assert ($jobLate -eq 0) ("output isn't held open by a plain Process.Start running alongside (" + $jobLate + " of 40 late)")
+
+[PkChildProcessJob]::TestUseProcessStart = $true
+try {
+    $s = Start-PkProcess -FilePath cmd.exe -Arguments '/d /c "echo fb& exit /b 5"'
+    $jobFbInJob = [PkHarnessJobProbe]::InJob($s['Proc'].Id, $jobHandle)
+    $r = Complete-PkProcess $s -Dispose
+    Test-Assert ($r.ExitCode -eq 5 -and $r.Stdout.Trim() -eq 'fb' -and $jobFbInJob -ne $false) "without the start lock, Start-PkProcess falls back to Process.Start and still assigns the job"
+} finally { [PkChildProcessJob]::TestUseProcessStart = $false }
+Write-Host ""
+
 Set-PkMessageHandler -Handler $null
 Reset-PkAbortState
 

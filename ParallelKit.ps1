@@ -163,7 +163,7 @@ public static class PkState
 
     // Bump this, and the check after the type definitions, whenever any C#
     // in this file changes: a session keeps the types it compiled first.
-    public const int TypesVersion = 4;
+    public const int TypesVersion = 5;
 
     // Locked: Register-/Unregister-PkCancellationSource are callable from
     // worker runspaces, and List<T> is not safe for concurrent writers.
@@ -227,7 +227,21 @@ public static class PkConsoleQuickEdit
 if (-not ([System.Management.Automation.PSTypeName]'PkChildProcessJob').Type) {
     Add-Type -TypeDefinition @'
 using System;
+using System.ComponentModel;
+using System.Diagnostics;
+using System.IO;
+using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+using Microsoft.Win32.SafeHandles;
+
+public sealed class PkStartedProcess
+{
+    public Process Process;
+    public StreamReader Stdout;
+    public StreamReader Stderr;
+}
 
 // A Windows Job Object with KILL_ON_JOB_CLOSE: every child process assigned
 // to it dies when this process exits for ANY reason, force-kill included.
@@ -329,6 +343,332 @@ public static class PkChildProcessJob
         }
         catch { return false; }
     }
+
+    // ---- Starting a program inside the job from its first instruction ----
+    //
+    // Process.Start can only be followed by Assign, so a program that starts a
+    // child straight away (cmd /c tool.exe) can do so before it's in the job,
+    // and that child survives a force-kill. TryStart has Windows put the
+    // program in the job as it creates it (PROC_THREAD_ATTRIBUTE_JOB_LIST,
+    // Windows 10 / Server 2016+), so its children join too.
+    //
+    // Everything else copies Process.Start with UseShellExecute = false:
+    // command line, Windows' own search for a bare name, CREATE_NO_WINDOW,
+    // stdin, redirected stdout/stderr, and the default encoding.
+    //
+    // The pipe ends the child writes to must be inheritable while it's
+    // created, and a plain Process.Start elsewhere in PowerShell inherits
+    // every inheritable handle: it would hold our output open until it exits.
+    // .NET's own start lock keeps those apart, so TryStart takes it (found by
+    // reflection) and returns null, for Process.Start plus Assign, when it
+    // isn't there in a form it knows. The handle list keeps our child from
+    // inheriting anyone else's handles.
+
+    private const uint CREATE_SUSPENDED = 0x4;
+    private const uint CREATE_UNICODE_ENVIRONMENT = 0x400;
+    private const uint EXTENDED_STARTUPINFO_PRESENT = 0x80000;
+    private const uint CREATE_NO_WINDOW = 0x08000000;
+    private const int STARTF_USESTDHANDLES = 0x100;
+    private const int STD_INPUT_HANDLE = -10;
+    private const uint HANDLE_FLAG_INHERIT = 1;
+    private static readonly IntPtr PROC_THREAD_ATTRIBUTE_HANDLE_LIST = (IntPtr)0x20002;
+    private static readonly IntPtr PROC_THREAD_ATTRIBUTE_JOB_LIST = (IntPtr)0x2000D;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct STARTUPINFO
+    {
+        public int cb;
+        public IntPtr lpReserved, lpDesktop, lpTitle;
+        public int dwX, dwY, dwXSize, dwYSize, dwXCountChars, dwYCountChars, dwFillAttribute, dwFlags;
+        public short wShowWindow, cbReserved2;
+        public IntPtr lpReserved2, hStdInput, hStdOutput, hStdError;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct STARTUPINFOEX
+    {
+        public STARTUPINFO StartupInfo;
+        public IntPtr lpAttributeList;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct PROCESS_INFORMATION
+    {
+        public IntPtr hProcess, hThread;
+        public int dwProcessId, dwThreadId;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct SECURITY_ATTRIBUTES
+    {
+        public int nLength;
+        public IntPtr lpSecurityDescriptor;
+        public int bInheritHandle;
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool CreateProcess(string lpApplicationName, StringBuilder lpCommandLine,
+        IntPtr lpProcessAttributes, IntPtr lpThreadAttributes, bool bInheritHandles, uint dwCreationFlags,
+        IntPtr lpEnvironment, string lpCurrentDirectory, ref STARTUPINFOEX lpStartupInfo,
+        out PROCESS_INFORMATION lpProcessInformation);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CreatePipe(out IntPtr hReadPipe, out IntPtr hWritePipe, ref SECURITY_ATTRIBUTES lpPipeAttributes, int nSize);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetHandleInformation(IntPtr hObject, uint dwMask, uint dwFlags);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetHandleInformation(IntPtr hObject, out uint lpdwFlags);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr GetStdHandle(int nStdHandle);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool InitializeProcThreadAttributeList(IntPtr lpAttributeList, int dwAttributeCount, int dwFlags, ref IntPtr lpSize);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool UpdateProcThreadAttribute(IntPtr lpAttributeList, uint dwFlags, IntPtr Attribute,
+        IntPtr lpValue, IntPtr cbSize, IntPtr lpPreviousValue, IntPtr lpReturnSize);
+
+    [DllImport("kernel32.dll")]
+    private static extern void DeleteProcThreadAttributeList(IntPtr lpAttributeList);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern uint ResumeThread(IntPtr hThread);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool TerminateProcess(IntPtr hProcess, uint uExitCode);
+
+    [DllImport("kernel32.dll")]
+    private static extern uint GetConsoleOutputCP();
+
+    // .NET's process-start lock: a plain object (5.1, 7.6) is held with
+    // Monitor; a System.Threading.Lock (where newer .NET is moving its locks)
+    // through its own Enter/Exit, by reflection since 5.1 has no such type.
+    // Monitor on a Lock wouldn't keep out its Enter, hence the type check.
+    private sealed class StartLock
+    {
+        public readonly string Kind;
+        private readonly object _obj;
+        private readonly MethodInfo _enter, _exit;
+
+        private StartLock(string kind, object obj, MethodInfo enter, MethodInfo exit)
+        {
+            Kind = kind; _obj = obj; _enter = enter; _exit = exit;
+        }
+
+        public static StartLock From(object candidate, string fieldName)
+        {
+            if (candidate == null) { return null; }
+            Type t = candidate.GetType();
+            if (t == typeof(object)) { return new StartLock("Monitor:" + fieldName, candidate, null, null); }
+            if (t.FullName == "System.Threading.Lock")
+            {
+                BindingFlags bf = BindingFlags.Public | BindingFlags.Instance;
+                MethodInfo enter = t.GetMethod("Enter", bf, null, Type.EmptyTypes, null);
+                MethodInfo exit = t.GetMethod("Exit", bf, null, Type.EmptyTypes, null);
+                if (enter != null && exit != null && enter.ReturnType == typeof(void) && exit.ReturnType == typeof(void))
+                {
+                    return new StartLock("Lock:" + fieldName, candidate, enter, exit);
+                }
+            }
+            return null;
+        }
+
+        public void Enter()
+        {
+            if (_enter == null) { Monitor.Enter(_obj); return; }
+            try { _enter.Invoke(_obj, null); }
+            catch (TargetInvocationException e) { throw e.InnerException; }
+        }
+
+        public void Exit()
+        {
+            if (_exit == null) { Monitor.Exit(_obj); return; }
+            try { _exit.Invoke(_obj, null); }
+            catch (TargetInvocationException e) { throw e.InnerException; }
+        }
+    }
+
+    private static StartLock _startLock;
+    private static bool _startLockLooked;
+
+    private static StartLock GetStartLock()
+    {
+        lock (_lock)
+        {
+            if (_startLockLooked) { return _startLock; }
+            _startLockLooked = true;
+            // .NET Framework: s_CreateProcessLock. .NET (Core) on Windows: s_createProcessLock.
+            string[] names = new string[] { "s_CreateProcessLock", "s_createProcessLock" };
+            foreach (string n in names)
+            {
+                try
+                {
+                    FieldInfo f = typeof(Process).GetField(n, BindingFlags.NonPublic | BindingFlags.Static);
+                    if (f == null) { continue; }
+                    StartLock l = StartLock.From(f.GetValue(null), n);
+                    if (l != null) { _startLock = l; break; }
+                }
+                catch { }   // reflection refused or the field changed: try the next name, else Process.Start
+            }
+            return _startLock;
+        }
+    }
+
+    // How TryStart holds .NET's start lock ("Monitor:<field>" or
+    // "Lock:<field>"), or null when it can't and the kit uses Process.Start.
+    public static string StartLockKind { get { StartLock l = GetStartLock(); return l == null ? null : l.Kind; } }
+
+    // Harness only: makes TryStart return null, to test the Process.Start path.
+    public static bool TestUseProcessStart = false;
+
+    private static StringBuilder BuildCommandLine(string fileName, string arguments)
+    {
+        // As Process.Start builds it: the program quoted unless it already is.
+        StringBuilder sb = new StringBuilder();
+        string f = fileName.Trim();
+        bool quoted = f.Length > 1 && f.StartsWith("\"", StringComparison.Ordinal) && f.EndsWith("\"", StringComparison.Ordinal);
+        if (!quoted) { sb.Append('"'); }
+        sb.Append(f);
+        if (!quoted) { sb.Append('"'); }
+        if (!String.IsNullOrEmpty(arguments)) { sb.Append(' '); sb.Append(arguments); }
+        return sb;
+    }
+
+    private static void CreateOutputPipe(out IntPtr read, out IntPtr write)
+    {
+        SECURITY_ATTRIBUTES sa = new SECURITY_ATTRIBUTES();
+        sa.nLength = Marshal.SizeOf(typeof(SECURITY_ATTRIBUTES));
+        sa.bInheritHandle = 1;
+        if (!CreatePipe(out read, out write, ref sa, 0)) { throw new Win32Exception(Marshal.GetLastWin32Error()); }
+        if (!SetHandleInformation(read, HANDLE_FLAG_INHERIT, 0))
+        {
+            int e = Marshal.GetLastWin32Error();
+            CloseHandle(read); CloseHandle(write);
+            read = IntPtr.Zero; write = IntPtr.Zero;
+            throw new Win32Exception(e);
+        }
+    }
+
+    // Starts the program in the job, or returns null when it can't do that
+    // safely (no job, no usable start lock): the caller then uses
+    // Process.Start and Assign. Throws Win32Exception when Windows refuses,
+    // as Process.Start does. encoding null: the console's output code page.
+    public static PkStartedProcess TryStart(string fileName, string arguments, string workingDirectory, Encoding encoding)
+    {
+        if (TestUseProcessStart || _job == IntPtr.Zero) { return null; }
+        StartLock startLock = GetStartLock();
+        if (startLock == null) { return null; }
+        if (encoding == null)
+        {
+            try { encoding = Encoding.GetEncoding((int)GetConsoleOutputCP()); }
+            catch { encoding = Console.OutputEncoding; }   // a code page this runtime can't decode: what PowerShell itself uses
+        }
+        StringBuilder commandLine = BuildCommandLine(fileName, arguments);
+
+        IntPtr outRead = IntPtr.Zero, outWrite = IntPtr.Zero, errRead = IntPtr.Zero, errWrite = IntPtr.Zero;
+        IntPtr attrList = IntPtr.Zero, handleArr = IntPtr.Zero, jobArr = IntPtr.Zero;
+        bool attrReady = false, created = false;
+        PROCESS_INFORMATION pi = new PROCESS_INFORMATION();
+
+        startLock.Enter();
+        try
+        {
+            try
+            {
+                CreateOutputPipe(out outRead, out outWrite);
+                CreateOutputPipe(out errRead, out errWrite);
+
+                // stdin as Process.Start passes it: PowerShell's own. Listed
+                // only if inheritable, the only case the child could use it.
+                IntPtr stdin = GetStdHandle(STD_INPUT_HANDLE);
+                uint hflags;
+                bool stdinInherit = stdin != IntPtr.Zero && stdin != new IntPtr(-1)
+                    && GetHandleInformation(stdin, out hflags) && (hflags & HANDLE_FLAG_INHERIT) != 0;
+                int handleCount = stdinInherit ? 3 : 2;
+                handleArr = Marshal.AllocHGlobal(IntPtr.Size * handleCount);
+                Marshal.WriteIntPtr(handleArr, 0, outWrite);
+                Marshal.WriteIntPtr(handleArr, IntPtr.Size, errWrite);
+                if (stdinInherit) { Marshal.WriteIntPtr(handleArr, 2 * IntPtr.Size, stdin); }
+                jobArr = Marshal.AllocHGlobal(IntPtr.Size);
+                Marshal.WriteIntPtr(jobArr, _job);
+
+                IntPtr size = IntPtr.Zero;
+                InitializeProcThreadAttributeList(IntPtr.Zero, 2, 0, ref size);   // fails by design: returns the size
+                attrList = Marshal.AllocHGlobal(size);
+                if (!InitializeProcThreadAttributeList(attrList, 2, 0, ref size)) { throw new Win32Exception(Marshal.GetLastWin32Error()); }
+                attrReady = true;
+                if (!UpdateProcThreadAttribute(attrList, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, handleArr,
+                        (IntPtr)(IntPtr.Size * handleCount), IntPtr.Zero, IntPtr.Zero)
+                    || !UpdateProcThreadAttribute(attrList, 0, PROC_THREAD_ATTRIBUTE_JOB_LIST, jobArr,
+                        (IntPtr)IntPtr.Size, IntPtr.Zero, IntPtr.Zero))
+                {
+                    throw new Win32Exception(Marshal.GetLastWin32Error());
+                }
+
+                STARTUPINFOEX si = new STARTUPINFOEX();
+                si.StartupInfo.cb = Marshal.SizeOf(typeof(STARTUPINFOEX));
+                si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+                si.StartupInfo.hStdInput = stdin;
+                si.StartupInfo.hStdOutput = outWrite;
+                si.StartupInfo.hStdError = errWrite;
+                si.lpAttributeList = attrList;
+
+                // Suspended only until the Process object below has its handle:
+                // the program is in the job already, so nothing can escape.
+                uint flags = CREATE_NO_WINDOW | CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT;
+                string dir = String.IsNullOrEmpty(workingDirectory) ? null : workingDirectory;
+                if (!CreateProcess(null, commandLine, IntPtr.Zero, IntPtr.Zero, true, flags, IntPtr.Zero, dir, ref si, out pi))
+                {
+                    throw new Win32Exception(Marshal.GetLastWin32Error());
+                }
+                created = true;
+            }
+            finally
+            {
+                if (attrReady) { DeleteProcThreadAttributeList(attrList); }
+                if (attrList != IntPtr.Zero) { Marshal.FreeHGlobal(attrList); }
+                if (handleArr != IntPtr.Zero) { Marshal.FreeHGlobal(handleArr); }
+                if (jobArr != IntPtr.Zero) { Marshal.FreeHGlobal(jobArr); }
+                // The child has its own copies; ours must go, or reading its
+                // output never reaches the end.
+                if (outWrite != IntPtr.Zero) { CloseHandle(outWrite); }
+                if (errWrite != IntPtr.Zero) { CloseHandle(errWrite); }
+                if (!created)
+                {
+                    if (outRead != IntPtr.Zero) { CloseHandle(outRead); }
+                    if (errRead != IntPtr.Zero) { CloseHandle(errRead); }
+                }
+            }
+        }
+        finally { startLock.Exit(); }
+
+        Process proc = null;
+        try
+        {
+            proc = Process.GetProcessById(pi.dwProcessId);
+            IntPtr opened = proc.Handle;   // taken while it's suspended, so ExitCode stays readable however fast it exits
+            if (ResumeThread(pi.hThread) == 0xFFFFFFFF) { throw new Win32Exception(Marshal.GetLastWin32Error()); }
+        }
+        catch
+        {
+            TerminateProcess(pi.hProcess, 1);
+            CloseHandle(outRead); CloseHandle(errRead);
+            CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+            if (proc != null) { proc.Dispose(); }
+            throw;
+        }
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+
+        PkStartedProcess r = new PkStartedProcess();
+        r.Process = proc;
+        r.Stdout = new StreamReader(new FileStream(new SafeFileHandle(outRead, true), FileAccess.Read, 4096, false), encoding, true, 4096);
+        r.Stderr = new StreamReader(new FileStream(new SafeFileHandle(errRead, true), FileAccess.Read, 4096, false), encoding, true, 4096);
+        return r;
+    }
 }
 '@ -Language CSharp
 }
@@ -336,7 +676,7 @@ public static class PkChildProcessJob
 # A session that loaded an older copy keeps its compiled types. Say so,
 # rather than fail later with a missing-method error. Keep this number in
 # sync with [PkState]::TypesVersion.
-if ((& { try { [PkState]::TypesVersion } catch { 0 } }) -ne 4) {
+if ((& { try { [PkState]::TypesVersion } catch { 0 } }) -ne 5) {
     throw "ParallelKit: this PowerShell session already loaded an older version of the kit, and its compiled parts can't be swapped out. Close this window and start a new one."
 }
 
@@ -938,7 +1278,9 @@ function Start-PkProcess {
     # How to decode its output: a name like 'utf-8', a code page number, or a
     # [System.Text.Encoding]. Default: the console's code page.
     # .OUTPUTS
-    # A hashtable @{ Proc; StdoutTask; StderrTask; Stopwatch }.
+    # A hashtable @{ Proc; StdoutTask; StderrTask; Stopwatch }. Proc is the
+    # program's Process. Read its output from StdoutTask and StderrTask: Proc's
+    # own StandardOutput, StandardError and StartInfo are usually not set.
     param(
         [Parameter(Mandatory)]
         [string]$FilePath,
@@ -989,6 +1331,7 @@ function Start-PkProcessCore {
     # In a try/catch: a .NET call that throws doesn't reliably stop the
     # script, and a $null process would be polled forever. The path handling
     # is in here too: it throws on characters Windows doesn't allow.
+    $started = $null
     try {
         if ($WorkingDirectory) {
             if ($null -ne $here) { $WorkingDirectory = Resolve-PkFileSystemPath -Path $WorkingDirectory -Here $here -CallerState $CallerState }
@@ -1001,12 +1344,27 @@ function Start-PkProcessCore {
         if ($null -ne $here -and ($FilePath.Contains('\') -or $FilePath.Contains('/') -or $FilePath.Contains(':'))) {
             $psi.FileName = Resolve-PkFileSystemPath -Path $FilePath -Here $here -CallerState $CallerState
         }
-        $proc = [System.Diagnostics.Process]::Start($psi)
+        # In the job from its first instruction where possible; otherwise
+        # Process.Start, and the job just after (a child it starts at once
+        # can miss it then).
+        $started = [PkChildProcessJob]::TryStart($psi.FileName, $psi.Arguments, $psi.WorkingDirectory, $encoding)
+        if ($null -eq $started) { $proc = [System.Diagnostics.Process]::Start($psi) }
     } catch {
         $tried = ""
         if ($psi.FileName -ne $FilePath) { $tried = " (" + $psi.FileName + ")" }
+        # Windows' reason, without PowerShell's "Exception calling <method>" wrapper.
+        $reason = [string]$_
+        if ($_.Exception -is [System.Management.Automation.MethodInvocationException] -and $null -ne $_.Exception.InnerException) { $reason = $_.Exception.InnerException.Message }
         # The original goes along as the inner exception: the batch reads Windows' error code from it.
-        throw [System.Management.Automation.RuntimeException]::new("Start-PkProcess: could not start '" + $FilePath + "'" + $tried + ": " + $_, $_.Exception)
+        throw [System.Management.Automation.RuntimeException]::new("Start-PkProcess: could not start '" + $FilePath + "'" + $tried + ": " + $reason, $_.Exception)
+    }
+    if ($null -ne $started) {
+        return @{
+            Proc       = $started.Process
+            StdoutTask = $started.Stdout.ReadToEndAsync()
+            StderrTask = $started.Stderr.ReadToEndAsync()
+            Stopwatch  = [System.Diagnostics.Stopwatch]::StartNew()
+        }
     }
     $null = [PkChildProcessJob]::Assign($proc)
     return @{
