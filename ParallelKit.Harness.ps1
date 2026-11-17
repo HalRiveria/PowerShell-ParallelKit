@@ -1098,6 +1098,9 @@ Test-Assert ($results.Count -eq 2) "-JobParams accepts a plain array of hashtabl
 $threw = $false
 try { $null = Invoke-PkRunspaceJobs -MaxParallel 1 -JobParams @(@{ Id = 1 }, 'oops') -WorkerScript { param($Id) } } catch { $threw = ($_.ToString() -like '*entry 1 is not a hashtable*') }
 Test-Assert $threw "-JobParams with a non-hashtable entry fails with a message naming the entry"
+$threw = $false
+try { $null = Invoke-PkRunspaceJobs -MaxParallel 1 -JobParams @(@{ Id = 1 }, $null) -WorkerScript { param($Id) } } catch { $threw = ($_.ToString() -like '*entry 1 is not a hashtable*') }
+Test-Assert $threw "-JobParams with a `$null entry fails the same way"
 
 # A shared budget sizes the thread pool too.
 $bigBudget = [System.Threading.SemaphoreSlim]::new(150, 150)
