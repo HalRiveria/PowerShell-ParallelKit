@@ -729,16 +729,16 @@ function ConvertTo-PkArgumentString {
     # .DESCRIPTION
     # An argument with a space, tab, newline or quote is wrapped in quotes, its
     # quotes become \", and backslashes are doubled where they come before a quote.
-    # These are the C runtime's rules, which most Windows programs use; cmd.exe /c
+    # These are the C runtime's rules, which most Windows programs use; cmd.exe
     # parses its own way. An argument with one of & | < > ^ ( ) , ; is quoted
     # too, so a .bat or .cmd program, which runs through cmd.exe, gets it as one
     # argument instead of cmd acting on it. The kit's -Arguments and Arguments
-    # values do this themselves when given a list, and for a .bat or .cmd
-    # program they also write a quote as "" instead of \", which cmd.exe can't
-    # be tricked by. This function's own output uses \": for a .bat or .cmd,
-    # give the kit the list instead. Not covered for those programs either way:
-    # cmd expands %NAME% inside quotes, and splits batch arguments at = (left
-    # unquoted, since some programs read NAME=value themselves).
+    # values do this themselves when given a list, and for cmd.exe or a
+    # batch-file program they also write a quote as "" instead of \", which
+    # cmd.exe can't be tricked by. This function's own output uses \": for
+    # those, give the kit the list instead. Not covered for those programs
+    # either way: cmd expands %NAME% inside quotes, and splits batch arguments
+    # at = (left unquoted, since some programs read NAME=value themselves).
     # .PARAMETER Arguments
     # The arguments, in order. A $null one is left out; an empty string is passed
     # as "". A file or folder object (from Get-ChildItem or Get-Item) is its full
@@ -765,9 +765,9 @@ function ConvertTo-PkArgumentString {
 }
 
 function ConvertTo-PkArgumentStringCore {
-    # ConvertTo-PkArgumentString's body. -ForBatchFile: for a .bat or .cmd,
-    # whose command line cmd.exe reads first, a quote is written "" instead of
-    # \". cmd.exe counts every quote, \" included, so with \" an argument like
+    # ConvertTo-PkArgumentString's body. -ForBatchFile: for cmd.exe or a .bat
+    # or .cmd, whose command line cmd.exe reads first, a quote is written ""
+    # instead of \". cmd.exe counts every quote, \" included, so with \" an argument like
     # a" & del ... & " runs a second command. "" keeps the count even, and the
     # C runtime still reads it as one quote in a program the batch file passes
     # %* to. A line break would end cmd.exe's command line, so it's refused.
@@ -789,7 +789,7 @@ function ConvertTo-PkArgumentStringCore {
         # On 5.1 a FileInfo from Get-ChildItem casts to its bare name.
         if ($item -is [System.IO.FileSystemInfo]) { $arg = $item.FullName } else { $arg = [string]$item }
         if ($ForBatchFile -and $arg.IndexOfAny([char[]]@("`r", "`n")) -ge 0) {
-            throw ("Arguments element " + $position + " contains a line break, which can't be passed to a .bat or .cmd program: cmd.exe would end the command line there and drop the rest. Pass it another way (a file, an environment variable).")
+            throw ("Arguments element " + $position + " contains a line break, which can't be passed to cmd.exe or a .bat or .cmd program: cmd.exe would end the command line there and drop the rest. Pass it another way (a file, an environment variable).")
         }
         # The C runtime only needs whitespace and quotes quoted. The rest are for
         # cmd.exe, which runs a .bat/.cmd: it acts on & | < > ^ ( ) outside
@@ -832,8 +832,8 @@ function Resolve-PkArguments {
     # -Arguments as given -> the command line: a string as written, a list
     # quoted one argument per element (a [string] cast would join it with
     # spaces, or $OFS), a lone file or folder object as its full path.
-    # -FilePath picks batch-file quoting for a .bat or .cmd. A bare name only
-    # finds an .exe, so a batch file always has its extension here.
+    # -FilePath picks batch-file quoting for cmd.exe or a .bat or .cmd. A bare
+    # name only finds an .exe, so a batch file always has its extension here.
     param($Arguments, [string]$FilePath = '')
     if ($null -eq $Arguments) { return '' }
     if ($Arguments -is [string]) { return $Arguments }
@@ -842,8 +842,11 @@ function Resolve-PkArguments {
     }
     if ($Arguments -is [System.Collections.IEnumerable] -or $Arguments -is [System.IO.FileSystemInfo]) {
         # Windows drops trailing dots and spaces from a file name, so
-        # 'run.cmd.' still runs through cmd.exe.
-        $forBatchFile = ($FilePath.Trim().Trim('"').TrimEnd(' ', '.') -match '\.(bat|cmd)$')
+        # 'run.cmd.' still runs through cmd.exe. cmd.exe itself, given a list
+        # (cmd /c tool "a b"), reads its command line the same way, so it gets
+        # the same quoting.
+        $exeName = $FilePath.Trim().Trim('"').TrimEnd(' ', '.')
+        $forBatchFile = ($exeName -match '\.(bat|cmd)$' -or $exeName -match '(^|[\\/])cmd(\.exe)?$')
         return (ConvertTo-PkArgumentStringCore -Arguments @($Arguments) -ForBatchFile:$forBatchFile)
     }
     return [string]$Arguments

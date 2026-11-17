@@ -2758,6 +2758,26 @@ if ($compiled) {
     $fwdExpected = (@($fwdArgs | ForEach-Object { '[' + $_ + ']' }) -join '')
     Test-Assert ($text -ceq $fwdExpected) ("a .cmd that passes %* on gets the list through exactly (" + $text + ")")
 
+    # cmd.exe itself given a list gets the same quoting: the program after /c
+    # still gets the list exactly (spaces, quotes, trailing backslashes), and
+    # no element can make cmd.exe run another command. Under any spelling of
+    # cmd.exe's name.
+    $text = $null
+    try { $text = Get-ArgvText (Invoke-PkProcessWithTimeout -FilePath $cmdExe -Arguments (@('/d', '/c', $argvExe) + $fwdArgs) -TimeoutMs 10000).Stdout } catch { $text = "threw: $_" }
+    Test-Assert ($text -ceq $fwdExpected) ("cmd.exe /c given a list passes it on to the program exactly (" + $text + ")")
+    $cmdHits = 0
+    $cmdThrew = 0
+    $cmdNames = @($cmdExe, 'cmd', 'CMD.EXE', ($cmdExe.ToUpperInvariant() + '.'))
+    foreach ($cmdName in $cmdNames) {
+        foreach ($payload in $injPayloads) {
+            try { $null = Invoke-PkProcessWithTimeout -FilePath $cmdName -Arguments @('/d', '/c', 'echo', $payload) -WorkingDirectory $injDir -TimeoutMs 10000 } catch { $cmdThrew++; Write-Host "  injection probe threw: $_" }
+            if ([System.IO.File]::Exists($injMarker)) { $cmdHits++; [System.IO.File]::Delete($injMarker) }
+        }
+    }
+    Test-Assert ($cmdHits -eq 0 -and $cmdThrew -eq 0) ("a quote in a list element can't make cmd.exe /c run another command (" + $cmdHits + " of " + ($cmdNames.Count * $injPayloads.Count) + " did, " + $cmdThrew + " failed to run)")
+    $cmdBatch = Invoke-PkProcessBatch -MaxConcurrent 1 -Commands @(@{ FilePath = 'cmd.exe'; WorkingDirectory = $injDir; Arguments = @('/d', '/c', 'echo', $injPayloads[0]) })
+    Test-Assert (-not [System.IO.File]::Exists($injMarker) -and $cmdBatch.Results[0].ExitCode -eq 0) "the same for cmd.exe through the batch"
+
     # A line break would end cmd.exe's command line and drop the rest, so it's
     # refused for a batch file, and still fine for any other program.
     $nlError = ''
