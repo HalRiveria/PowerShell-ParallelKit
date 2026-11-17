@@ -227,6 +227,13 @@ $sw = [System.Diagnostics.Stopwatch]::StartNew()
 try { $null = Invoke-PkProcessWithTimeout -FilePath $pingExe -Arguments '-n 30 127.0.0.1' -TimeoutMs 800 } catch { $threw = ($_.ToString() -like '*did not exit within*') }
 $sw.Stop()
 Test-Assert ($threw -and $sw.Elapsed.TotalSeconds -lt 6) "a process that overruns its time limit is killed and reported"
+# A -TimeoutMs below 1 is refused before anything starts, not taken as a
+# limit that's already used up.
+foreach ($badMs in 0, -5) {
+    $badMsError = $null
+    try { $null = Invoke-PkProcessWithTimeout -FilePath $cmdExe -Arguments '/c exit 0' -TimeoutMs $badMs } catch { $badMsError = $_.ToString() }
+    Test-Assert ($badMsError -like '*-TimeoutMs must be at least 1*') ("-TimeoutMs " + $badMs + " is refused with a clear message (error: " + $badMsError + ")")
+}
 $threw = $false
 try { $null = Start-PkProcess -FilePath 'C:\no\such\program.exe' } catch { $threw = ($_.ToString() -like "*could not start*") }
 Test-Assert $threw "a program that can't be started throws a clear error (not a silent null)"
