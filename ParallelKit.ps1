@@ -1340,7 +1340,7 @@ function Invoke-PkProcessDispatch {
     # Start-PkProcess on the job's FilePath and Arguments.
     # .PARAMETER JobPollCompleted
     # { param($job) } returning $true once the job is finished. Default:
-    # $job['Proc'].HasExited.
+    # $job['Proc'].HasExited. Only its last output value counts.
     # .PARAMETER JobFinalize
     # { param($job, $pendingQueue) } called once per finished job; collect its
     # result with Complete-PkProcess. Enqueue new job hashtables onto $pendingQueue
@@ -1718,6 +1718,9 @@ function Invoke-PkProcessDispatchCore {
             $pkCbDone = $false
             $pkPolled = do { & $pkJobPollCompleted $pkJob; $pkCbDone = $true } while ($false)
             if (-not $pkCbDone) { Write-PkCallbackLoopWarning -PkName '-JobPollCompleted' -PkContext $pkCallbackContext }
+            # Only the poll's last value counts: a value it leaks first (an
+            # ArrayList.Add index, say) would make a running job look done.
+            if ($pkPolled -is [object[]]) { $pkPolled = $pkPolled[-1] }
             if ($pkPolled) {
                 $pkPendingBefore = $pkPending.Count
                 $pkCbDone = $false
@@ -1784,6 +1787,7 @@ function Invoke-PkProcessDispatchCore {
                 $pkCbDone = $false
                 $pkPolled = do { & $pkJobPollCompleted $pkJob; $pkCbDone = $true } while ($false)
                 if (-not $pkCbDone) { Write-PkCallbackLoopWarning -PkName '-JobPollCompleted' -PkContext $pkCallbackContext }
+                if ($pkPolled -is [object[]]) { $pkPolled = $pkPolled[-1] }   # only the last value counts: see the main poll pass
                 if ($pkPolled) {
                     $pkPendingBefore = $pkPending.Count
                     $pkCbDone = $false
@@ -1841,6 +1845,7 @@ function Invoke-PkProcessDispatchCore {
                 $pkCbDone = $false
                 $pkPolled = do { & $pkJobPollCompleted $pkJob; $pkCbDone = $true } while ($false)
                 if (-not $pkCbDone) { Write-PkCallbackLoopWarning -PkName '-JobPollCompleted' -PkContext $pkCallbackContext }
+                if ($pkPolled -is [object[]]) { $pkPolled = $pkPolled[-1] }   # only the last value counts: see the main poll pass
                 if ($pkPolled) {
                     $pkPendingBefore = $pkPending.Count
                     $pkCbDone = $false

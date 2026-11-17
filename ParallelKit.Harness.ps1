@@ -3075,6 +3075,20 @@ try {
 $fcLeft = Get-LimitPingCount 55
 Stop-StrayPings 55
 Test-Assert ($fcProblem -like '*finalize failed*' -and ($fcCleaned -join ',') -eq 'run' -and $fcLeft -eq 0 -and $fcBudget.CurrentCount -eq 2) ("a -JobFinalize that throws gets no -JobAbortCleanup for its finished job, only for the killed one (cleaned: " + ($fcCleaned -join ',') + ", " + $fcLeft + " left, " + $fcBudget.CurrentCount + " of 2 slots free)")
+
+# A -JobPollCompleted that leaks a value (ArrayList.Add returns the index)
+# before its answer: only the last value counts, so the job isn't finalized
+# while its program still runs.
+Reset-Harness
+$leakSeen = [System.Collections.ArrayList]::new()
+$leakFin = @{ Count = 0; Exited = $null }
+$leakFeed = @{ Given = $false }
+$null = Invoke-PkProcessDispatch -MaxConcurrent 1 `
+    -GroupProvider { if ($leakFeed.Given) { return $null }; $leakFeed.Given = $true; return 'g' }.GetNewClosure() `
+    -JobBuilder { param($g) return @(@{ FilePath = $pingExe; Arguments = '-n 2 127.0.0.1' }) }.GetNewClosure() `
+    -JobPollCompleted { param($job) $leakSeen.Add(1); $job['Proc'].HasExited }.GetNewClosure() `
+    -JobFinalize { param($job, $q) $leakFin.Count++; $leakFin.Exited = $job['Proc'].HasExited; $null = Complete-PkProcess -Job $job }.GetNewClosure()
+Test-Assert ($leakFin.Count -eq 1 -and $leakFin.Exited -eq $true -and $leakSeen.Count -gt 1) ("a -JobPollCompleted that leaks a value finalizes the job only once it has exited (finalized " + $leakFin.Count + "x, HasExited then: " + $leakFin.Exited + ", polled " + $leakSeen.Count + "x)")
 Reset-Harness
 Write-Host ""
 
