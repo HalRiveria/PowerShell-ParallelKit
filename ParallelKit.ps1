@@ -1255,7 +1255,7 @@ function Invoke-PkProcessWithTimeout {
     # Its command line: one string, passed exactly as written, or a list, each
     # element one argument, quoted for you (see ConvertTo-PkArgumentString).
     # .PARAMETER TimeoutMs
-    # The time limit in milliseconds (default 60000).
+    # The time limit in milliseconds (default 60000), at least 1.
     # .PARAMETER StreamTimeoutMs
     # How long to wait for the output after the program exits (default 15000).
     # .PARAMETER WorkingDirectory
@@ -1279,6 +1279,8 @@ function Invoke-PkProcessWithTimeout {
         $OutputEncoding = $null,
         [switch]$IgnoreAbort
     )
+    # Checked before starting anything: 0 or less would kill the program at once.
+    if ($TimeoutMs -lt 1) { throw ("Invoke-PkProcessWithTimeout: -TimeoutMs must be at least 1 (got " + $TimeoutMs + "). It's the program's time limit in milliseconds.") }
     $job = Start-PkProcessCore -FilePath $FilePath -Arguments $Arguments -WorkingDirectory $WorkingDirectory -OutputEncoding $OutputEncoding -CallerState $PSCmdlet.SessionState
     try {
         # Short slices, so an abort or cancel is noticed within a moment.
