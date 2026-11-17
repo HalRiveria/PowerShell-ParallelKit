@@ -3453,6 +3453,26 @@ Test-Assert ((Get-Command Invoke-PkProcessDispatch).Parameters['PollCallback'].A
 Reset-Harness
 Write-Host ""
 
+# ==============================================================================
+Write-Host "=== AL: a job is marked done before its shared slot is released ===" -ForegroundColor Cyan
+# Released first, a stop landing before the mark has the teardown release the
+# slot again, leaving a shared budget one above its limit. The window is one
+# statement wide, too narrow to hit from a test, so this reads the dispatcher's
+# code: in the loop body or catch block around each .Release(), the job is
+# marked done first (SlotReleased set, or $pkStarting cleared on a failed start).
+$slotCoreAst = & (Get-Module ParallelKit) { (Get-Command Invoke-PkProcessDispatchCore).ScriptBlock.Ast }
+$slotReleases = @($slotCoreAst.FindAll({ param($a) $a -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and $a.Member.Extent.Text -eq 'Release' -and $a.Expression.Extent.Text -eq '$pkMaxConcurrent' }, $true))
+$slotMarkedFirst = 0
+foreach ($slotCall in $slotReleases) {
+    $slotUnit = $slotCall.Parent
+    while ($null -ne $slotUnit -and $slotUnit -isnot [System.Management.Automation.Language.CatchClauseAst] -and $slotUnit -isnot [System.Management.Automation.Language.LoopStatementAst]) { $slotUnit = $slotUnit.Parent }
+    if ($null -eq $slotUnit) { continue }
+    $slotMarks = @($slotUnit.FindAll({ param($a) $a -is [System.Management.Automation.Language.AssignmentStatementAst] -and ($a.Extent.Text -eq '$pkJob[''SlotReleased''] = $true' -or $a.Extent.Text -eq '$pkStarting = $null') }, $true))
+    if (@($slotMarks | Where-Object { $_.Extent.EndOffset -lt $slotCall.Extent.StartOffset }).Count -gt 0) { $slotMarkedFirst++ }
+}
+Test-Assert ($slotReleases.Count -gt 0 -and $slotMarkedFirst -eq $slotReleases.Count) ("every shared-slot release comes after its job is marked done (" + $slotMarkedFirst + " of " + $slotReleases.Count + ")")
+Write-Host ""
+
 Set-PkMessageHandler -Handler $null
 Reset-PkAbortState
 
