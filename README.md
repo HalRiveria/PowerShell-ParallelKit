@@ -258,7 +258,7 @@ All of these callbacks run on whichever thread called the dispatcher: the main t
 - Whatever your callbacks output is thrown away, apart from the return values listed here. They can't corrupt the dispatcher's result by accident.
 - `-MaxConcurrent` can be a `SemaphoreSlim` shared by several dispatchers that must stay under one combined limit. It works inside workers, so two runspace jobs can each run a dispatcher against one shared budget.
 - `-GroupReleaseCheck { param($group) }` makes a group with zero jobs keep its queue-ahead slot until the check returns true. Use it to stop one dispatcher racing ahead of another that it's paired with. The dispatcher doesn't return until every held group has been released, unless the run is canceled or aborted. It runs on every loop pass, so keep it cheap.
-- `-JobPollCompleted { param($job) }` replaces the default "has the process exited" check. Use it for a custom starter whose job isn't a plain process.
+- `-JobPollCompleted { param($job) }` replaces the default "has the process exited" check. Use it for a custom starter whose job isn't a plain process. Only its last output value counts, so a stray value written before the answer doesn't mark the job done.
 - `-PollCallback { param($runningJobs) }` runs on every loop pass, with the jobs currently running (`-AbortPollCallback`, its name before 3.0, also works). That's about every 50 ms, and can be many times more often when programs finish quickly, so keep it cheap.
 - `-CancelToken` stops the dispatcher when canceled. An abort stops it either way, without canceling your token.
 - An exception from one of your callbacks stops the dispatcher: running processes are killed and the exception is rethrown.
