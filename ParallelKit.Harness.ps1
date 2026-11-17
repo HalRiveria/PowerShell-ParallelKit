@@ -3572,6 +3572,204 @@ try {
 } finally { [PkChildProcessJob]::TestUseProcessStart = $false }
 Write-Host ""
 
+Write-Host "=== AN: static checks on the kit's own code ===" -ForegroundColor Cyan
+# Rules that are easy to break in one place without any other test noticing:
+# the dispatcher's copied blocks drifting apart, a user callback called
+# without the continue/break guard, an empty catch with no reason. Each check
+# reads ParallelKit.ps1, then an edited copy that breaks the rule once, so a
+# check that has stopped seeing anything fails too.
+$anSource = [System.IO.File]::ReadAllText((Join-Path $PSScriptRoot "ParallelKit.ps1"))
+
+function Get-HarnessCodeText {
+    # Code as one line of tokens: comments, line breaks and spacing don't count.
+    param([string]$Text)
+    $tokens = $null; $errors = $null
+    $null = [System.Management.Automation.Language.Parser]::ParseInput($Text, [ref]$tokens, [ref]$errors)
+    $skip = @('Comment', 'NewLine', 'LineContinuation', 'EndOfInput')
+    $kept = foreach ($token in $tokens) { if ($skip -notcontains $token.Kind.ToString()) { $token.Text } }
+    return (@($kept) -join ' ')
+}
+
+function Get-HarnessCodeDifference {
+    # Where two Get-HarnessCodeText strings first differ, for a failure message.
+    param([string]$A, [string]$B)
+    $i = 0
+    while ($i -lt $A.Length -and $i -lt $B.Length -and $A[$i] -eq $B[$i]) { $i++ }
+    $from = [Math]::Max(0, $i - 40)
+    return ("'..." + $A.Substring($from, [Math]::Min(80, $A.Length - $from)) + "...' vs '..." + $B.Substring($from, [Math]::Min(80, $B.Length - $from)) + "...'")
+}
+
+function Get-HarnessDispatchCore {
+    param([string]$Source)
+    $tokens = $null; $errors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseInput($Source, [ref]$tokens, [ref]$errors)
+    return $ast.Find({ param($a) $a -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $a.Name -eq 'Invoke-PkProcessDispatchCore' }, $true)
+}
+
+function Get-HarnessFinalizePassDrift {
+    # The dispatcher's three poll/finalize passes (main loop, graceful wait,
+    # final pass) are copies on purpose: a shared function cost too much per
+    # job on 5.1. They must match apart from two intended differences: the
+    # final pass has no time-limit check (what's left is force-stopped right
+    # after), and each invariant message names its own pass. Returns what's
+    # wrong; empty when they match.
+    param([string]$Source)
+    $problems = [System.Collections.Generic.List[string]]::new()
+    $core = Get-HarnessDispatchCore -Source $Source
+    if ($null -eq $core) { $problems.Add('Invoke-PkProcessDispatchCore not found'); return ,$problems }
+    $passes = @($core.FindAll({ param($a) $a -is [System.Management.Automation.Language.ForEachStatementAst] -and $a.Condition.Extent.Text -eq '$pkRunning' -and $a.Body.Extent.Text.Contains('& $pkJobPollCompleted') }, $true))
+    $names = @('main poll pass', 'graceful-wait loop', 'final pass')
+    if ($passes.Count -ne 3) { $problems.Add('expected 3 passes, found ' + $passes.Count); return ,$problems }
+    $timeLimit = Get-HarnessCodeText -Text 'if ($pkJob[''TimeLimit''] -gt 0) { Stop-PkTimedOutJob -Job $pkJob }'
+    $messagePattern = '"ProcessDispatch: invariant violation - job''s GroupKey is not registered \(([^)]*)\)[^"]*"'
+    $texts = @()
+    for ($i = 0; $i -lt 3; $i++) {
+        $text = Get-HarnessCodeText -Text $passes[$i].Extent.Text
+        $named = [regex]::Match($text, $messagePattern)
+        if (-not $named.Success -or $named.Groups[1].Value -ne $names[$i]) { $problems.Add('the ' + $names[$i] + "'s invariant message doesn't name it") }
+        $text = [regex]::Replace($text, $messagePattern, '"<invariant message>"')
+        $text = $text.Replace('$pkStillRunning', '$pkStillWaiting')
+        $hasTimeLimit = $text.Contains($timeLimit)
+        if ($i -lt 2 -and -not $hasTimeLimit) { $problems.Add('the ' + $names[$i] + ' has no time-limit check') }
+        if ($i -eq 2 -and $hasTimeLimit) { $problems.Add('the final pass has a time-limit check') }
+        $texts += ($text.Replace($timeLimit, '') -replace '\s+', ' ')
+    }
+    for ($i = 1; $i -lt 3; $i++) {
+        if ($texts[$i] -ne $texts[0]) { $problems.Add('the ' + $names[$i] + ' differs from the main poll pass: ' + (Get-HarnessCodeDifference -A $texts[0] -B $texts[$i])) }
+    }
+    return ,$problems
+}
+
+function Get-HarnessForceStopDrift {
+    # The force-stop after an abort's wait and the finally block's teardown
+    # run the same per-job steps, apart from one intended difference: the
+    # teardown skips -JobAbortCleanup for a job whose -JobFinalize was running.
+    param([string]$Source)
+    $problems = [System.Collections.Generic.List[string]]::new()
+    $core = Get-HarnessDispatchCore -Source $Source
+    if ($null -eq $core) { $problems.Add('Invoke-PkProcessDispatchCore not found'); return ,$problems }
+    $skipCondition = '-not [object]::ReferenceEquals($pkJob, $pkFinalizing)'
+    $texts = @{}
+    foreach ($list in '$pkRunning', '$pkTearDown') {
+        $loops = @($core.FindAll({ param($a) $a -is [System.Management.Automation.Language.ForEachStatementAst] -and $a.Condition.Extent.Text -eq $list -and $a.Body.Extent.Text.Contains('$pkJobAbortCleanup') }.GetNewClosure(), $true))
+        if ($loops.Count -ne 1) { $problems.Add('expected one stop loop over ' + $list + ', found ' + $loops.Count); continue }
+        $loop = $loops[0]
+        $steps = [System.Collections.Generic.List[string]]::new()
+        $siblings = $loop.Parent.Statements
+        $before = $siblings[$siblings.IndexOf($loop) - 1]
+        $steps.Add((Get-HarnessCodeText -Text $before.Extent.Text).Replace($list, '$LIST'))
+        $skipped = $false
+        foreach ($statement in $loop.Body.Statements) {
+            if ($statement -is [System.Management.Automation.Language.IfStatementAst] -and $statement.Clauses[0].Item1.Extent.Text -eq $skipCondition) {
+                $skipped = $true
+                foreach ($inner in $statement.Clauses[0].Item2.Statements) { $steps.Add((Get-HarnessCodeText -Text $inner.Extent.Text)) }
+            } else {
+                $steps.Add((Get-HarnessCodeText -Text $statement.Extent.Text))
+            }
+        }
+        if ($list -eq '$pkTearDown' -and -not $skipped) { $problems.Add("the teardown doesn't skip the job mid-finalize") }
+        if ($list -eq '$pkRunning' -and $skipped) { $problems.Add('the force-stop skips the job mid-finalize') }
+        $texts[$list] = ($steps -join ' ; ')
+    }
+    if ($texts.Count -eq 2 -and $texts['$pkRunning'] -ne $texts['$pkTearDown']) {
+        $problems.Add('the teardown differs from the force-stop: ' + (Get-HarnessCodeDifference -A $texts['$pkRunning'] -B $texts['$pkTearDown']))
+    }
+    return ,$problems
+}
+
+function Get-HarnessUnguardedCallbacks {
+    # Every `& $variable` call of a user callback must be Invoke-PkCallback's
+    # guard or its inlined copy: `$flag = $false`, then
+    # `do { & $cb ...; $flag = $true } while ($false)`, then
+    # `if (-not $flag) { <loop warning> }`. The variables below hold the kit's
+    # own helpers or Invoke-PkRun's body, not callbacks; a new helper captured
+    # into a variable goes on this list. Returns @{ Calls; Problems }.
+    param([string]$Source)
+    $internal = @('$ScriptBlock', '$pkNewBatchResult', '$pkGetStartFailureCause', '$pkGetJobTimeLimit', '$pkReportStartFailure', '$pkStartProcessCore', '$pkWriteCallbackLoopWarning')
+    $problems = [System.Collections.Generic.List[string]]::new()
+    $tokens = $null; $errors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseInput($Source, [ref]$tokens, [ref]$errors)
+    $calls = @($ast.FindAll({ param($a) $a -is [System.Management.Automation.Language.CommandAst] -and $a.InvocationOperator -eq 'Ampersand' -and $a.CommandElements[0] -is [System.Management.Automation.Language.VariableExpressionAst] }, $true))
+    $checked = 0
+    foreach ($call in $calls) {
+        $name = $call.CommandElements[0].Extent.Text
+        if ($internal -contains $name) { continue }
+        $checked++
+        $where = 'line ' + $call.Extent.StartLineNumber + ' (& ' + $name + ')'
+        $loop = $call.Parent.Parent
+        if ($loop -is [System.Management.Automation.Language.AssignmentStatementAst] -and $loop.Left.Extent.Text -eq '$null') { $loop = $loop.Parent }
+        $loop = $loop.Parent
+        if ($loop -isnot [System.Management.Automation.Language.DoWhileStatementAst] -or $loop.Condition.Extent.Text -ne '$false') { $problems.Add($where + ': not inside do { } while ($false)'); continue }
+        $last = $loop.Body.Statements[$loop.Body.Statements.Count - 1]
+        if ($last -isnot [System.Management.Automation.Language.AssignmentStatementAst] -or $last.Right.Extent.Text -ne '$true') { $problems.Add($where + ": the do block doesn't end by setting a flag to `$true"); continue }
+        $flag = $last.Left.Extent.Text
+        $statement = $loop
+        if ($loop.Parent -is [System.Management.Automation.Language.AssignmentStatementAst]) { $statement = $loop.Parent }
+        $siblings = $statement.Parent.Statements
+        $index = $siblings.IndexOf($statement)
+        # The last statement before the call that mentions the flag resets it.
+        $reset = $null
+        for ($j = $index - 1; $j -ge 0 -and $null -eq $reset; $j--) {
+            if ($siblings[$j].Extent.Text.Contains($flag)) { $reset = Get-HarnessCodeText -Text $siblings[$j].Extent.Text }
+        }
+        if ($reset -ne ($flag + ' = $false')) { $problems.Add($where + ': ' + $flag + ' is not reset to $false before the call'); continue }
+        # ...and the first one after it that mentions the flag is the warning.
+        $next = $null
+        for ($j = $index + 1; $j -lt $siblings.Count -and $null -eq $next; $j++) {
+            if ($siblings[$j].Extent.Text.Contains($flag)) { $next = $siblings[$j] }
+        }
+        if ($next -isnot [System.Management.Automation.Language.IfStatementAst] -or -not $next.Clauses[0].Item1.Extent.Text.StartsWith('-not ' + $flag) -or $next.Clauses[0].Item2.Extent.Text -notmatch "Write-PkCallbackLoopWarning|\`$pkWriteCallbackLoopWarning|used 'continue' or 'break'") {
+            $problems.Add($where + ': not followed by the loop warning when ' + $flag + ' is still $false')
+        }
+    }
+    return @{ Calls = $checked; Problems = $problems }
+}
+
+function Get-HarnessSilentCatches {
+    # An empty catch (PowerShell, or C# in an Add-Type block) needs its reason:
+    # a comment after it on the same line, or a comment line right above it.
+    # Here-strings count too: their code runs as well. Returns @{ Catches; Problems }.
+    param([string]$Source)
+    $lines = $Source -split "`r?`n"
+    $problems = [System.Collections.Generic.List[string]]::new()
+    $found = 0
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $after = $null
+        if ($lines[$i] -match 'catch\s*(\[[^\]]*\]\s*|\([^)]*\)\s*)*\{\s*\}(.*)$') { $after = $Matches[2] }
+        elseif ($lines[$i] -match 'catch\s*(\[[^\]]*\]\s*|\([^)]*\)\s*)*\{\s*$' -and $i + 1 -lt $lines.Count -and $lines[$i + 1] -match '^\s*\}(.*)$') { $after = $Matches[1] }
+        if ($null -eq $after) { continue }
+        $found++
+        if ($after -match '#|//') { continue }
+        if ($i -gt 0 -and $lines[$i - 1] -match '^\s*(#|//)') { continue }
+        $problems.Add('line ' + ($i + 1) + ': ' + $lines[$i].Trim())
+    }
+    return @{ Catches = $found; Problems = $problems }
+}
+
+$anPasses = Get-HarnessFinalizePassDrift -Source $anSource
+Test-Assert ($anPasses.Count -eq 0) ("the dispatcher's three finalize passes match, apart from the time limit and each message's pass name" + $(if ($anPasses.Count) { ': ' + ($anPasses -join '; ') }))
+$anStops = Get-HarnessForceStopDrift -Source $anSource
+Test-Assert ($anStops.Count -eq 0) ("the dispatcher's force-stop and its teardown run the same steps, apart from the mid-finalize skip" + $(if ($anStops.Count) { ': ' + ($anStops -join '; ') }))
+$anGuards = Get-HarnessUnguardedCallbacks -Source $anSource
+Test-Assert ($anGuards.Calls -gt 0 -and $anGuards.Problems.Count -eq 0) ("every user-callback call is guarded against continue/break (" + $anGuards.Calls + " calls)" + $(if ($anGuards.Problems.Count) { ': ' + ($anGuards.Problems -join '; ') }))
+$anCatches = Get-HarnessSilentCatches -Source $anSource
+Test-Assert ($anCatches.Catches -gt 0 -and $anCatches.Problems.Count -eq 0) ("every empty catch says why (" + $anCatches.Catches + " catches)" + $(if ($anCatches.Problems.Count) { ': ' + ($anCatches.Problems -join '; ') }))
+
+# Each check on a copy broken in exactly one spot.
+$anFinalMessage = 'is not registered (final pass). This should be unreachable.") -Level Error'
+$anBroken = $anSource.Replace($anFinalMessage, $anFinalMessage + '; $pkOneSided = 1')
+$anFound = Get-HarnessFinalizePassDrift -Source $anBroken
+Test-Assert ($anBroken -ne $anSource -and $anFound.Count -eq 1 -and $anFound[0] -match '^the final pass differs') ("an edit to one finalize pass only is caught (" + ($anFound -join '; ') + ")")
+$anBroken = $anSource.Replace('$pkJob[''SlotReleased''] = $true   # first, as in the force-stop above', '$pkJob[''SlotReleased''] = $false   # first, as in the force-stop above')
+$anFound = Get-HarnessForceStopDrift -Source $anBroken
+Test-Assert ($anBroken -ne $anSource -and $anFound.Count -eq 1 -and $anFound[0] -match '^the teardown differs') ("an edit to the teardown only is caught (" + ($anFound -join '; ') + ")")
+$anBroken = $anSource.Replace('$null = do { & $pkOnComplete $pkJob[''Command''] $pkR; $pkCbDone = $true } while ($false)', '$null = & $pkOnComplete $pkJob[''Command''] $pkR; $pkCbDone = $true')
+$anFound = (Get-HarnessUnguardedCallbacks -Source $anBroken).Problems
+Test-Assert ($anBroken -ne $anSource -and $anFound.Count -eq 1 -and $anFound[0] -match '& \$pkOnComplete\): not inside do') ("a callback called without the guard is caught (" + ($anFound -join '; ') + ")")
+$anFound = (Get-HarnessSilentCatches -Source ($anSource + "`r`nfunction Get-PkBroken { try { 1 } catch { } }`r`n")).Problems
+Test-Assert ($anFound.Count -eq 1 -and $anFound[0] -match 'Get-PkBroken') ("an empty catch with no reason is caught (" + ($anFound -join '; ') + ")")
+Write-Host ""
+
 Set-PkMessageHandler -Handler $null
 Reset-PkAbortState
 

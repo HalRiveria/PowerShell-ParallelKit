@@ -1235,11 +1235,10 @@ function Resolve-PkFileSystemPath {
 & {
     $pkProvider = $null
     $pkDrive = $null
-    # Swallowed: a path the caller's scope can't read either falls back below.
     try {
         $pkResolved = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(__PATH__, [ref]$pkProvider, [ref]$pkDrive)
         if ($pkProvider.Name -eq 'FileSystem') { $pkResolved }
-    } catch { }
+    } catch { }   # a path the caller's scope can't read either falls back below
 }
 '@
         $text = $text.Replace('__PATH__', $q + [System.Management.Automation.Language.CodeGeneration]::EscapeSingleQuotedStringContent($Path) + $q)
