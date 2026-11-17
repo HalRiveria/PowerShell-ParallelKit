@@ -1904,8 +1904,8 @@ function Invoke-PkProcessDispatchCore {
             foreach ($pkJob in $pkRunning) {
                 try { if ($pkJob['Proc']) { $null = $pkJob['Proc'].WaitForExit(5000) } } catch { }   # a custom starter's .Proc may not be a Process; the kill above already ran
                 try { $null = Invoke-PkCallback -PkCallback $pkJobAbortCleanup -PkArgs @(,$pkJob) -PkName '-JobAbortCleanup' -PkContext $pkCallbackContext } catch { }   # one job's failed cleanup mustn't skip the others'
+                $pkJob['SlotReleased'] = $true   # first: see the main poll pass
                 if ($pkIsSharedBudget) { try { $null = $pkMaxConcurrent.Release() } catch { } }   # best effort: one failed release mustn't stop the other jobs' cleanup
-                $pkJob['SlotReleased'] = $true
                 try { if ($pkJob['Proc']) { $pkJob['Proc'].Dispose() } } catch { }   # the job is over either way
             }
         }
@@ -1915,9 +1915,9 @@ function Invoke-PkProcessDispatchCore {
         if (-not $pkLoopDone) {
             # Best-effort teardown after an error or a stop (an error carries
             # on up by itself). Jobs with SlotReleased set are already done:
-            # their slot is released and their process disposed or about to
-            # be. Same per-job steps as the force-stop above; keep the two in
-            # step.
+            # their slot is released and their process disposed, or both are
+            # about to be. Same per-job steps as the force-stop above; keep the
+            # two in step.
             $pkTearDown = [System.Collections.Generic.List[hashtable]]::new()
             foreach ($pkJob in $pkRunning) { if (-not $pkJob['SlotReleased']) { $pkTearDown.Add($pkJob) } }
             if ($null -ne $pkStarting -and -not $pkTearDown.Contains($pkStarting)) { $pkTearDown.Add($pkStarting) }
@@ -1927,8 +1927,8 @@ function Invoke-PkProcessDispatchCore {
                 if (-not [object]::ReferenceEquals($pkJob, $pkFinalizing)) {
                     try { $null = Invoke-PkCallback -PkCallback $pkJobAbortCleanup -PkArgs @(,$pkJob) -PkName '-JobAbortCleanup' -PkContext $pkCallbackContext } catch { }   # one job's failed cleanup mustn't skip the others'
                 }
+                $pkJob['SlotReleased'] = $true   # first, as in the force-stop above
                 if ($pkIsSharedBudget) { try { $null = $pkMaxConcurrent.Release() } catch { } }   # best effort: one failed release mustn't stop the other jobs' cleanup
-                $pkJob['SlotReleased'] = $true
                 try { if ($pkJob['Proc']) { $pkJob['Proc'].Dispose() } } catch { }   # the job is over either way
             }
         }

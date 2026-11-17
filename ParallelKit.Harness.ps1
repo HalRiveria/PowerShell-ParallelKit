@@ -3453,6 +3453,29 @@ Test-Assert ((Get-Command Invoke-PkProcessDispatch).Parameters['PollCallback'].A
 Reset-Harness
 Write-Host ""
 
+# ==============================================================================
+Write-Host "=== AL: a job is marked done before its shared slot is released ===" -ForegroundColor Cyan
+# Released first, a stop landing before the mark has the teardown release the
+# slot again, leaving a shared budget one above its limit. The window is one
+# statement wide, too narrow to hit from a test, so this reads the dispatcher's
+# code: the statement right before each `if ($pkIsSharedBudget) { ...Release() }`
+# marks the job done (SlotReleased set, or $pkStarting cleared on a failed start).
+$slotCoreAst = & (Get-Module ParallelKit) { (Get-Command Invoke-PkProcessDispatchCore).ScriptBlock.Ast }
+$slotReleases = @($slotCoreAst.FindAll({ param($a) $a -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and $a.Member.Extent.Text -eq 'Release' -and $a.Expression.Extent.Text -eq '$pkMaxConcurrent' }, $true))
+$slotMarkedFirst = 0
+foreach ($slotCall in $slotReleases) {
+    $slotIf = $slotCall.Parent
+    while ($null -ne $slotIf -and -not ($slotIf -is [System.Management.Automation.Language.IfStatementAst] -and $slotIf.Clauses[0].Item1.Extent.Text -eq '$pkIsSharedBudget')) { $slotIf = $slotIf.Parent }
+    if ($null -eq $slotIf -or $slotIf.Parent -isnot [System.Management.Automation.Language.StatementBlockAst]) { continue }
+    $slotSiblings = $slotIf.Parent.Statements
+    $slotIndex = $slotSiblings.IndexOf($slotIf)
+    if ($slotIndex -lt 1) { continue }
+    $slotBefore = $slotSiblings[$slotIndex - 1].Extent.Text
+    if ($slotBefore -eq '$pkJob[''SlotReleased''] = $true' -or $slotBefore -eq '$pkStarting = $null') { $slotMarkedFirst++ }
+}
+Test-Assert ($slotReleases.Count -gt 0 -and $slotMarkedFirst -eq $slotReleases.Count) ("every shared-slot release comes after its job is marked done (" + $slotMarkedFirst + " of " + $slotReleases.Count + ")")
+Write-Host ""
+
 Set-PkMessageHandler -Handler $null
 Reset-PkAbortState
 
