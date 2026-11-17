@@ -99,7 +99,7 @@ Dot-source it. It loads itself as an in-memory module named `ParallelKit`: nothi
 
 Its public functions are imported globally, so they stay available for the rest of that PowerShell session, and a `.GetNewClosure()` block can call them however your script was started. Its internal helpers stay inside the module.
 
-`Initialize-ParallelKit` is optional. It registers the Ctrl+C handler, sets up child-process cleanup and sizes the thread pool up front; the engines set up what they need on first use either way. It returns an object with `AbortHandler`, `ChildProcessJob` and `ThreadPool`, each `$true` if that part worked (a failed abort handler or child-process cleanup also prints a warning).
+`Initialize-ParallelKit` is optional. It registers the Ctrl+C handler, sets up child-process cleanup and sizes the thread pool up front; the engines set up what they need on first use either way. It returns an object with `AbortHandler`, `ChildProcessJob` and `ThreadPool`, each `$true` if that part worked (a failed abort handler or child-process cleanup also prints a warning), `Version`, the kit's version, and `StartMode`, how the kit starts programs here: `CreatedInJob` (inside the Job Object, the normal case), `AddedToJob` (started, then added to it just after) or `NoJob` (no cleanup if PowerShell is killed). It's the default for the session, not a promise for every program: one whose start can't be set up inside the Job Object falls back to `AddedToJob`, with a warning.
 
 Each public function has built-in help: `Get-Help Invoke-PkProcessBatch -Full` shows its parameters, their defaults, what it returns and an example.
 
@@ -394,7 +394,7 @@ Inside `Invoke-PkRun`, no new ones start, and the running ones get up to 60 seco
 
 **And if the script is killed outright, from Task Manager say?**
 
-The programs it started are killed with it, through a Windows Job Object. There's no waiting period and no cleanup callback in that case, so partial output files can be left behind. Each program is created inside the Job Object, so anything it starts is in it too, however soon.
+The programs it started are killed with it, through a Windows Job Object. There's no waiting period and no cleanup callback in that case, so partial output files can be left behind. Each program is created inside the Job Object, so anything it starts is in it too, however soon. If the kit can't do that on some system (it relies on a private part of .NET), it starts the program and adds it to the Job Object just after, and warns once: a child the program starts in that moment can escape. `Initialize-ParallelKit`'s `StartMode` says which way it works.
 
 **Can I show progress?**
 
@@ -422,7 +422,7 @@ It was built with Claude Code, as the top of this page says. The worker rules an
 
 ## Bugs and questions
 
-Open an [issue](https://github.com/HalRiveria/PowerShell-ParallelKit/issues) with what you ran, what happened, and your Windows and PowerShell versions (`$PSVersionTable`).
+Open an [issue](https://github.com/HalRiveria/PowerShell-ParallelKit/issues) with what you ran, what happened, your Windows and PowerShell versions (`$PSVersionTable`), and what `Initialize-ParallelKit` returns.
 
 ## License
 
