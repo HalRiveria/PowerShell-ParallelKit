@@ -4156,6 +4156,56 @@ foreach ($njCase in 'two jobs', 'job then null') {
 }
 Write-Host ""
 
+Write-Host "=== AU: time limits that can't work are refused up front ===" -ForegroundColor Cyan
+# NaN and +Infinity for -TimeoutSeconds acted as no limit; a negative wait
+# either waited until the program (or the leftover child holding its output)
+# ended, defeating the parameter, or failed later with .NET's own message.
+# Each must be refused before anything starts, naming the command and the
+# parameter. 0 stays meaningful: no limit, or don't wait.
+Reset-Harness
+$tlJob = @{ FilePath = $cmdExe; Arguments = '/d /c exit 0' }
+$tlDispatch = @{
+    MaxConcurrent = 1
+    GroupProvider = { return $null }
+    JobBuilder    = { param($g) return @() }
+    JobFinalize   = { param($job, $pending) }
+}
+$tlCases = [ordered]@{
+    'Invoke-PkProcessBatch -TimeoutSeconds NaN'          = @{ Expect = 'Invoke-PkProcessBatch: -TimeoutSeconds'; Run = { $null = Invoke-PkProcessBatch -Commands @($tlJob) -TimeoutSeconds ([double]::NaN) } }
+    'Invoke-PkProcessBatch -TimeoutSeconds Infinity'     = @{ Expect = 'Invoke-PkProcessBatch: -TimeoutSeconds'; Run = { $null = Invoke-PkProcessBatch -Commands @($tlJob) -TimeoutSeconds ([double]::PositiveInfinity) } }
+    'Invoke-PkProcessDispatch -TimeoutSeconds NaN'       = @{ Expect = 'Invoke-PkProcessDispatch: -TimeoutSeconds'; Run = { $null = Invoke-PkProcessDispatch @tlDispatch -TimeoutSeconds ([double]::NaN) } }
+    'Invoke-PkProcessDispatch -TimeoutSeconds Infinity'  = @{ Expect = 'Invoke-PkProcessDispatch: -TimeoutSeconds'; Run = { $null = Invoke-PkProcessDispatch @tlDispatch -TimeoutSeconds ([double]::PositiveInfinity) } }
+    'Invoke-PkProcessBatch -AbortTimeoutSeconds -5'      = @{ Expect = 'Invoke-PkProcessBatch: -AbortTimeoutSeconds'; Run = { $null = Invoke-PkProcessBatch -Commands @($tlJob) -AbortTimeoutSeconds -5 } }
+    'Invoke-PkProcessDispatch -AbortTimeoutSeconds -5'   = @{ Expect = 'Invoke-PkProcessDispatch: -AbortTimeoutSeconds'; Run = { $null = Invoke-PkProcessDispatch @tlDispatch -AbortTimeoutSeconds -5 } }
+    'Invoke-PkRunspaceJobs -DrainTimeoutSeconds -5'      = @{ Expect = 'Invoke-PkRunspaceJobs: -DrainTimeoutSeconds'; Run = { $null = Invoke-PkRunspaceJobs -WorkerScript { param($Id) $Id } -JobParams @(@{ Id = 1 }) -MaxParallel 1 -DrainTimeoutSeconds -5 } }
+    'Invoke-PkProcessWithTimeout -StreamTimeoutMs -1'    = @{ Expect = 'Invoke-PkProcessWithTimeout: -StreamTimeoutMs'; Run = { $null = Invoke-PkProcessWithTimeout -FilePath $cmdExe -Arguments '/d /c exit 0' -StreamTimeoutMs -1 } }
+    'Complete-PkProcess -StreamTimeoutMs -1'             = @{ Expect = 'Complete-PkProcess: -StreamTimeoutMs'; Started = $true; Run = { param($s) $null = Complete-PkProcess $s -StreamTimeoutMs -1 } }
+    'Wait-PkProcess -TimeoutMs -1'                       = @{ Expect = 'Wait-PkProcess: -TimeoutMs'; Started = $true; Run = { param($s) $null = Wait-PkProcess -Process $s['Proc'] -TimeoutMs -1 } }
+}
+foreach ($tlName in $tlCases.Keys) {
+    $tlCase = $tlCases[$tlName]
+    $tlError = $null
+    $tlStarted = $null
+    if ($tlCase.ContainsKey('Started')) { $tlStarted = Start-PkProcess -FilePath $cmdExe -Arguments '/d /c exit 0' }
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    try { & $tlCase.Run $tlStarted } catch { $tlError = $_.ToString() }
+    $sw.Stop()
+    if ($null -ne $tlStarted) { $null = Complete-PkProcess $tlStarted -Dispose }
+    Test-Assert ($null -ne $tlError -and $tlError.StartsWith($tlCase.Expect + ' must be') -and $sw.Elapsed.TotalSeconds -lt 2) ($tlName + " is refused up front with a clear message (error: " + $tlError + ")")
+}
+# 0 is still taken where it means something: don't wait.
+$s = Start-PkProcess -FilePath $cmdExe -Arguments '/d /c exit 0'
+$tlZero = $null
+try {
+    $null = Wait-PkProcess -Process $s['Proc'] -TimeoutMs 0
+    $null = Wait-PkProcess -Process $s['Proc'] -TimeoutMs 5000
+    $null = Complete-PkProcess $s -StreamTimeoutMs 0 -Dispose
+    $null = Invoke-PkProcessBatch -Commands @($tlJob) -AbortTimeoutSeconds 0 -TimeoutSeconds 0
+    $null = Invoke-PkRunspaceJobs -WorkerScript { param($Id) $Id } -JobParams @(@{ Id = 1 }) -MaxParallel 1 -DrainTimeoutSeconds 0
+} catch { $tlZero = $_.ToString() }
+Test-Assert ($null -eq $tlZero) ("0 is still accepted for -TimeoutMs, -StreamTimeoutMs, -AbortTimeoutSeconds, -DrainTimeoutSeconds and -TimeoutSeconds (error: " + $tlZero + ")")
+Write-Host ""
+
 Set-PkMessageHandler -Handler $null
 Reset-PkAbortState
 
