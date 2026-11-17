@@ -1033,7 +1033,9 @@ function Stop-PkProcessTree {
         [System.Diagnostics.Process[]]$Process
     )
     $alive = [System.Collections.Generic.List[System.Diagnostics.Process]]::new()
-    foreach ($p in $Process) { if ($null -ne $p -and -not $p.HasExited) { $alive.Add($p) } }
+    # A disposed Process reads $null for HasExited and Id (no throw), and an
+    # empty /PID fails taskkill for the whole list, so it's left out.
+    foreach ($p in $Process) { if ($null -ne $p -and $p.HasExited -eq $false -and $null -ne $p.Id) { $alive.Add($p) } }
     if ($alive.Count -eq 0) { return $false }
     $killed = $false
     $pidArgs = foreach ($p in $alive) { '/PID ' + $p.Id }
@@ -1069,7 +1071,11 @@ function Stop-PkProcessTree {
             try { $p.Kill(); $killed = $true } catch { }  # it exited between the check and the kill
         }
     }
-    if ($killed) { foreach ($p in $alive) { $null = $p.WaitForExit(5000) } }
+    if ($killed) {
+        foreach ($p in $alive) {
+            try { $null = $p.WaitForExit(5000) } catch { }  # disposed by its owner meanwhile; one failed wait mustn't skip the others
+        }
+    }
     return $killed
 }
 
@@ -1713,9 +1719,12 @@ function Invoke-PkProcessDispatchCore {
                 $pkCbDone = $false
                 $null = do { & $pkJobFinalize $pkJob $pkPending; $pkCbDone = $true } while ($false)
                 if (-not $pkCbDone) { Write-PkCallbackLoopWarning -PkName '-JobFinalize' -PkContext $pkCallbackContext }
-                try { if ($pkJob['Proc']) { $pkJob['Proc'].Dispose() } } catch { }   # a failed Dispose can't affect the result already taken
-                if ($pkIsSharedBudget) { $null = $pkMaxConcurrent.Release() }
+                # Marked done first: a stop landing after the Release or the
+                # Dispose would otherwise have the teardown release the slot a
+                # second time and treat the disposed job as still running.
                 $pkJob['SlotReleased'] = $true
+                if ($pkIsSharedBudget) { $null = $pkMaxConcurrent.Release() }
+                try { if ($pkJob['Proc']) { $pkJob['Proc'].Dispose() } } catch { }   # a failed Dispose can't affect the result already taken
                 # Whatever JobFinalize queued (a retry, follow-ups) joins its group
                 # here, read off the queue rather than a returned flag. Only when the
                 # queue grew: walking it for every job is slow on a large batch.
@@ -1774,9 +1783,9 @@ function Invoke-PkProcessDispatchCore {
                     $pkCbDone = $false
                     $null = do { & $pkJobFinalize $pkJob $pkPending; $pkCbDone = $true } while ($false)
                     if (-not $pkCbDone) { Write-PkCallbackLoopWarning -PkName '-JobFinalize' -PkContext $pkCallbackContext }
-                    try { if ($pkJob['Proc']) { $pkJob['Proc'].Dispose() } } catch { }
+                    $pkJob['SlotReleased'] = $true   # first: see the main poll pass
                     if ($pkIsSharedBudget) { $null = $pkMaxConcurrent.Release() }
-                    $pkJob['SlotReleased'] = $true
+                    try { if ($pkJob['Proc']) { $pkJob['Proc'].Dispose() } } catch { }   # a failed Dispose can't affect the result already taken
                     # Whatever JobFinalize queued (a retry, follow-ups) joins its group
                     # here, read off the queue rather than a returned flag. Only when the
                     # queue grew: walking it for every job is slow on a large batch.
@@ -1829,9 +1838,9 @@ function Invoke-PkProcessDispatchCore {
                     $pkCbDone = $false
                     $null = do { & $pkJobFinalize $pkJob $pkPending; $pkCbDone = $true } while ($false)
                     if (-not $pkCbDone) { Write-PkCallbackLoopWarning -PkName '-JobFinalize' -PkContext $pkCallbackContext }
-                    try { if ($pkJob['Proc']) { $pkJob['Proc'].Dispose() } } catch { }
+                    $pkJob['SlotReleased'] = $true   # first: see the main poll pass
                     if ($pkIsSharedBudget) { $null = $pkMaxConcurrent.Release() }
-                    $pkJob['SlotReleased'] = $true
+                    try { if ($pkJob['Proc']) { $pkJob['Proc'].Dispose() } } catch { }   # a failed Dispose can't affect the result already taken
                     # Whatever JobFinalize queued (a retry, follow-ups) joins its group
                     # here, read off the queue rather than a returned flag. Only when the
                     # queue grew: walking it for every job is slow on a large batch.
@@ -1875,9 +1884,9 @@ function Invoke-PkProcessDispatchCore {
             foreach ($pkJob in $pkRunning) {
                 try { if ($pkJob['Proc']) { $null = $pkJob['Proc'].WaitForExit(5000) } } catch { }
                 try { $null = Invoke-PkCallback -PkCallback $pkJobAbortCleanup -PkArgs @(,$pkJob) -PkName '-JobAbortCleanup' -PkContext $pkCallbackContext } catch { }
-                try { if ($pkJob['Proc']) { $pkJob['Proc'].Dispose() } } catch { }
                 if ($pkIsSharedBudget) { try { $null = $pkMaxConcurrent.Release() } catch { } }
                 $pkJob['SlotReleased'] = $true
+                try { if ($pkJob['Proc']) { $pkJob['Proc'].Dispose() } } catch { }
             }
         }
     }
@@ -1885,10 +1894,10 @@ function Invoke-PkProcessDispatchCore {
     } finally {
         if (-not $pkLoopDone) {
             # Best-effort teardown after an error or a stop (an error carries
-            # on up by itself). Jobs with SlotReleased set are already done and
-            # disposed, and a disposed Process makes Stop-PkProcessTree throw
-            # part-way. Same per-job steps as the force-stop above; keep the
-            # two in step.
+            # on up by itself). Jobs with SlotReleased set are already done:
+            # their slot is released and their process disposed or about to
+            # be. Same per-job steps as the force-stop above; keep the two in
+            # step.
             $pkTearDown = [System.Collections.Generic.List[hashtable]]::new()
             foreach ($pkJob in $pkRunning) { if (-not $pkJob['SlotReleased']) { $pkTearDown.Add($pkJob) } }
             if ($null -ne $pkStarting -and -not $pkTearDown.Contains($pkStarting)) { $pkTearDown.Add($pkStarting) }

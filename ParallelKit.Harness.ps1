@@ -3006,6 +3006,49 @@ try {
 $stopLeft = Get-LimitPingCount 47
 Stop-StrayPings 47
 Test-Assert ($stopProblem -like '*finalize failed*' -and $stopLeft -eq 0) ("an error after a job was finalized in the same pass still kills the running ones (" + $stopLeft + " left, problem: " + $stopProblem + ")")
+
+# A -JobFinalize that disposes the job's process and then throws: the
+# teardown's kill list then holds a disposed Process, whose HasExited and Id
+# read as $null. It mustn't spoil the kill for the jobs still running.
+Reset-Harness
+$dispJobs = @(1..3 | ForEach-Object { @{ Name = ('p' + $_); FilePath = $cmdExe; Arguments = ('/c ""' + $pingExe + '" -n 51 127.0.0.1"') } })
+$dispJobs += @{ Name = 'a'; FilePath = $cmdExe; Arguments = '/c exit 0' }
+$dispFeed = @{ Given = $false }
+$dispWaitStart = [System.Diagnostics.Stopwatch]::StartNew()
+$dispProblem = $null
+try {
+    $null = Invoke-PkProcessDispatch -MaxConcurrent 4 `
+        -GroupProvider { if ($dispFeed.Given) { return $null }; $dispFeed.Given = $true; return 'g' }.GetNewClosure() `
+        -JobBuilder { param($g) return $dispJobs }.GetNewClosure() `
+        -JobPollCompleted {
+            param($job)
+            # 'a' reports done once the three pings run (bounded, so a ping
+            # that never starts fails the test instead of hanging it).
+            if ($job['Name'] -ne 'a') { return $false }
+            return ($job['Proc'].HasExited -and ((Get-LimitPingCount 51) -ge 3 -or $dispWaitStart.Elapsed.TotalSeconds -gt 15))
+        }.GetNewClosure() `
+        -JobFinalize { param($job, $q) $null = Complete-PkProcess -Job $job -Dispose; throw "finalize failed after dispose" }
+} catch { $dispProblem = [string]$_ }
+$dispLeft = Get-LimitPingCount 51
+Stop-StrayPings 51
+Test-Assert ($dispProblem -like '*finalize failed after dispose*' -and $dispLeft -eq 0) ("a -JobFinalize that disposes its process and throws still has the running jobs killed (" + $dispLeft + " of 3 left, problem: " + $dispProblem + ")")
+
+# The same directly: a disposed process in the list doesn't stop the live
+# tree beside it being killed.
+$dispGone = Start-PkProcess -FilePath $cmdExe -Arguments '/c exit 0'
+$null = Wait-PkProcess -Process $dispGone.Proc -TimeoutMs 5000
+$dispGone.Proc.Dispose()
+$dispLive = Start-PkProcess -FilePath $cmdExe -Arguments ('/c ""' + $pingExe + '" -n 53 127.0.0.1"')
+$dispWait = [System.Diagnostics.Stopwatch]::StartNew()
+while ((Get-LimitPingCount 53) -lt 1 -and $dispWait.Elapsed.TotalSeconds -lt 5) { Start-Sleep -Milliseconds 100 }
+$dispThrew = $null
+$dispKilled = $false
+try { $dispKilled = Stop-PkProcessTree -Process @($dispGone.Proc, $dispLive.Proc) } catch { $dispThrew = [string]$_ }
+$dispLeft = Get-LimitPingCount 53
+Stop-StrayPings 53
+Test-Assert ($null -eq $dispThrew -and $dispKilled -and $dispLeft -eq 0 -and $dispLive.Proc.HasExited) ("Stop-PkProcessTree kills a live tree listed beside a disposed process (" + $dispLeft + " left, returned " + $dispKilled + ", threw: " + $dispThrew + ")")
+try { if (-not $dispLive.Proc.HasExited) { $dispLive.Proc.Kill() } } catch { }  # cleanup after a failure; already-exited is fine
+$dispLive.Proc.Dispose()
 Reset-Harness
 Write-Host ""
 
