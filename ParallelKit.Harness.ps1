@@ -1417,6 +1417,20 @@ $killedPair = $false
 if ($null -ne $childProc) { $killedPair = Stop-PkProcessTree -Process @($parentJob.Proc, $childProc) }
 Test-Assert ($null -ne $childProc -and $killedPair -and $parentJob.Proc.HasExited -and $childProc.HasExited) ("Stop-PkProcessTree kills a parent and its child passed together, and says so (found child: " + ($null -ne $childProc) + ", returned: " + $killedPair + ")")
 $parentJob.Proc.Dispose(); if ($null -ne $childProc) { $childProc.Dispose() }
+# A large kill: taskkill prints a line per process it kills (three per
+# `cmd /c ping` tree). Left unread, that fills its output pipe and taskkill
+# blocks until the 10 s wait gives up, leaving most children running.
+$many = @(1..40 | ForEach-Object { Start-PkProcess -FilePath $cmdExe -Arguments (& $nestedPing 49) })
+$waitMany = [System.Diagnostics.Stopwatch]::StartNew()
+while ((Get-HarnessPingCount 49) -lt 40 -and $waitMany.Elapsed.TotalSeconds -lt 15) { Start-Sleep -Milliseconds 200 }
+$startedMany = Get-HarnessPingCount 49
+$swMany = [System.Diagnostics.Stopwatch]::StartNew()
+$killedMany = Stop-PkProcessTree -Process @($many | ForEach-Object { $_.Proc })
+$swMany.Stop()
+$leftMany = Get-HarnessPingCount 49
+Test-Assert ($startedMany -eq 40 -and $killedMany -and $leftMany -eq 0 -and $swMany.Elapsed.TotalSeconds -lt 5) ("Stop-PkProcessTree kills 40 trees in one call, quickly, with none left (started " + $startedMany + ", " + [Math]::Round($swMany.Elapsed.TotalSeconds, 1) + "s, " + $leftMany + " left)")
+foreach ($j in $many) { try { if (-not $j.Proc.HasExited) { $j.Proc.Kill() } } catch { }; $j.Proc.Dispose() }  # cleanup after a failure; already-exited is fine
+Get-CimInstance Win32_Process -Filter "Name = 'PING.EXE'" | Where-Object { $_.CommandLine -like '*-n 49 127.0.0.1*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 Test-Assert ($batch.Aborted -and $batch.ForceKilledCount -eq 1 -and (Get-HarnessPingCount 43) -eq 0) ("dispatch: the force-stop after an abort kills the program's children too (aborted=" + $batch.Aborted + ", force-killed=" + $batch.ForceKilledCount + ")")
 Reset-PkAbortState
 $threw = $false
