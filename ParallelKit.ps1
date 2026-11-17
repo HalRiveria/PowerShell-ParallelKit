@@ -2748,9 +2748,10 @@ function Invoke-PkRunspaceJobs {
     # Check the worker code and job values before starting. On unless you pass
     # -CheckWorkerSafety:$false, whatever Get-Help says the default is.
     # .OUTPUTS
-    # An object with ForceStoppedCount, CrashedCount, Aborted, Crashed (one
-    # @{ Job; Error } entry per worker that threw) and Errors (one @{ Job; Error }
-    # entry per non-terminating error a worker wrote).
+    # An object with ForceStoppedCount (workers an abort stopped waiting for;
+    # one stuck in a .NET call keeps running), CrashedCount, Aborted, Crashed
+    # (one @{ Job; Error } entry per worker that threw) and Errors (one
+    # @{ Job; Error } entry per non-terminating error a worker wrote).
     # .EXAMPLE
     # Invoke-PkRunspaceJobs -MaxParallel 4 -JobParams @(@{ Id = 1 }, @{ Id = 2 }) -WorkerScript { param($Id) $Id * 2 } -ResultHandler { param($r) Write-Host $r }
     param(
