@@ -1561,7 +1561,8 @@ function Complete-PkProcess {
     # .DESCRIPTION
     # A program that exited can still have its output held open by a program it
     # started, so reading the output is time-limited too; StreamTimedOut says when
-    # that limit was hit.
+    # that limit was hit. The stream it gave up on comes back $null: its output
+    # is missing, not cut short.
     # .PARAMETER Job
     # What Start-PkProcess returned, or a dispatcher job with the same keys.
     # .PARAMETER StreamTimeoutMs

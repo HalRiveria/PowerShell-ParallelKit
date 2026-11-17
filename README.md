@@ -143,7 +143,7 @@ Programs run in your current location (`Get-Location`) unless a command says oth
 - `StartError` is set when the program couldn't be started (not found, say). Every command is still tried and gets its own result, but repeats of the same failure for the same program print once, with a count at the end.
 - `Aborted` is `$true` for a command an abort killed or kept from starting.
 - `TimedOut` is `$true` for a program `-TimeoutSeconds` killed.
-- `StreamTimedOut` means the output read gave up 15 seconds after the program exited, which only happens when a program it started is still holding the output open. The stream it gave up on comes back empty: what the program wrote there is missing, not cut short. `StreamError` means a read failed, and that stream comes back empty too.
+- `StreamTimedOut` means the output read gave up 15 seconds after the program exited, which only happens when a program it started is still holding the output open. The stream it gave up on comes back `$null`: what the program wrote there is missing, not cut short. `StreamError` means a read failed, and that stream comes back `$null` too.
 
 `Results` is in the order commands finished, not the order you gave them. Use `Command` to match them up, or give each command your own key (`Index = $n`) and sort on it: `$batch.Results | Sort-Object { $_.Command.Index }`.
 
