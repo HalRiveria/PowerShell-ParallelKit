@@ -2936,9 +2936,9 @@ function Invoke-PkRunspaceJobs {
                     # hashtable before its answer) is ignored, with a warning.
                     $nextRaw = Invoke-PkCallback -PkCallback $NextJobProvider -PkName '-NextJobProvider' -PkContext $pkCallbackContext
                     $nextJob = $null
-                    $rawItems = @($nextRaw)   # @($null) is one $null: the end
+                    $rawItems = @($nextRaw)   # empty when it output nothing: the end
                     $jobIndex = -1
-                    if ($null -ne $rawItems[-1]) {
+                    if ($rawItems.Count -gt 0 -and $null -ne $rawItems[-1]) {
                         for ($rawIndex = $rawItems.Count - 1; $rawIndex -ge 0 -and $jobIndex -lt 0; $rawIndex--) {
                             if ($rawItems[$rawIndex] -is [hashtable]) { $jobIndex = $rawIndex }
                         }
