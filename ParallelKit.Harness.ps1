@@ -4092,6 +4092,70 @@ foreach ($rsName in 'ResultHandler', 'PollCallback', 'NextJobProvider') {
 }
 Write-Host ""
 
+Write-Host "=== AT: a stray value next to a callback's answer ===" -ForegroundColor Cyan
+# A value a callback lets out before its answer (an ArrayList.Add index, say)
+# reaches the kit together with the answer, as one array. Each callback below
+# leaks one; the kit must still read the answer it meant.
+
+# -GroupReleaseCheck: `$log.Add($g); return $false` must not release the
+# group. Only zero-job groups are held, and with -MaxQueueAhead 1 the next
+# group is pulled only once the held one is released, on the third check.
+Reset-Harness
+$rc = @{ Given = 0; Checks = 0; PulledAfter = -1 }
+$rcLog = [System.Collections.ArrayList]::new()
+$rcRun = Invoke-PkProcessDispatch -MaxConcurrent 1 -MaxQueueAhead 1 `
+    -GroupProvider { if ($rc.Given -ge 2) { return $null }; $rc.Given++; if ($rc.Given -eq 2) { $rc.PulledAfter = $rc.Checks }; return ('g' + $rc.Given) }.GetNewClosure() `
+    -JobBuilder { param($g) return @() } `
+    -JobFinalize { param($job, $pending) } `
+    -GroupReleaseCheck { param($g) if ($g -ne 'g1') { return $true }; $rc.Checks++; $rcLog.Add($g); return ($rc.Checks -ge 3) }.GetNewClosure()
+Test-Assert ($rc.PulledAfter -eq 3 -and $rcRun.GroupResults.Count -eq 2) ("a stray value from -GroupReleaseCheck doesn't release a held group: only its last value counts (next group pulled after check " + $rc.PulledAfter + " of 3)")
+
+# -GroupProvider: `$log.Add('end'); return $null` reaches the dispatcher as
+# @(<index>, $null). That's the end, with a warning, not one more group
+# (which asked again forever). A runaway is cut off after 10 calls.
+Reset-Harness
+$gp = @{ Given = 0; Calls = 0 }
+$gpLog = [System.Collections.ArrayList]::new()
+$gpError = $null
+try {
+    $gpRun = Invoke-PkProcessDispatch -MaxConcurrent 1 `
+        -GroupProvider { $gp.Calls++; if ($gp.Calls -gt 10) { throw 'pk-test: runaway -GroupProvider' }; if ($gp.Given -ge 2) { $gpLog.Add('end'); return $null }; $gp.Given++; return ('g' + $gp.Given) }.GetNewClosure() `
+        -JobBuilder { param($g) return @{ FilePath = $cmdExe; Arguments = '/d /c exit 0' } }.GetNewClosure() `
+        -JobFinalize { param($job, $pending) $null = Complete-PkProcess -Job $job }
+} catch { $gpError = [string]$_ }
+$gpGroups = ''
+if ($null -eq $gpError) { $gpGroups = (@($gpRun.GroupResults | ForEach-Object { [string]$_.GroupInfo }) -join ',') }
+$gpWarned = @($script:messages | Where-Object { $_.Message -like '*-GroupProvider*' -and $_.Level -eq 'Warn' }).Count
+Test-Assert ($null -eq $gpError -and $gpGroups -eq 'g1,g2' -and $gp.Calls -eq 3 -and $gpWarned -eq 1) ("output ending in `$null from -GroupProvider ends the groups, with a warning (groups: " + $gpGroups + ", calls: " + $gp.Calls + ", warnings: " + $gpWarned + ", error: " + $gpError + ")")
+
+# A list as one group, written as the README shows it.
+Reset-Harness
+$gl = @{ Given = $false }
+$glSeen = [System.Collections.Generic.List[object]]::new()
+$null = Invoke-PkProcessDispatch -MaxConcurrent 1 `
+    -GroupProvider { if ($gl.Given) { return $null }; $gl.Given = $true; return ,@('a', 'b', 'c') }.GetNewClosure() `
+    -JobBuilder { param($g) $glSeen.Add($g); return @() }.GetNewClosure() `
+    -JobFinalize { param($job, $pending) }
+Test-Assert ($glSeen.Count -eq 1 -and $glSeen[0] -is [array] -and ($glSeen[0] -join ',') -eq 'a,b,c' -and $script:messages.Count -eq 0) ("-GroupProvider returning ,@('a', 'b', 'c') gives one group holding the list, without a warning (" + $glSeen.Count + " group(s))")
+
+# -NextJobProvider: only the last value decides. Two hashtables run the
+# second, with a warning about the first; a hashtable let out before
+# `return $null` isn't run: the run ends, with a warning.
+foreach ($njCase in 'two jobs', 'job then null') {
+    Reset-Harness
+    $nj = @{ Calls = 0 }
+    $njRan = [System.Collections.Generic.List[int]]::new()
+    $njProvider = { $nj.Calls++; if ($nj.Calls -gt 1) { return $null }; @{ Id = 1 }; return @{ Id = 2 } }.GetNewClosure()
+    # A second call (only reached if the first didn't end the run) gives job 3, then the end.
+    if ($njCase -eq 'job then null') { $njProvider = { $nj.Calls++; if ($nj.Calls -gt 2) { return $null }; if ($nj.Calls -eq 2) { return @{ Id = 3 } }; @{ Id = 1 }; return $null }.GetNewClosure() }
+    $null = Invoke-PkRunspaceJobs -WorkerScript { param([int]$Id) $Id } -NextJobProvider $njProvider -MaxParallel 1 -ResultHandler { param($r) $njRan.Add($r) }.GetNewClosure()
+    $njWarned = @($script:messages | Where-Object { $_.Message -like '*-NextJobProvider*' -and $_.Level -eq 'Warn' }).Count
+    $njExpected = '2'
+    if ($njCase -eq 'job then null') { $njExpected = '' }
+    Test-Assert (($njRan -join ',') -eq $njExpected -and $nj.Calls -eq (2 - [int]($njCase -eq 'job then null')) -and $njWarned -eq 1) ("-NextJobProvider, " + $njCase + ": only the last value counts, the other is warned about (ran: [" + ($njRan -join ',') + "], calls: " + $nj.Calls + ", warnings: " + $njWarned + ")")
+}
+Write-Host ""
+
 Set-PkMessageHandler -Handler $null
 Reset-PkAbortState
 
