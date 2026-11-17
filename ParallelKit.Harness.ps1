@@ -3789,6 +3789,309 @@ $anFound = (Get-HarnessSilentCatches -Source ($anSource + "`r`nfunction Get-PkBr
 Test-Assert ($anFound.Count -eq 2 -and $anFound[0] -match 'Get-PkBroken' -and $anFound[1] -match 'try \{ 1 \} catch \{$') ("an empty catch with no reason is caught, on one line or several (" + ($anFound -join '; ') + ")")
 Write-Host ""
 
+Write-Host "=== AO: output held open by a leftover child sets StreamTimedOut ===" -ForegroundColor Cyan
+# cmd exits at once, but the ping it starts with `start /b` keeps the output
+# pipe open about 3 s longer.
+Reset-Harness
+$heldArgs = '/d /c echo before& start /b ping -n 4 127.0.0.1 >nul& echo after'
+$s = Start-PkProcess -FilePath $cmdExe -Arguments $heldArgs
+$null = $s['Proc'].WaitForExit(10000)
+$sw = [System.Diagnostics.Stopwatch]::StartNew()
+$r = Complete-PkProcess $s -StreamTimeoutMs 1000 -Dispose
+$sw.Stop()
+Test-Assert ($r.StreamTimedOut -and $r.ExitCode -eq 0 -and $null -eq $r.StreamError -and $sw.Elapsed.TotalSeconds -ge 0.9 -and $sw.Elapsed.TotalSeconds -lt 3) ("Complete-PkProcess sets StreamTimedOut when a leftover child holds the output past -StreamTimeoutMs (" + [math]::Round($sw.Elapsed.TotalSeconds, 1) + "s, StreamTimedOut=" + $r.StreamTimedOut + ", ExitCode=" + $r.ExitCode + ")")
+$sw = [System.Diagnostics.Stopwatch]::StartNew()
+$r = Invoke-PkProcessWithTimeout -FilePath $cmdExe -Arguments $heldArgs -StreamTimeoutMs 1000
+$sw.Stop()
+Test-Assert ($r.StreamTimedOut -and $r.ExitCode -eq 0 -and $null -eq $r.StreamError -and $sw.Elapsed.TotalSeconds -lt 3) ("so does Invoke-PkProcessWithTimeout -StreamTimeoutMs (" + [math]::Round($sw.Elapsed.TotalSeconds, 1) + "s, StreamTimedOut=" + $r.StreamTimedOut + ")")
+Write-Host ""
+
+Write-Host "=== AP: repeated runs don't leak handles, threads or runspaces ===" -ForegroundColor Cyan
+# Counted after a warm-up: the first runs grow the thread pool and JIT
+# caches (on 5.1, handles climb about 100 over the first 20 runspace runs,
+# then hold). After that the handle count still jumps by a few hundred and
+# back between runs, on both runtimes and with a bare RunspacePool too, so
+# one reading before and one after isn't enough: this compares the lowest
+# reading over the last 20 warm-up runs with the lowest over the last 20
+# measured ones. A leak raises that floor; the jumps don't. A leak of one
+# handle, thread or runspace per run shows well past these margins. For the
+# runspace engine the handle count isn't checked: it can sit 250-450 higher
+# for 10-50 runs at a time, the same with a bare RunspacePool, which hides
+# any leak worth looking for. Its thread and runspace counts are exact, and
+# catch a pool or runspace left open.
+function Get-HarnessResourceCount {
+    [System.GC]::Collect(); [System.GC]::WaitForPendingFinalizers(); [System.GC]::Collect()
+    $me = [System.Diagnostics.Process]::GetCurrentProcess()
+    $count = @{ Handles = $me.HandleCount; Threads = $me.Threads.Count; Runspaces = @(Get-Runspace).Count }
+    $me.Dispose()
+    return $count
+}
+function Measure-HarnessGrowth {
+    param([scriptblock]$Run, [int]$Warmup, [int]$Measured)
+    $floors = @{}
+    foreach ($phase in 'warm-up', 'measured') {
+        $runs = $Warmup
+        if ($phase -eq 'measured') { $runs = $Measured }
+        $floor = $null
+        for ($i = 0; $i -lt $runs; $i++) {
+            & $Run
+            if ($i -ge $runs - 20) {
+                $c = Get-HarnessResourceCount
+                if ($null -eq $floor) { $floor = $c }
+                else { foreach ($k in @($c.Keys)) { if ($c[$k] -lt $floor[$k]) { $floor[$k] = $c[$k] } } }
+            }
+        }
+        $floors[$phase] = $floor
+    }
+    $before = $floors['warm-up']; $after = $floors['measured']
+    return @{ Handles = $after.Handles - $before.Handles; Threads = $after.Threads - $before.Threads; Runspaces = $after.Runspaces - $before.Runspaces }
+}
+$growthCases = [ordered]@{
+    'Start-PkProcess'                          = @{ Measured = 100; Run = { $s = Start-PkProcess -FilePath $cmdExe -Arguments '/d /c exit 0'; $null = Complete-PkProcess $s -Dispose } }
+    'Start-PkProcess, Process.Start fallback'  = @{ Measured = 100; Fallback = $true; Run = { $s = Start-PkProcess -FilePath $cmdExe -Arguments '/d /c exit 0'; $null = Complete-PkProcess $s -Dispose } }
+    'Invoke-PkProcessBatch'                    = @{ Measured = 60; Run = { $null = Invoke-PkProcessBatch -MaxConcurrent 2 -Commands @(@{ FilePath = $cmdExe; Arguments = '/d /c exit 0' }, @{ FilePath = $cmdExe; Arguments = '/d /c exit 0' }) } }
+    'Invoke-PkRunspaceJobs'                    = @{ Measured = 80; SkipHandles = $true; Run = { $null = Invoke-PkRunspaceJobs -WorkerScript { param([int]$Id) $Id } -JobParams @(@{ Id = 1 }, @{ Id = 2 }) -MaxParallel 2 } }
+}
+foreach ($growthName in $growthCases.Keys) {
+    $growthCase = $growthCases[$growthName]
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    if ($growthCase.ContainsKey('Fallback')) { [PkChildProcessJob]::TestUseProcessStart = $true }
+    try { $growth = Measure-HarnessGrowth -Run $growthCase.Run -Warmup 40 -Measured $growthCase.Measured }
+    finally { [PkChildProcessJob]::TestUseProcessStart = $false }
+    $sw.Stop()
+    $growthDetail = " (" + $growth.Handles + " handles, " + $growth.Threads + " threads, " + $growth.Runspaces + " runspaces; " + [math]::Round($sw.Elapsed.TotalSeconds, 1) + "s)"
+    if ($growthCase.ContainsKey('SkipHandles')) {
+        Test-Assert ($growth.Threads -lt 10 -and $growth.Runspaces -le 0) ($growthName + ": " + $growthCase.Measured + " more runs after a warm-up leave threads and runspaces where they were" + $growthDetail)
+    } else {
+        Test-Assert ($growth.Handles -lt 50 -and $growth.Threads -lt 10 -and $growth.Runspaces -le 0) ($growthName + ": " + $growthCase.Measured + " more runs after a warm-up leave handles, threads and runspaces where they were" + $growthDetail)
+    }
+}
+Write-Host ""
+
+Write-Host "=== AQ: killing PowerShell outright leaves no programs running ===" -ForegroundColor Cyan
+# The README's "no orphans": PowerShell killed with Stop-Process -Force runs
+# no cleanup at all, so only the kit's Job Object can end its programs. A
+# child PowerShell starts 3 `cmd /c ping` jobs and is killed; none of the
+# pings may survive. Both start paths: created inside the job, and
+# Process.Start then added to it.
+$killScript = Join-Path $env:TEMP ("pk-hardkill-" + [guid]::NewGuid().ToString("N") + ".ps1")
+[System.IO.File]::WriteAllText($killScript, @'
+param([string]$Kit, [int]$Fallback)
+. $Kit
+# The fallback adds cmd.exe to the job just after starting it, so a child it
+# starts at once could land outside (the race the default path closes): the
+# long ping starts a second later there.
+$pingArgs = '/d /c ping -n 61 127.0.0.1 >nul'
+if ($Fallback) { [PkChildProcessJob]::TestUseProcessStart = $true; $pingArgs = '/d /c ping -n 2 127.0.0.1 >nul& ping -n 61 127.0.0.1 >nul' }
+for ($i = 0; $i -lt 3; $i++) {
+    $j = Start-PkProcess -FilePath cmd.exe -Arguments $pingArgs
+    [Console]::Out.WriteLine($j['Proc'].Id)
+}
+[Console]::Out.WriteLine('READY'); [Console]::Out.Flush()
+Start-Sleep -Seconds 60
+'@)
+try {
+    foreach ($killFallback in 0, 1) {
+        $killArgs = '-NoProfile -ExecutionPolicy Bypass -File "' + $killScript + '" -Kit "' + (Join-Path $PSScriptRoot 'ParallelKit.ps1') + '" -Fallback ' + $killFallback
+        $psi = [System.Diagnostics.ProcessStartInfo]::new($selfExe, $killArgs)
+        $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.CreateNoWindow = $true
+        $killHost = [System.Diagnostics.Process]::Start($psi)
+        $killCmds = @()
+        while ($true) {
+            $lineTask = $killHost.StandardOutput.ReadLineAsync()
+            if (-not $lineTask.Wait(60000)) { break }
+            if ($null -eq $lineTask.Result -or $lineTask.Result -eq 'READY') { break }
+            $killCmds += [int]$lineTask.Result
+        }
+        # Each cmd.exe's ping.exe, once it's running.
+        $killPings = @()
+        foreach ($c in $killCmds) {
+            $p = $null
+            for ($t = 0; $t -lt 160 -and -not $p; $t++) {
+                $p = Get-CimInstance Win32_Process -Filter ("ParentProcessId=" + $c + " AND Name='PING.EXE' AND CommandLine LIKE '%-n 61%'")
+                if (-not $p) { Start-Sleep -Milliseconds 25 }
+            }
+            if ($p) { $killPings += [int]@($p)[0].ProcessId }
+        }
+        Stop-Process -Id $killHost.Id -Force -ErrorAction SilentlyContinue   # already gone if it failed before READY: the assert below reports that
+        $null = $killHost.WaitForExit(10000); $killHost.Dispose()
+        $killLeft = @($killPings + $killCmds)
+        for ($t = 0; $t -lt 30 -and $killLeft.Count -gt 0; $t++) {
+            Start-Sleep -Milliseconds 100
+            $killLeft = @($killLeft | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })
+        }
+        foreach ($id in $killLeft) { Stop-Process -Id $id -Force -ErrorAction SilentlyContinue }
+        $killPath = 'created inside the job'
+        if ($killFallback) { $killPath = 'Process.Start fallback' }
+        Test-Assert ($killPings.Count -eq 3 -and $killLeft.Count -eq 0) ("PowerShell killed outright takes its programs and their children with it, " + $killPath + " (" + $killPings.Count + " of 3 pings seen, " + $killLeft.Count + " still running)")
+    }
+} finally {
+    try { [System.IO.File]::Delete($killScript) } catch { }   # temp file only; best effort
+}
+Write-Host ""
+
+Write-Host "=== AR: both start paths give the same results ===" -ForegroundColor Cyan
+# Creating a program inside the Job Object re-does what Process.Start does
+# (command line, environment, working folder, output encoding, exit code),
+# and Process.Start is the fallback when that can't be used. One table, run
+# both ways, must come back the same.
+$parityExe = Join-Path $env:TEMP ("pk-parity-" + [guid]::NewGuid().ToString("N") + ".exe")
+$paritySrc = [System.IO.Path]::ChangeExtension($parityExe, '.cs')
+[System.IO.File]::WriteAllText($paritySrc, @'
+public static class PkParity {
+    public static int Main(string[] args) {
+        string t = "cwd=" + System.IO.Directory.GetCurrentDirectory() + "\n" + "env=" + System.Environment.GetEnvironmentVariable("PK_HARNESS_PARITY") + "\n";
+        foreach (string a in args) { t += "[" + a + "]\n"; }
+        t += new string(new char[] { (char)0x63, (char)0x61, (char)0x66, (char)0xE9, (char)0x20, (char)0x65E5, (char)0x672C });
+        byte[] b = new System.Text.UTF8Encoding(false).GetBytes(t);
+        System.IO.Stream o = System.Console.OpenStandardOutput();
+        o.Write(b, 0, b.Length); o.Flush();
+        System.Console.Error.Write("args=" + args.Length);
+        return args.Length > 0 ? int.Parse(args[0]) : 0;
+    }
+}
+'@)
+$csc = $null
+try { $csc = Invoke-PkProcessWithTimeout -FilePath $cscExe -Arguments (ConvertTo-PkArgumentString @('/nologo', ('/out:' + $parityExe), $paritySrc)) } catch { Write-Host "  csc.exe failed to run: $_" }
+[System.IO.File]::Delete($paritySrc)
+$compiled = ($null -ne $csc -and $csc.ExitCode -eq 0 -and [System.IO.File]::Exists($parityExe))
+Test-Assert $compiled "the start-path test program compiles"
+if ($compiled) {
+    $parityUtf8 = 'caf' + [char]0xE9 + ' ' + [char]0x65E5 + [char]0x672C
+    $parityCommands = @(
+        @{ Name = 'access violation'; FilePath = $parityExe; Arguments = @('-1073741819', 'two words', 'say "hi"', 'C:\dir with space\', ''); OutputEncoding = 'utf-8' }
+        @{ Name = 'largest exit code'; FilePath = $parityExe; Arguments = @('2147483647'); OutputEncoding = 'utf-8' }
+        @{ Name = 'working folder'; FilePath = $parityExe; WorkingDirectory = $PSScriptRoot; OutputEncoding = 'utf-8' }
+        @{ Name = 'cmd'; FilePath = $cmdExe; Arguments = '/d /c echo out& echo err 1>&2& exit /b 3' }
+    )
+    $parityRuns = @{}
+    $env:PK_HARNESS_PARITY = 'set by the script'
+    try {
+        foreach ($parityPath in 'job', 'fallback') {
+            [PkChildProcessJob]::TestUseProcessStart = ($parityPath -eq 'fallback')
+            try { $b = Invoke-PkProcessBatch -Commands $parityCommands -MaxConcurrent 2 }
+            finally { [PkChildProcessJob]::TestUseProcessStart = $false }
+            $rows = @{}
+            foreach ($br in $b.Results) { $rows[$br.Command['Name']] = $br }
+            $parityRuns[$parityPath] = $rows
+        }
+    } finally { Remove-Item Env:PK_HARNESS_PARITY }
+    $parityDiffs = @()
+    foreach ($c in $parityCommands) {
+        $a = $parityRuns['job'][$c['Name']]; $f = $parityRuns['fallback'][$c['Name']]
+        if ($a.ExitCode -ne $f.ExitCode -or $a.Stdout -cne $f.Stdout -or $a.Stderr -cne $f.Stderr -or [string]$a.StartError -ne [string]$f.StartError) { $parityDiffs += $c['Name'] }
+    }
+    Test-Assert ($parityDiffs.Count -eq 0) ("exit code, stdout, stderr and start error are the same on both start paths" + $(if ($parityDiffs.Count) { " (differ: " + ($parityDiffs -join ', ') + ")" }))
+    $job = $parityRuns['job']
+    $av = $job['access violation']
+    $expectedArgs = "[-1073741819]`n[two words]`n[say `"hi`"]`n[C:\dir with space\]`n[]`n"
+    Test-Assert ($av.ExitCode -eq -1073741819 -and ([string]$av.Stdout).Contains("`nenv=set by the script`n" + $expectedArgs) -and ([string]$av.Stdout).EndsWith($parityUtf8) -and $av.Stderr -eq 'args=5') ("and they're right: the script's environment variable, a quoted argument list, UTF-8 output, stderr and a negative exit code (" + $av.ExitCode + ")")
+    Test-Assert ($job['largest exit code'].ExitCode -eq 2147483647 -and ([string]$job['working folder'].Stdout).StartsWith('cwd=' + $PSScriptRoot + "`n") -and $job['cmd'].ExitCode -eq 3 -and ([string]$job['cmd'].Stdout).Trim() -eq 'out' -and ([string]$job['cmd'].Stderr).Trim() -eq 'err') ("the largest exit code, the working folder, and a cmd.exe command's output and exit code (" + $job['largest exit code'].ExitCode + ", " + ([string]$job['working folder'].Stdout).Split("`n")[0] + ")")
+    try { [System.IO.File]::Delete($parityExe) } catch { }   # temp file only; best effort
+}
+Write-Host ""
+
+Write-Host "=== AS: a callback that throws while programs run ===" -ForegroundColor Cyan
+# The exception comes out of the call, every program is killed, and a shared
+# budget gets every slot back. Each case throws once a long ping is running;
+# its count (-n 53) marks it for the check afterwards. Groups: 'long' first
+# (the ping), then 'quick' ones (cmd /c exit 0), or empty ones for
+# -GroupReleaseCheck, which is only asked about groups with no jobs.
+function Get-HarnessMarkedPings {
+    return ,@(Get-CimInstance Win32_Process -Filter "Name='PING.EXE'" | Where-Object { [string]$_.CommandLine -like '* -n 53 *' })
+}
+$throwBudget = [System.Threading.SemaphoreSlim]::new(2, 2)
+foreach ($throwName in 'PollCallback', 'GroupCompleteCallback', 'JobBuilder', 'GroupProvider', 'GroupReleaseCheck') {
+    Reset-Harness
+    $st = @{ Calls = 0; Thrown = $false; Long = @{ FilePath = $pingExe; Arguments = '-n 53 127.0.0.1'; TimeoutSeconds = 20 } }   # the time limit only bounds a case that never throws
+    $p = @{
+        MaxConcurrent = $throwBudget
+        MaxQueueAhead = 2
+        GroupProvider = { if ($st.Calls -ge 6) { return $null }; $st.Calls++; if ($st.Calls -eq 1) { return 'long' }; return 'quick' }.GetNewClosure()
+        JobBuilder    = { param($g) if ($g -eq 'long') { return $st.Long }; return @{ FilePath = $cmdExe; Arguments = '/d /c exit 0' } }.GetNewClosure()
+        JobFinalize   = { param($job, $q) $null = Complete-PkProcess -Job $job }
+    }
+    switch ($throwName) {
+        'PollCallback' {
+            $p['PollCallback'] = { param($running) if ($null -ne $st.Long['Proc'] -and -not $st.Long['Proc'].HasExited) { $st.Thrown = $true; throw 'pk-test: PollCallback' } }.GetNewClosure()
+        }
+        'GroupCompleteCallback' {
+            $p['GroupCompleteCallback'] = { param($g) if ($null -ne $st.Long['Proc'] -and -not $st.Long['Proc'].HasExited) { $st.Thrown = $true; throw 'pk-test: GroupCompleteCallback' } }.GetNewClosure()
+        }
+        'JobBuilder' {
+            $p['JobBuilder'] = { param($g) if ($g -eq 'long') { return $st.Long }; if ($null -ne $st.Long['Proc'] -and -not $st.Long['Proc'].HasExited) { $st.Thrown = $true; throw 'pk-test: JobBuilder' }; return @{ FilePath = $cmdExe; Arguments = '/d /c exit 0' } }.GetNewClosure()
+        }
+        'GroupProvider' {
+            $p['GroupProvider'] = { if ($st.Calls -ge 6) { return $null }; $st.Calls++; if ($st.Calls -eq 1) { return 'long' }; if ($null -ne $st.Long['Proc'] -and -not $st.Long['Proc'].HasExited) { $st.Thrown = $true; throw 'pk-test: GroupProvider' }; return 'quick' }.GetNewClosure()
+        }
+        'GroupReleaseCheck' {
+            $p['JobBuilder'] = { param($g) if ($g -eq 'long') { return $st.Long }; return @() }.GetNewClosure()
+            $p['GroupReleaseCheck'] = { param($g) if ($null -ne $st.Long['Proc'] -and -not $st.Long['Proc'].HasExited) { $st.Thrown = $true; throw 'pk-test: GroupReleaseCheck' }; return $false }.GetNewClosure()
+        }
+    }
+    $throwError = $null
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    try { $null = Invoke-PkProcessDispatch @p } catch { $throwError = [string]$_ }
+    $sw.Stop()
+    $throwLeft = Get-HarnessMarkedPings
+    for ($t = 0; $t -lt 20 -and $throwLeft.Count -gt 0; $t++) { Start-Sleep -Milliseconds 100; $throwLeft = Get-HarnessMarkedPings }
+    foreach ($l in $throwLeft) { Stop-Process -Id $l.ProcessId -Force -ErrorAction SilentlyContinue }
+    $throwSlots = $throwBudget.CurrentCount
+    if ($throwSlots -lt 2) { $null = $throwBudget.Release(2 - $throwSlots) }   # so one failure doesn't fail the cases after it
+    Test-Assert ($st.Thrown -and $throwError -like ('*pk-test: ' + $throwName + '*') -and $throwLeft.Count -eq 0 -and $throwSlots -eq 2 -and $sw.Elapsed.TotalSeconds -lt 15) ("dispatcher: -" + $throwName + " throwing while a program runs: the exception comes out, nothing is left running, the shared budget gets its slots back (threw while running: " + $st.Thrown + ", error: " + $throwError + ", left running: " + $throwLeft.Count + ", slots: " + $throwSlots + " of 2, " + [math]::Round($sw.Elapsed.TotalSeconds, 1) + "s)")
+}
+$throwBudget.Dispose()
+
+# The runspace engine: a throwing -ResultHandler, -PollCallback or
+# -NextJobProvider stops the run, stops the running workers (their pipelines
+# are stopped, then the pool closes) and lets the exception out. Each worker
+# notes when it starts and sleeps in 25 ms steps, so a stop lands at once;
+# each throwing callback first waits for two workers to be running.
+$rsWorker = {
+    param([int]$Id, [int]$Ms, $Seen)
+    $Seen[$Id] = 'started'
+    $w = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($w.ElapsedMilliseconds -lt $Ms) { [System.Threading.Thread]::Sleep(25) }
+    $Seen[$Id] = 'done'
+    return $Id
+}
+$rsWaitRunning = {
+    param($Seen)
+    $w = [System.Diagnostics.Stopwatch]::StartNew()
+    while (@($Seen.Values | Where-Object { $_ -eq 'started' }).Count -lt 2 -and $w.ElapsedMilliseconds -lt 3000) { Start-Sleep -Milliseconds 10 }
+    return @($Seen.Values | Where-Object { $_ -eq 'started' }).Count
+}
+$rsBaseline = @(Get-Runspace).Count
+foreach ($rsName in 'ResultHandler', 'PollCallback', 'NextJobProvider') {
+    Reset-Harness
+    $seen = [System.Collections.Concurrent.ConcurrentDictionary[int, string]]::new()
+    $st = @{ Calls = 0; Running = -1 }
+    $p = @{ WorkerScript = $rsWorker; MaxParallel = 3 }
+    switch ($rsName) {
+        'ResultHandler' {
+            # Job 1 returns at once, while jobs 2 and 3 run on.
+            $p['JobParams'] = @(@{ Id = 1; Ms = 0; Seen = $seen }, @{ Id = 2; Ms = 10000; Seen = $seen }, @{ Id = 3; Ms = 10000; Seen = $seen })
+            $p['ResultHandler'] = { param($r) $st.Running = & $rsWaitRunning $seen; throw 'pk-test: ResultHandler' }.GetNewClosure()
+        }
+        'PollCallback' {
+            $p['JobParams'] = @(@{ Id = 2; Ms = 10000; Seen = $seen }, @{ Id = 3; Ms = 10000; Seen = $seen })
+            $p['PollCallback'] = { $st.Running = & $rsWaitRunning $seen; throw 'pk-test: PollCallback' }.GetNewClosure()
+        }
+        'NextJobProvider' {
+            $p['NextJobProvider'] = { $st.Calls++; if ($st.Calls -le 2) { return @{ Id = $st.Calls + 1; Ms = 10000; Seen = $seen } }; $st.Running = & $rsWaitRunning $seen; throw 'pk-test: NextJobProvider' }.GetNewClosure()
+        }
+    }
+    $rsError = $null
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    try { $null = Invoke-PkRunspaceJobs @p } catch { $rsError = [string]$_ }
+    $sw.Stop()
+    # The pool closes in the background once the stopped workers have ended.
+    for ($t = 0; $t -lt 60 -and @(Get-Runspace).Count -gt $rsBaseline; $t++) { Start-Sleep -Milliseconds 50 }
+    $rsLeft = @(Get-Runspace).Count - $rsBaseline
+    Test-Assert ($rsError -like ('*pk-test: ' + $rsName + '*') -and $st.Running -eq 2 -and $rsLeft -le 0 -and $sw.Elapsed.TotalSeconds -lt 8) ("runspace jobs: -" + $rsName + " throwing while 2 workers run stops the run: the exception comes out and the workers' runspaces close (error: " + $rsError + ", workers running at the throw: " + $st.Running + ", runspaces left: " + $rsLeft + ", " + [math]::Round($sw.Elapsed.TotalSeconds, 1) + "s)")
+}
+Write-Host ""
+
 Set-PkMessageHandler -Handler $null
 Reset-PkAbortState
 
