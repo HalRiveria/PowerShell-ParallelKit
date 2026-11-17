@@ -3878,9 +3878,13 @@ $killScript = Join-Path $env:TEMP ("pk-hardkill-" + [guid]::NewGuid().ToString("
 [System.IO.File]::WriteAllText($killScript, @'
 param([string]$Kit, [int]$Fallback)
 . $Kit
-if ($Fallback) { [PkChildProcessJob]::TestUseProcessStart = $true }
+# The fallback adds cmd.exe to the job just after starting it, so a child it
+# starts at once could land outside (the race the default path closes): the
+# long ping starts a second later there.
+$pingArgs = '/d /c ping -n 61 127.0.0.1 >nul'
+if ($Fallback) { [PkChildProcessJob]::TestUseProcessStart = $true; $pingArgs = '/d /c ping -n 2 127.0.0.1 >nul& ping -n 61 127.0.0.1 >nul' }
 for ($i = 0; $i -lt 3; $i++) {
-    $j = Start-PkProcess -FilePath cmd.exe -Arguments '/d /c ping -n 61 127.0.0.1 >nul'
+    $j = Start-PkProcess -FilePath cmd.exe -Arguments $pingArgs
     [Console]::Out.WriteLine($j['Proc'].Id)
 }
 [Console]::Out.WriteLine('READY'); [Console]::Out.Flush()
@@ -3903,13 +3907,13 @@ try {
         $killPings = @()
         foreach ($c in $killCmds) {
             $p = $null
-            for ($t = 0; $t -lt 80 -and -not $p; $t++) {
-                $p = Get-CimInstance Win32_Process -Filter ("ParentProcessId=" + $c + " AND Name='PING.EXE'")
+            for ($t = 0; $t -lt 160 -and -not $p; $t++) {
+                $p = Get-CimInstance Win32_Process -Filter ("ParentProcessId=" + $c + " AND Name='PING.EXE' AND CommandLine LIKE '%-n 61%'")
                 if (-not $p) { Start-Sleep -Milliseconds 25 }
             }
             if ($p) { $killPings += [int]@($p)[0].ProcessId }
         }
-        Stop-Process -Id $killHost.Id -Force
+        Stop-Process -Id $killHost.Id -Force -ErrorAction SilentlyContinue   # already gone if it failed before READY: the assert below reports that
         $null = $killHost.WaitForExit(10000); $killHost.Dispose()
         $killLeft = @($killPings + $killCmds)
         for ($t = 0; $t -lt 30 -and $killLeft.Count -gt 0; $t++) {
@@ -3981,8 +3985,8 @@ if ($compiled) {
     $job = $parityRuns['job']
     $av = $job['access violation']
     $expectedArgs = "[-1073741819]`n[two words]`n[say `"hi`"]`n[C:\dir with space\]`n[]`n"
-    Test-Assert ($av.ExitCode -eq -1073741819 -and $av.Stdout.Contains("`nenv=set by the script`n" + $expectedArgs) -and $av.Stdout.EndsWith($parityUtf8) -and $av.Stderr -eq 'args=5') ("and they're right: the script's environment variable, a quoted argument list, UTF-8 output, stderr and a negative exit code (" + $av.ExitCode + ")")
-    Test-Assert ($job['largest exit code'].ExitCode -eq 2147483647 -and $job['working folder'].Stdout.StartsWith('cwd=' + $PSScriptRoot + "`n") -and $job['cmd'].ExitCode -eq 3 -and $job['cmd'].Stdout.Trim() -eq 'out' -and $job['cmd'].Stderr.Trim() -eq 'err') ("the largest exit code, the working folder, and a cmd.exe command's output and exit code (" + $job['largest exit code'].ExitCode + ", " + ([string]$job['working folder'].Stdout).Split("`n")[0] + ")")
+    Test-Assert ($av.ExitCode -eq -1073741819 -and ([string]$av.Stdout).Contains("`nenv=set by the script`n" + $expectedArgs) -and ([string]$av.Stdout).EndsWith($parityUtf8) -and $av.Stderr -eq 'args=5') ("and they're right: the script's environment variable, a quoted argument list, UTF-8 output, stderr and a negative exit code (" + $av.ExitCode + ")")
+    Test-Assert ($job['largest exit code'].ExitCode -eq 2147483647 -and ([string]$job['working folder'].Stdout).StartsWith('cwd=' + $PSScriptRoot + "`n") -and $job['cmd'].ExitCode -eq 3 -and ([string]$job['cmd'].Stdout).Trim() -eq 'out' -and ([string]$job['cmd'].Stderr).Trim() -eq 'err') ("the largest exit code, the working folder, and a cmd.exe command's output and exit code (" + $job['largest exit code'].ExitCode + ", " + ([string]$job['working folder'].Stdout).Split("`n")[0] + ")")
     try { [System.IO.File]::Delete($parityExe) } catch { }   # temp file only; best effort
 }
 Write-Host ""
@@ -3999,7 +4003,7 @@ function Get-HarnessMarkedPings {
 $throwBudget = [System.Threading.SemaphoreSlim]::new(2, 2)
 foreach ($throwName in 'PollCallback', 'GroupCompleteCallback', 'JobBuilder', 'GroupProvider', 'GroupReleaseCheck') {
     Reset-Harness
-    $st = @{ Calls = 0; Thrown = $false; Long = @{ FilePath = $pingExe; Arguments = '-n 53 127.0.0.1' } }
+    $st = @{ Calls = 0; Thrown = $false; Long = @{ FilePath = $pingExe; Arguments = '-n 53 127.0.0.1'; TimeoutSeconds = 20 } }   # the time limit only bounds a case that never throws
     $p = @{
         MaxConcurrent = $throwBudget
         MaxQueueAhead = 2
