@@ -3049,6 +3049,18 @@ $cts.CancelAfter(300)
 $d = Invoke-KwDispatch -Jobs 3 -FilePath 'ping.exe' -Arguments '-n 2 127.0.0.1' -Extra @{ CancelToken = $cts.Token; AbortTimeoutSeconds = 30; JobAbortCleanup = { param($job) $kwCount.N++; KEYWORD } }
 $kwOk = ($d.Result.Aborted -and $d.Done -eq 1 -and $kwCount.N -eq 2); $kwDetail = "done " + $d.Done + ", cleaned " + $kwCount.N
 '@
+    '-JobFinalize (abort wait)' = @'
+$cts = [System.Threading.CancellationTokenSource]::new()
+$cts.CancelAfter(300)
+$d = Invoke-KwDispatch -Jobs 3 -FilePath 'ping.exe' -Arguments '-n 2 127.0.0.1' -Extra @{ CancelToken = $cts.Token; AbortTimeoutSeconds = 30; JobFinalize = { param($job, $q) $null = Complete-PkProcess -Job $job; $kwCount.N++; KEYWORD } }
+$kwOk = ($d.Result.Aborted -and $kwCount.N -eq 1 -and $d.Result.ForceKilledCount -eq 0); $kwDetail = "finalized " + $kwCount.N + ", force-killed " + $d.Result.ForceKilledCount
+'@
+    '-JobPollCompleted (abort wait)' = @'
+$cts = [System.Threading.CancellationTokenSource]::new()
+$cts.CancelAfter(300)
+$d = Invoke-KwDispatch -Jobs 3 -FilePath 'ping.exe' -Arguments '-n 2 127.0.0.1' -Extra @{ CancelToken = $cts.Token; AbortTimeoutSeconds = 30; JobPollCompleted = { param($job) if ($job['Proc'].HasExited) { return $true }; $kwCount.N++; KEYWORD } }
+$kwOk = ($d.Result.Aborted -and $d.Done -eq 1 -and $d.Result.ForceKilledCount -eq 0); $kwDetail = "done " + $d.Done + ", force-killed " + $d.Result.ForceKilledCount
+'@
     '-GroupReleaseCheck' = @'
 $d = Invoke-KwDispatch -Jobs 0 -Extra @{ JobBuilder = { param($g) }; GroupReleaseCheck = { param($g) $kwCount.N++; if ($kwCount.N -ge 3) { return $true }; KEYWORD } }
 $kwOk = ($d.Result.GroupResults.Count -eq 1 -and $kwCount.N -ge 3); $kwDetail = "checks " + $kwCount.N
