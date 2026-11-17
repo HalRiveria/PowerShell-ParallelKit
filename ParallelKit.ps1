@@ -2,7 +2,7 @@
 # graceful Ctrl+C/window-close handling for Windows PowerShell 5.1 and
 # PowerShell 7.
 #
-# Version 3.1 - https://github.com/HalRiveria/PowerShell-ParallelKit
+# Version 3.2 - https://github.com/HalRiveria/PowerShell-ParallelKit
 # Copyright (c) 2026 HalRiveria. MIT License: keep this notice with any copy;
 # the full text is in LICENSE in the repository.
 #
@@ -2688,7 +2688,7 @@ function Invoke-PkGracefulDrain {
         foreach ($h in $localHandles) {
             # BeginStop, not Stop: Stop() blocks until the pipeline
             # actually unwinds, and a worker stuck in a .NET call never does.
-            try { $null = $h.PS.BeginStop($null, $null) } catch { }
+            try { $null = $h.PS.BeginStop($null, $null) } catch { }   # one worker that can't be asked to stop mustn't keep the rest from being asked
         }
     }
 
