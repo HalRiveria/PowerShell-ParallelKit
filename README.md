@@ -357,6 +357,8 @@ GitHub runs the same harness on Windows PowerShell 5.1 and on PowerShell 7 for e
   ```
 
 - `Testing/hosts/check-host.ps1` checks the kit in a host you choose, such as an editor's terminal or a scheduled task.
+- `Testing/force-kill/run.ps1` checks [No orphans](#parallelkit): it starts `cmd /c ping` jobs, kills the PowerShell running them outright, and counts any `ping` left running. Expect none.
+- `Testing/stop-in-call/run.ps1` shows where PowerShell acts on a stop (a third Ctrl+C, or the runspace engine's force-stop): never inside a .NET call, which runs to the end, and only at the next function or cmdlet call. That's behind the Limits note on workers stuck in a .NET call.
 
 ## FAQ
 
