@@ -3632,7 +3632,7 @@ function Get-HarnessFinalizePassDrift {
         $hasTimeLimit = $text.Contains($timeLimit)
         if ($i -lt 2 -and -not $hasTimeLimit) { $problems.Add('the ' + $names[$i] + ' has no time-limit check') }
         if ($i -eq 2 -and $hasTimeLimit) { $problems.Add('the final pass has a time-limit check') }
-        $texts += ($text.Replace($timeLimit, '') -replace '\s+', ' ')
+        $texts += $text.Replace($timeLimit + ' ', '')
     }
     for ($i = 1; $i -lt 3; $i++) {
         if ($texts[$i] -ne $texts[0]) { $problems.Add('the ' + $names[$i] + ' differs from the main poll pass: ' + (Get-HarnessCodeDifference -A $texts[0] -B $texts[$i])) }
@@ -3656,7 +3656,9 @@ function Get-HarnessForceStopDrift {
         $loop = $loops[0]
         $steps = [System.Collections.Generic.List[string]]::new()
         $siblings = $loop.Parent.Statements
-        $before = $siblings[$siblings.IndexOf($loop) - 1]
+        $at = $siblings.IndexOf($loop)
+        if ($at -lt 1) { $problems.Add('nothing runs before the stop loop over ' + $list + ' (expected Stop-PkJobProcesses)'); continue }
+        $before = $siblings[$at - 1]
         $steps.Add((Get-HarnessCodeText -Text $before.Extent.Text).Replace($list, '$LIST'))
         $skipped = $false
         foreach ($statement in $loop.Body.Statements) {
@@ -3678,24 +3680,33 @@ function Get-HarnessForceStopDrift {
 }
 
 function Get-HarnessUnguardedCallbacks {
-    # Every `& $variable` call of a user callback must be Invoke-PkCallback's
-    # guard or its inlined copy: `$flag = $false`, then
+    # Every call of a user callback (`& $cb`, `. $cb`, `& $h['cb']`) must be
+    # Invoke-PkCallback's guard or its inlined copy: `$flag = $false`, then
     # `do { & $cb ...; $flag = $true } while ($false)`, then
-    # `if (-not $flag) { <loop warning> }`. The variables below hold the kit's
-    # own helpers or Invoke-PkRun's body, not callbacks; a new helper captured
-    # into a variable goes on this list. Returns @{ Calls; Problems }.
+    # `if (-not $flag) { <loop warning> }`. `$cb.Invoke()` skips the guard
+    # altogether, so it's refused. The variables below hold the kit's own
+    # helpers, not callbacks; a new helper captured into a variable goes on
+    # this list. Invoke-PkRun's `& $ScriptBlock` is the run itself, not called
+    # from a loop. Returns @{ Calls; Problems }.
     param([string]$Source)
-    $internal = @('$ScriptBlock', '$pkNewBatchResult', '$pkGetStartFailureCause', '$pkGetJobTimeLimit', '$pkReportStartFailure', '$pkStartProcessCore', '$pkWriteCallbackLoopWarning')
+    $internal = @('$pkNewBatchResult', '$pkGetStartFailureCause', '$pkGetJobTimeLimit', '$pkReportStartFailure', '$pkStartProcessCore', '$pkWriteCallbackLoopWarning')
     $problems = [System.Collections.Generic.List[string]]::new()
     $tokens = $null; $errors = $null
     $ast = [System.Management.Automation.Language.Parser]::ParseInput($Source, [ref]$tokens, [ref]$errors)
-    $calls = @($ast.FindAll({ param($a) $a -is [System.Management.Automation.Language.CommandAst] -and $a.InvocationOperator -eq 'Ampersand' -and $a.CommandElements[0] -is [System.Management.Automation.Language.VariableExpressionAst] }, $true))
+    $calls = @($ast.FindAll({ param($a) $a -is [System.Management.Automation.Language.CommandAst] -and ($a.InvocationOperator -eq 'Ampersand' -or $a.InvocationOperator -eq 'Dot') -and $a.CommandElements[0] -isnot [System.Management.Automation.Language.StringConstantExpressionAst] -and $a.CommandElements[0] -isnot [System.Management.Automation.Language.ScriptBlockExpressionAst] }, $true))
+    $invokes = @($ast.FindAll({ param($a) $a -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and ($a.Member.Extent.Text -eq 'Invoke' -or $a.Member.Extent.Text -eq 'InvokeReturnAsIs') }, $true))
+    foreach ($call in $invokes) { $problems.Add('line ' + $call.Extent.StartLineNumber + ' (' + $call.Extent.Text + '): call a callback with & inside the guard, not .Invoke()') }
     $checked = 0
     foreach ($call in $calls) {
         $name = $call.CommandElements[0].Extent.Text
         if ($internal -contains $name) { continue }
+        if ($name -eq '$ScriptBlock') {
+            $function = $call.Parent
+            while ($null -ne $function -and $function -isnot [System.Management.Automation.Language.FunctionDefinitionAst]) { $function = $function.Parent }
+            if ($null -ne $function -and $function.Name -eq 'Invoke-PkRun') { continue }
+        }
         $checked++
-        $where = 'line ' + $call.Extent.StartLineNumber + ' (& ' + $name + ')'
+        $where = 'line ' + $call.Extent.StartLineNumber + ' (' + $call.Extent.Text.Substring(0, 1) + ' ' + $name + ')'
         $loop = $call.Parent.Parent
         if ($loop -is [System.Management.Automation.Language.AssignmentStatementAst] -and $loop.Left.Extent.Text -eq '$null') { $loop = $loop.Parent }
         $loop = $loop.Parent
@@ -3703,6 +3714,7 @@ function Get-HarnessUnguardedCallbacks {
         $last = $loop.Body.Statements[$loop.Body.Statements.Count - 1]
         if ($last -isnot [System.Management.Automation.Language.AssignmentStatementAst] -or $last.Right.Extent.Text -ne '$true') { $problems.Add($where + ": the do block doesn't end by setting a flag to `$true"); continue }
         $flag = $last.Left.Extent.Text
+        $flagPattern = [regex]::Escape($flag) + '(?![\w:])'
         $statement = $loop
         if ($loop.Parent -is [System.Management.Automation.Language.AssignmentStatementAst]) { $statement = $loop.Parent }
         $siblings = $statement.Parent.Statements
@@ -3710,13 +3722,13 @@ function Get-HarnessUnguardedCallbacks {
         # The last statement before the call that mentions the flag resets it.
         $reset = $null
         for ($j = $index - 1; $j -ge 0 -and $null -eq $reset; $j--) {
-            if ($siblings[$j].Extent.Text.Contains($flag)) { $reset = Get-HarnessCodeText -Text $siblings[$j].Extent.Text }
+            if ($siblings[$j].Extent.Text -match $flagPattern) { $reset = Get-HarnessCodeText -Text $siblings[$j].Extent.Text }
         }
         if ($reset -ne ($flag + ' = $false')) { $problems.Add($where + ': ' + $flag + ' is not reset to $false before the call'); continue }
         # ...and the first one after it that mentions the flag is the warning.
         $next = $null
         for ($j = $index + 1; $j -lt $siblings.Count -and $null -eq $next; $j++) {
-            if ($siblings[$j].Extent.Text.Contains($flag)) { $next = $siblings[$j] }
+            if ($siblings[$j].Extent.Text -match $flagPattern) { $next = $siblings[$j] }
         }
         if ($next -isnot [System.Management.Automation.Language.IfStatementAst] -or -not $next.Clauses[0].Item1.Extent.Text.StartsWith('-not ' + $flag) -or $next.Clauses[0].Item2.Extent.Text -notmatch "Write-PkCallbackLoopWarning|\`$pkWriteCallbackLoopWarning|used 'continue' or 'break'") {
             $problems.Add($where + ': not followed by the loop warning when ' + $flag + ' is still $false')
@@ -3736,7 +3748,12 @@ function Get-HarnessSilentCatches {
     for ($i = 0; $i -lt $lines.Count; $i++) {
         $after = $null
         if ($lines[$i] -match 'catch\s*(\[[^\]]*\]\s*|\([^)]*\)\s*)*\{\s*\}(.*)$') { $after = $Matches[2] }
-        elseif ($lines[$i] -match 'catch\s*(\[[^\]]*\]\s*|\([^)]*\)\s*)*\{\s*$' -and $i + 1 -lt $lines.Count -and $lines[$i + 1] -match '^\s*\}(.*)$') { $after = $Matches[1] }
+        elseif ($lines[$i] -match 'catch\s*(\[[^\]]*\]\s*|\([^)]*\)\s*)*\{\s*$') {
+            # A body on the lines below: empty if only blank lines come before its `}`.
+            $k = $i + 1
+            while ($k -lt $lines.Count -and $lines[$k].Trim() -eq '') { $k++ }
+            if ($k -lt $lines.Count -and $lines[$k] -match '^\s*\}(.*)$') { $after = $Matches[1] }
+        }
         if ($null -eq $after) { continue }
         $found++
         if ($after -match '#|//') { continue }
@@ -3766,8 +3783,10 @@ Test-Assert ($anBroken -ne $anSource -and $anFound.Count -eq 1 -and $anFound[0] 
 $anBroken = $anSource.Replace('$null = do { & $pkOnComplete $pkJob[''Command''] $pkR; $pkCbDone = $true } while ($false)', '$null = & $pkOnComplete $pkJob[''Command''] $pkR; $pkCbDone = $true')
 $anFound = (Get-HarnessUnguardedCallbacks -Source $anBroken).Problems
 Test-Assert ($anBroken -ne $anSource -and $anFound.Count -eq 1 -and $anFound[0] -match '& \$pkOnComplete\): not inside do') ("a callback called without the guard is caught (" + ($anFound -join '; ') + ")")
-$anFound = (Get-HarnessSilentCatches -Source ($anSource + "`r`nfunction Get-PkBroken { try { 1 } catch { } }`r`n")).Problems
-Test-Assert ($anFound.Count -eq 1 -and $anFound[0] -match 'Get-PkBroken') ("an empty catch with no reason is caught (" + ($anFound -join '; ') + ")")
+$anFound = (Get-HarnessUnguardedCallbacks -Source ($anSource + "`r`nfunction Get-PkBroken { param(`$h, `$ScriptBlock) & `$h['Cb']; . `$h.Cb; & `$ScriptBlock; `$h['Cb'].Invoke() }`r`n")).Problems
+Test-Assert ($anFound.Count -eq 4) ("callbacks called through an index, a property, a dot-source, or .Invoke() are caught too (" + ($anFound -join '; ') + ")")
+$anFound = (Get-HarnessSilentCatches -Source ($anSource + "`r`nfunction Get-PkBroken { try { 1 } catch { } }`r`nfunction Get-PkBroken2 {`r`n    try { 1 } catch {`r`n`r`n    }`r`n}`r`n")).Problems
+Test-Assert ($anFound.Count -eq 2 -and $anFound[0] -match 'Get-PkBroken' -and $anFound[1] -match 'try \{ 1 \} catch \{$') ("an empty catch with no reason is caught, on one line or several (" + ($anFound -join '; ') + ")")
 Write-Host ""
 
 Set-PkMessageHandler -Handler $null
