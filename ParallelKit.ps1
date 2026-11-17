@@ -1,38 +1,31 @@
 # ParallelKit - parallel runspace jobs, bounded external-process dispatch, and
-# graceful Ctrl+C/window-close handling for Windows PowerShell 5.1.
+# graceful Ctrl+C/window-close handling for Windows PowerShell 5.1 and
+# PowerShell 7.
 #
-# Version 2.3 - https://github.com/HalRiveria/PowerShell-ParallelKit
+# Version 3.0 - https://github.com/HalRiveria/PowerShell-ParallelKit
 # Copyright (c) 2026 HalRiveria. MIT License: keep this notice with any copy;
 # the full text is in LICENSE in the repository.
 #
 # Use:   . "<path>\ParallelKit.ps1"     (dot-source it; it loads itself as an in-memory module)
-# Read README.md first - the two worker-code rules there are what keep this
-# from hanging or crashing.
+# Read README.md first: its two worker-code rules are what keep this from
+# hanging or crashing.
 #
-# Works under Set-StrictMode: job hashtables are read as $job['Name'], never
-# $job.Name, because under strict mode the dot form THROWS for a key that
-# isn't there yet. Keep it that way when editing.
-#
-# State lives in the static [PkState] class, never in $script: variables - a
-# function called from inside a .GetNewClosure()'d block can see an empty
-# $script: scope, and a static has no scope to lose.
+# Works under Set-StrictMode: read job hashtables as $job['Name'], never
+# $job.Name, which throws there for a key that isn't set yet. State lives in
+# the static [PkState] class, never in $script: variables: a function called
+# from a .GetNewClosure() block can see an empty $script: scope.
 
-# Everything below needs Add-Type, which Constrained Language Mode blocks with
-# an error that doesn't say why. Say why.
+# Add-Type needs FullLanguage: say so, rather than fail on Add-Type's error.
 if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') {
     throw ("ParallelKit: this PowerShell session runs in " + $ExecutionContext.SessionState.LanguageMode + " mode, but the kit needs FullLanguage " +
         "(it compiles C# with Add-Type). This is usually set by AppLocker or Windows Defender Application Control policy. " +
         "Ask whoever manages the machine to allow this script, or run it where that policy doesn't apply.")
 }
 
-# Everything below loads as an in-memory module named ParallelKit. The kit's
-# own frames then live in the module's session state, so a callback you pass
-# in sees your variables, never the kit's locals, and the internal helpers
-# stay out of your session. The public functions are imported globally, so
-# they work from any .GetNewClosure() block and for the rest of the session.
-# A copy loaded earlier in this session is dropped first, so only one is
-# listed. -ErrorAction Stop: without it, a throw in the module body (the
-# stale-types check below, say) wouldn't stop the script that loads the kit.
+# Loads as an in-memory module, so a callback you pass in sees your
+# variables, never the kit's, and the private helpers stay out of your
+# session. A copy loaded earlier is removed first. -ErrorAction Stop makes a
+# throw in here (the stale-types check) stop the script that loads the kit.
 Get-Module -Name ParallelKit | Remove-Module
 New-Module -Name ParallelKit -ErrorAction Stop -ScriptBlock {
 
@@ -58,13 +51,12 @@ public static class PkConsoleCtrl
     public static volatile bool AbortRequested = false;
     public static volatile bool IsCloseEvent   = false;   // true = window close/logoff/shutdown, false = Ctrl+C
 
-    // The handler only intercepts while a run is active. Outside a run,
-    // Ctrl+C and closing the window behave exactly as they normally would.
+    // The handler only acts while a run is active.
     public static volatile bool RunActive = false;
 
     // On a window close, logoff or shutdown the handler parks on this until
-    // the run ends: the process dies as soon as the handler returns, and
-    // Windows ends it after a few seconds anyway. Ctrl+C never parks.
+    // the run ends, since the process dies as soon as the handler returns.
+    // Ctrl+C never parks.
     public static readonly ManualResetEventSlim DrainComplete = new ManualResetEventSlim(false);
     public static int DrainWaitMs = 65000;
 
@@ -169,11 +161,8 @@ public static class PkState
     public static object MessageHandler = null;   // a PowerShell scriptblock, or null for the default
     public static volatile bool ThreadPoolRaised = false;
 
-    // Bump this whenever any C# in this file changes. A PowerShell session
-    // keeps compiled types until it exits, so re-loading an edited kit into
-    // an old session would silently run the OLD C# - the check after the
-    // type definitions catches that. That check compares against this
-    // number too; bump both together.
+    // Bump this, and the check after the type definitions, whenever any C#
+    // in this file changes: a session keeps the types it compiled first.
     public const int TypesVersion = 4;
 
     // Locked: Register-/Unregister-PkCancellationSource are callable from
@@ -291,9 +280,8 @@ public static class PkChildProcessJob
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool CloseHandle(IntPtr hObject);
 
-    // Deliberately never closed: the OS closes it when this process exits,
-    // and that close is what kills the children. Closing it early would
-    // kill running work.
+    // Never closed: Windows closes it when this process exits, and that is
+    // what kills the children.
     private static IntPtr _job = IntPtr.Zero;
     private static readonly object _lock = new object();
 
@@ -328,8 +316,8 @@ public static class PkChildProcessJob
         }
     }
 
-    // Never throws - a failed assignment only loses the force-kill cleanup
-    // for that one process, it must not fail the work itself.
+    // Never throws: a failed assignment only loses the force-kill cleanup
+    // for that one process.
     public static bool Assign(System.Diagnostics.Process process)
     {
         if (_job == IntPtr.Zero || process == null) { return false; }
@@ -345,17 +333,15 @@ public static class PkChildProcessJob
 '@ -Language CSharp
 }
 
-# A session that loaded an earlier copy of this file still has that copy's
-# compiled types, and they can't be replaced. Say so, instead of failing
-# later with a missing-method error somewhere unrelated. Keep this number
-# in sync with [PkState]::TypesVersion above.
+# A session that loaded an older copy keeps its compiled types. Say so,
+# rather than fail later with a missing-method error. Keep this number in
+# sync with [PkState]::TypesVersion.
 if ((& { try { [PkState]::TypesVersion } catch { 0 } }) -ne 4) {
     throw "ParallelKit: this PowerShell session already loaded an older version of the kit, and its compiled parts can't be swapped out. Close this window and start a new one."
 }
 
-# How kit functions tell a worker runspace from the main one: in a worker
-# these two globals are set by Invoke-PkRunspaceJobs; everywhere else they
-# are null. Defined here so reading them is legal under Set-StrictMode.
+# Set in a worker by Invoke-PkRunspaceJobs, null elsewhere: how kit
+# functions tell where they run. Defined here for strict mode.
 if (-not (Test-Path -LiteralPath 'Variable:\global:PkWorkerQueue')) { $global:PkWorkerQueue = $null }
 if (-not (Test-Path -LiteralPath 'Variable:\global:PkCancelToken')) { $global:PkCancelToken = $null }
 
@@ -370,6 +356,7 @@ function Set-PkMessageHandler {
     # The handler gets ($Message, $Level), where Level is Info, Warn or Error, and
     # always runs on the main thread, including for messages from worker code. If it
     # throws, the message is shown on the console instead and the run carries on.
+    # Leave it early with return: continue and break end it too, but warn once.
     # .PARAMETER Handler
     # { param($Message, $Level) ... }, or $null to go back to the default (console).
     # .EXAMPLE
@@ -385,22 +372,19 @@ function Invoke-PkMessageHandler {
     $handler = [PkState]::MessageHandler
     if ($null -ne $handler) {
         try {
-            # A `continue` or `break` in the handler stops at this do/while
-            # instead of in whichever kit loop wrote the message, and counts
-            # as `return`. The same idea as Invoke-PkCallback, which can't be
-            # used here: its warning is itself a message. This one goes to
-            # the console, once per handler (a note on the scriptblock).
+            # Invoke-PkCallback's do/while, inlined: its warning is itself a
+            # message. Warns on the console, once per handler (a note on the
+            # scriptblock).
             $handlerDone = $false
-            do { $null = & $handler $Message $Level; $handlerDone = $true } while ($false)   # a handler's stray output must not become our caller's output
+            do { $null = & $handler $Message $Level; $handlerDone = $true } while ($false)
             if (-not $handlerDone -and $null -eq $handler.PSObject.Properties['PkLoopWarned']) {
                 $handler.PSObject.Properties.Add([psnoteproperty]::new('PkLoopWarned', $true))
                 Write-Host "[ParallelKit] the message handler used 'continue' or 'break'. PowerShell sends those to the nearest loop, which here is one of the kit's, so the kit stopped the handler there instead. Use 'return' to leave it early." -ForegroundColor Yellow
             }
             return
         } catch {
-            # A handler that fails (a locked log file, say) must not take
-            # the run down with it. Fall back to the console for this one
-            # message and say why.
+            # A failing handler (a locked log file, say) mustn't stop the run:
+            # show this message on the console instead.
             Write-Host ("[ParallelKit] message handler failed (" + $_ + ") - showing the message here instead:") -ForegroundColor Yellow
         }
     }
@@ -426,9 +410,8 @@ function Write-PkMessage {
         [ValidateSet('Info', 'Warn', 'Error', 'Warning')]
         [string]$Level = 'Info'
     )
-    # A message handler only ever sees Info, Warn or Error, spelled that way:
-    # ValidateSet ignores case, and Warning means Warn. Before a worker queues
-    # it, so it holds there too.
+    # Handlers only ever see Info, Warn or Error, spelled that way:
+    # ValidateSet ignores case. Done before a worker queues it.
     switch ($Level) {
         'Error' { $Level = 'Error' }
         'Info'  { $Level = 'Info' }
@@ -452,32 +435,41 @@ function Receive-PkWorkerMessages {
 }
 
 function Invoke-PkCallback {
-    # Calls one of the caller's callbacks and returns what it output.
-    # PowerShell sends a `continue` or `break` to the nearest loop on the call
-    # stack, across the module boundary: for a callback, one of the kit's own
-    # loops, which then skips its bookkeeping or never ends. The do/while here
-    # is that nearest loop instead, so the keyword only ends the callback, as
-    # `return` would, keeping whatever it output so far. Warns once per
-    # -PkName in -PkWarned (every time without one). A labeled `break outer`
-    # still goes through to the caller's own loop. Invoke-PkMessageHandler has
-    # its own copy of this, since this one's warning is itself a message.
-    # pk-prefixed, parameters included: in a worker this frame sits between
-    # the kit and a callback built without .GetNewClosure(), which sees it.
+    # Calls one of the caller's callbacks and returns its output. A `continue`
+    # or `break` in a callback goes to the nearest loop on the call stack, even
+    # across the module boundary: one of the kit's, which then skips its
+    # bookkeeping or never ends. This do/while catches it instead, so it ends
+    # only the callback, like `return`. A labeled `break outer` still reaches
+    # the caller's loop. Inlined where a callback runs per job or per result
+    # (on 5.1 this call more than doubled the dispatcher's own time per job),
+    # and in Invoke-PkMessageHandler.
+    # pk-prefixed: in a worker, a callback without .GetNewClosure() sees this frame.
     param(
         [Parameter(Mandatory)][scriptblock]$PkCallback,
         [object[]]$PkArgs = @(),
         [Parameter(Mandatory)][string]$PkName,
-        [hashtable]$PkWarned
+        [hashtable]$PkContext
     )
     $pkCompleted = $false
     $pkOutput = do { & $PkCallback @PkArgs; $pkCompleted = $true } while ($false)
-    if (-not $pkCompleted -and ($null -eq $PkWarned -or -not $PkWarned.ContainsKey($PkName))) {
-        if ($null -ne $PkWarned) { $PkWarned[$PkName] = $true }
-        Write-PkMessage ($PkName + " used 'continue' or 'break' outside a loop of its own. PowerShell sends those to the nearest loop, which here is one of the kit's, so the kit stopped the callback there instead. Use 'return' to leave a callback early.") -Level Warn
-    }
-    # The comma hands back exactly what the callback gave, as a direct call
-    # would: a collection it returned whole (`return ,$list`) stays one value.
+    if (-not $pkCompleted) { Write-PkCallbackLoopWarning -PkName $PkName -PkContext $PkContext }
+    # The comma keeps a collection returned whole (`return ,$list`) one value.
     if ($null -ne $pkOutput) { return ,$pkOutput }
+}
+
+function Write-PkCallbackLoopWarning {
+    # For a callback that used continue/break (see Invoke-PkCallback). Warns
+    # once per -PkName in a run. -PkContext is the run's @{ Prefix; Warned }:
+    # Prefix names the engine, Warned the names already warned about.
+    param([string]$PkName, [hashtable]$PkContext)
+    $pkFullName = $PkName
+    if ($null -ne $PkContext) {
+        $pkWarned = $PkContext['Warned']
+        if ($pkWarned.ContainsKey($PkName)) { return }
+        $pkWarned[$PkName] = $true
+        $pkFullName = [string]$PkContext['Prefix'] + $PkName
+    }
+    Write-PkMessage ($pkFullName + " used 'continue' or 'break' outside a loop of its own. PowerShell sends those to the nearest loop, which here is one of the kit's, so the kit stopped the callback there instead. Use 'return' to leave a callback early.") -Level Warn
 }
 
 # ==============================================================================
@@ -499,10 +491,9 @@ function Initialize-PkChildProcessJob {
 }
 
 function Initialize-PkThreadPool {
-    # Every redirected child process holds two thread-pool threads for its
-    # async stdout/stderr reads. The pool grows slowly past its minimum, so
-    # a burst of processes can leave reads waiting long enough to look like
-    # a hung process. Raise the minimum up front.
+    # Each redirected child holds two pool threads for its output reads, and
+    # the pool grows slowly past its minimum, so a burst of processes could
+    # stall their reads. Raise the minimum up front.
     param([int]$MaxConcurrentProcesses = 0)
     $clampedProcs = [Math]::Min([Math]::Max($MaxConcurrentProcesses, 0), 16000)
     $minimumWorkerThreads = [Math]::Max(128, (2 * $clampedProcs) + 32)
@@ -537,16 +528,15 @@ function Register-PkCancellationSource {
     # .SYNOPSIS
     # Adds your own CancellationTokenSource to the set an abort cancels.
     # .DESCRIPTION
-    # Every registered source is cancelled the moment an abort is detected. If an
+    # Every registered source is canceled the moment an abort is detected. If an
     # abort is still in force when you register (see Reset-PkAbortState), the source
-    # is cancelled straight away. A -Cts passed to Invoke-PkRunspaceJobs is
+    # is canceled right away. A -Cts passed to Invoke-PkRunspaceJobs is
     # registered for you. Remove it with Unregister-PkCancellationSource when done.
     # .PARAMETER Cts
     # The source to cancel on an abort.
 
-    # Cancelling a source registered while an old abort is still in force
-    # matters: otherwise a later run would start normally while its workers,
-    # seeing the old flag, quietly did nothing.
+    # Canceled at once while an old abort is in force: otherwise a later run
+    # would start while its workers, seeing the old flag, did nothing.
     param([Parameter(Mandatory)][System.Threading.CancellationTokenSource]$Cts)
     [PkState]::AddSource($Cts)
     if ([PkState]::AbortLatched) {
@@ -568,7 +558,7 @@ function Reset-PkAbortState {
     # Clears a finished abort so the engines run again.
     # .DESCRIPTION
     # An abort stays in force until this is called: until then every engine returns
-    # straight away with Aborted = $true. Invoke-PkRun calls it at the start of each
+    # right away with Aborted = $true. Invoke-PkRun calls it at the start of each
     # run, so you only need it to call an engine again outside Invoke-PkRun after an
     # abort.
 
@@ -632,7 +622,7 @@ function Test-PkAbortSignal {
 
 function Test-PkCancelRequested {
     # .SYNOPSIS
-    # For worker code: returns $true once this run is being cancelled or aborted.
+    # For worker code: returns $true once this run is being canceled or aborted.
     # .DESCRIPTION
     # Check it before any step that can't be undone (deleting a source file, say)
     # and skip the step if it's true: a worker that was force-stopped isn't killed,
@@ -683,7 +673,8 @@ function Invoke-PkRun {
     # and whatever is left is then stopped. A long step of your own in here must
     # check Test-PkAbortSignal now and then and stop when it's true, or Ctrl+C will
     # seem to do nothing until that step ends. Pressing Ctrl+C again, or closing the
-    # window, skips the wait; a third press stops the script as Ctrl+C normally does.
+    # window, skips the wait; a third press stops the script as Ctrl+C normally does,
+    # and the kit's engines still kill the programs they started.
     #
     # For the length of the run it also keeps the PC from idle-sleeping and turns off
     # the console's QuickEdit mode. Whatever the block outputs is passed through.
@@ -701,14 +692,11 @@ function Invoke-PkRun {
         [Parameter(Mandatory)]
         [scriptblock]$ScriptBlock,
         [bool]$DisableQuickEdit = $true,
-        # Stop the PC idle-sleeping for the length of the run (the display
-        # can still turn off; lid close / Start -> Sleep still work).
         [bool]$KeepAwake = $true
     )
-    # Already inside a run (a helper that brackets its own work, called
-    # from a bracketed caller): just run it. Re-arming here would wipe the
-    # outer run's abort state, and disarming on the way out would leave the
-    # rest of the outer run unprotected.
+    # Already inside a run: just run it. Re-arming would wipe the outer run's
+    # abort state, and disarming afterwards would leave the rest of it
+    # unprotected.
     if ([PkConsoleCtrl]::RunActive) {
         & $ScriptBlock
         return
@@ -717,7 +705,6 @@ function Invoke-PkRun {
     if (-not [PkChildProcessJob]::IsInitialized)     { $null = Initialize-PkChildProcessJob }
     Reset-PkAbortState
     [PkConsoleCtrl]::RunActive = $true
-    # Only turn QuickEdit back on afterwards if it was on to begin with.
     $quickEditWasOn = ([PkConsoleQuickEdit]::GetEnabled() -eq 1)
     if ($DisableQuickEdit -and $quickEditWasOn) { $null = [PkConsoleQuickEdit]::SetEnabled($false) }
     if ($KeepAwake) { $null = [PkSleepBlock]::Block() }
@@ -778,14 +765,12 @@ function ConvertTo-PkArgumentString {
 }
 
 function ConvertTo-PkArgumentStringCore {
-    # ConvertTo-PkArgumentString's body. -ForBatchFile is for a .bat or .cmd
-    # program, whose command line cmd.exe reads first: a quote inside an
-    # argument is written "" instead of \". cmd.exe counts every quote, and to
-    # it \" is an ordinary quote that ends the quoted part, so an argument like
-    # a" & del ... & " ran its second command. "" keeps cmd's count even, and a
-    # program the batch file passes %* on to still reads "" as one quote (the C
-    # runtime does). A line break would end cmd.exe's command line there and
-    # silently drop the rest, so it's refused.
+    # ConvertTo-PkArgumentString's body. -ForBatchFile: for a .bat or .cmd,
+    # whose command line cmd.exe reads first, a quote is written "" instead of
+    # \". cmd.exe counts every quote, \" included, so with \" an argument like
+    # a" & del ... & " runs a second command. "" keeps the count even, and the
+    # C runtime still reads it as one quote in a program the batch file passes
+    # %* to. A line break would end cmd.exe's command line, so it's refused.
     param(
         [AllowNull()]
         [AllowEmptyCollection()]
@@ -806,10 +791,10 @@ function ConvertTo-PkArgumentStringCore {
         if ($ForBatchFile -and $arg.IndexOfAny([char[]]@("`r", "`n")) -ge 0) {
             throw ("Arguments element " + $position + " contains a line break, which can't be passed to a .bat or .cmd program: cmd.exe would end the command line there and drop the rest. Pass it another way (a file, an environment variable).")
         }
-        # The C runtime only needs quotes around whitespace and quotes. The rest
-        # are cmd.exe's: it runs a .bat/.cmd program's command line, acting on
-        # & | < > ^ ( ) outside quotes and splitting batch arguments at , ;
-        # Quoting them is harmless to other programs.
+        # The C runtime only needs whitespace and quotes quoted. The rest are for
+        # cmd.exe, which runs a .bat/.cmd: it acts on & | < > ^ ( ) outside
+        # quotes and splits batch arguments at , ; Quoting them is harmless
+        # to other programs.
         if ($arg.Length -gt 0 -and $arg.IndexOfAny([char[]]@(' ', "`t", "`n", "`v", '"', '&', '|', '<', '>', '^', '(', ')', ',', ';')) -lt 0) {
             $parts.Add($arg)
             continue
@@ -844,13 +829,11 @@ function ConvertTo-PkArgumentStringCore {
 }
 
 function Resolve-PkArguments {
-    # -Arguments / Arguments as given -> the command line. A string is used as
-    # written; a list is quoted one argument per element, so a path with a space
-    # stays whole (a plain [string] cast would join it with spaces, or $OFS). A
-    # lone file or folder object is one argument, its full path. -FilePath is
-    # the program: a list for a .bat or .cmd is quoted for cmd.exe (see
-    # ConvertTo-PkArgumentStringCore). A bare name only ever finds an .exe,
-    # so a batch file always has its extension here.
+    # -Arguments as given -> the command line: a string as written, a list
+    # quoted one argument per element (a [string] cast would join it with
+    # spaces, or $OFS), a lone file or folder object as its full path.
+    # -FilePath picks batch-file quoting for a .bat or .cmd. A bare name only
+    # finds an .exe, so a batch file always has its extension here.
     param($Arguments, [string]$FilePath = '')
     if ($null -eq $Arguments) { return '' }
     if ($Arguments -is [string]) { return $Arguments }
@@ -939,7 +922,8 @@ function Start-PkProcess {
     # The program to run. A path with a folder in it is read as PowerShell reads
     # paths: .\tool.exe and bin\tool.exe are relative to your current location, and
     # drives like Data:\ or ~ work. A bare name (tool.exe) is found the way Windows
-    # finds programs, mostly on PATH.
+    # finds programs, mostly on PATH. Only an .exe is found without its extension:
+    # write a .cmd wrapper out in full (npm.cmd).
     # .PARAMETER Arguments
     # Its command line: one string, passed exactly as written, or a list, each
     # element one argument, quoted for you (see ConvertTo-PkArgumentString).
@@ -963,11 +947,9 @@ function Start-PkProcess {
 }
 
 function Start-PkProcessCore {
-    # Start-PkProcess's body. -CallerState is the session of whoever called the
-    # kit's public function, for paths only visible from there: the engines
-    # start programs from deep inside the module, where $PSCmdlet no longer
-    # leads back to the caller. Called by Start-PkProcess,
-    # Invoke-PkProcessWithTimeout, the dispatcher's default starter and the batch.
+    # Start-PkProcess's body. -CallerState: the session of whoever called the
+    # public function, for paths only visible from there. Deep inside the
+    # module, $PSCmdlet no longer leads back to the caller.
     param(
         [Parameter(Mandatory)]
         [string]$FilePath,
@@ -978,9 +960,7 @@ function Start-PkProcessCore {
     )
     $encoding = Resolve-PkEncoding -Encoding $OutputEncoding
     $commandLine = Resolve-PkArguments -Arguments $Arguments -FilePath $FilePath
-    # Self-starting: a caller who never ran Initialize-ParallelKit still
-    # gets children that die with the script, and output reads that
-    # aren't starved of threads. Both are cheap no-ops once done.
+    # For a caller who never ran Initialize-ParallelKit. No-ops once done.
     if (-not [PkChildProcessJob]::IsInitialized) { $null = [PkChildProcessJob]::Initialize() }
     if (-not [PkState]::ThreadPoolRaised)        { $null = Initialize-PkThreadPool }
 
@@ -996,18 +976,16 @@ function Start-PkProcessCore {
     $psi.RedirectStandardError  = $true
     $psi.CreateNoWindow         = $true
 
-    # Relative paths mean your current location, as everywhere else in
-    # PowerShell, not the process's working directory (which cd and
-    # Set-Location never change). From a location that isn't on disk (HKLM:,
-    # say) that's the last file-system one. If that folder is gone, fall back
-    # to the process's working directory, as before.
+    # Relative paths mean your current location, not the process's working
+    # directory, which Set-Location never changes. From a location that isn't
+    # on disk (HKLM:) that's the last file-system one. If that folder is gone,
+    # the process's working directory.
     $here = $ExecutionContext.SessionState.Path.CurrentFileSystemLocation.ProviderPath
     if (-not [System.IO.Directory]::Exists($here)) { $here = $null }
 
-    # In a try/catch on purpose: a bare .NET call that throws does not
-    # reliably stop a PowerShell script, and a $null process left behind
-    # would be polled forever. The path handling is in here too: it throws
-    # on a path with characters Windows doesn't allow.
+    # In a try/catch: a .NET call that throws doesn't reliably stop the
+    # script, and a $null process would be polled forever. The path handling
+    # is in here too: it throws on characters Windows doesn't allow.
     try {
         if ($WorkingDirectory) {
             if ($null -ne $here) { $WorkingDirectory = Resolve-PkFileSystemPath -Path $WorkingDirectory -Here $here -CallerState $CallerState }
@@ -1046,8 +1024,9 @@ function Stop-PkProcessTree {
     # .PARAMETER Process
     # The program(s), such as the Proc that Start-PkProcess returns.
     # .OUTPUTS
-    # [bool] For one program, $true if this call killed it and $false if it
-    # had already exited. For several, $true if this call killed any of them.
+    # [bool] For one program, $true if this call killed it, even if part of its
+    # tree couldn't be killed, and $false if it had already exited. For several,
+    # $true if this call killed any of them.
     param(
         [Parameter(Mandatory)]
         [AllowEmptyCollection()]
@@ -1069,14 +1048,12 @@ function Stop-PkProcessTree {
             if ($taskkill.WaitForExit(10000)) { $killed = ($taskkill.ExitCode -eq 0) }
         } finally { $taskkill.Dispose() }
     } catch { }  # taskkill missing or blocked: the fallback below still kills each process itself
-    # taskkill reports failure if any process in the trees couldn't be killed,
-    # even when it killed the program itself: one already gone (a child in
-    # another listed tree, or a `cmd /c` that ended on its own once taskkill
-    # killed its child, which it does first), or a child it wasn't allowed
-    # to kill. Count it as killing them if any listed process is now gone.
-    # A program that exited on its own in the moment since the check above
-    # counts as killed too. Of the kit's callers only Stop-PkTimedOutJob reads
-    # the result, and it only kills a program already past its time limit.
+    # taskkill fails if any process in the trees couldn't be killed, even when
+    # it killed the program: one already gone (a child in another listed tree,
+    # or a `cmd /c` that ended once taskkill killed its child, which it does
+    # first) or one it wasn't allowed to kill. So a listed process now gone
+    # counts as killed, even one that just exited on its own. Only
+    # Stop-PkTimedOutJob reads the result, and it only kills overdue programs.
     if (-not $killed) {
         foreach ($p in $alive) { if ($p.HasExited) { $killed = $true; break } }
     }
@@ -1090,9 +1067,9 @@ function Stop-PkProcessTree {
 }
 
 function Stop-PkJobProcesses {
-    # The dispatcher's force-stop: every running job's process tree in one
-    # Stop-PkProcessTree call, rather than one taskkill per job. A custom
-    # starter's .Proc may not be a Process; those are skipped.
+    # The dispatcher's force-stop: every running job's tree in one
+    # Stop-PkProcessTree call. A custom starter's .Proc may not be a Process;
+    # those are skipped.
     param([System.Collections.Generic.List[hashtable]]$Jobs)
     $procs = foreach ($job in $Jobs) { if ($job['Proc'] -is [System.Diagnostics.Process]) { $job['Proc'] } }
     try { $null = Stop-PkProcessTree -Process @($procs) } catch { }  # best effort; each job is still waited on and disposed after
@@ -1113,10 +1090,9 @@ function Get-PkJobTimeLimit {
 }
 
 function Stop-PkTimedOutJob {
-    # Kills a dispatcher job's program tree once it passes the job's TimeLimit and
-    # sets TimedOut; the poll then sees it exited and it is finalized like any
-    # other. Only a .Proc that is a real Process is timed: anything else is left
-    # to the job's own -JobPollCompleted.
+    # Kills a dispatcher job's program tree once it passes its TimeLimit and
+    # sets TimedOut; the job is then finalized like any other. Only a .Proc
+    # that is a real Process is timed.
     param([hashtable]$Job)
     $proc = $Job['Proc']
     $clock = $Job['Stopwatch']
@@ -1165,12 +1141,11 @@ function Wait-PkProcess {
 
 function Wait-PkRunningJobs {
     # The dispatch loop's pause: until a running program exits, the token is
-    # cancelled, or TimeoutMs passes. Only programs that haven't exited are waited
-    # on: a -JobPollCompleted can keep saying "not done" after the exit, and the
-    # signalled handle would make every wait return at once and spin a core.
-    # A job with no real process, or past the 63 handles WaitAny can hold on an STA
-    # thread (one of them the token), is only noticed when the time is up. With
-    # nothing to wait on, a plain sleep. Same handle wrapping as Wait-PkProcess.
+    # canceled, or TimeoutMs passes. Exited programs aren't waited on: a
+    # -JobPollCompleted can keep saying "not done" after the exit, and the
+    # signaled handle would spin a core. A job with no real process, or past
+    # the 63 handles WaitAny holds on an STA thread (one is the token), is only
+    # noticed when the time is up. Same handle wrapping as Wait-PkProcess.
     param(
         [System.Collections.Generic.List[hashtable]]$Jobs,
         [System.Threading.CancellationToken]$CancelToken,
@@ -1223,9 +1198,8 @@ function Complete-PkProcess {
     # .OUTPUTS
     # An object with ExitCode, Stdout, Stderr, StreamTimedOut and StreamError.
 
-    # Only -Job by position: with -Dispose a switch, the old `-Dispose $true`
-    # would otherwise hand its $true to -StreamTimeoutMs (1 ms) and cut the
-    # output off without an error. This way it's an error.
+    # Only -Job by position: otherwise `-Dispose $true` would bind $true to
+    # -StreamTimeoutMs (1 ms) and cut the output off without an error.
     [CmdletBinding(PositionalBinding = $false)]
     param(
         [Parameter(Mandatory, Position = 0)]
@@ -1234,9 +1208,9 @@ function Complete-PkProcess {
         [switch]$Dispose
     )
     $result = [ordered]@{ ExitCode = $null; Stdout = $null; Stderr = $null; StreamTimedOut = $false; StreamError = $null }
-    # A job started by a custom starter may have no read tasks, and a read
-    # can fail. Neither is worth an exception here - this runs inside
-    # JobFinalize, where a throw stops the whole dispatcher.
+    # A custom starter's job may have no read tasks, and a read can fail.
+    # Neither throws: this runs inside JobFinalize, where a throw stops the
+    # whole dispatcher.
     $tasks = [System.Collections.Generic.List[System.Threading.Tasks.Task]]::new()
     if ($null -ne $Job['StdoutTask']) { $tasks.Add($Job['StdoutTask']) }
     if ($null -ne $Job['StderrTask']) { $tasks.Add($Job['StderrTask']) }
@@ -1260,7 +1234,7 @@ function Invoke-PkProcessWithTimeout {
     # Runs one program to completion, with a hard time limit.
     # .DESCRIPTION
     # Throws if the program had to be killed: because it ran past -TimeoutMs, or
-    # because the run was aborted or cancelled while it was going. Anything the
+    # because the run was aborted or canceled while it was going. Anything the
     # program started is killed with it.
     # .PARAMETER FilePath
     # The program to run.
@@ -1290,14 +1264,11 @@ function Invoke-PkProcessWithTimeout {
         [int]$StreamTimeoutMs = 15000,
         [string]$WorkingDirectory = "",
         $OutputEncoding = $null,
-        # For a program that has to run BECAUSE of an abort (cleanup, a
-        # restore step): keep going even though the run is being aborted.
         [switch]$IgnoreAbort
     )
     $job = Start-PkProcessCore -FilePath $FilePath -Arguments $Arguments -WorkingDirectory $WorkingDirectory -OutputEncoding $OutputEncoding -CallerState $PSCmdlet.SessionState
     try {
-        # Wait in short slices so Ctrl+C (or the run's cancel token) is
-        # noticed within a moment, not after the whole time limit.
+        # Short slices, so an abort or cancel is noticed within a moment.
         $waited  = [System.Diagnostics.Stopwatch]::StartNew()
         $exited  = $false
         $stopWhy = $null
@@ -1309,9 +1280,9 @@ function Invoke-PkProcessWithTimeout {
         }
         if (-not $exited) {
             try { $null = Stop-PkProcessTree -Process $job['Proc'] } catch { }   # best effort - the throw below still reports why
-            # Let the two output reads finish (the kill closes their pipes)
-            # before the process is disposed under them. Bounded, and any
-            # read error is irrelevant - the stop reason is what gets reported.
+            # Let the output reads finish (the kill closes their pipes) before
+            # the process is disposed under them. Bounded; a read error doesn't
+            # matter here.
             try { $null = [System.Threading.Tasks.Task]::WaitAll(@($job['StdoutTask'], $job['StderrTask']), 500) } catch { }
             throw ("'" + $FilePath + "' " + $stopWhy + " - killed")
         }
@@ -1336,8 +1307,9 @@ function Invoke-PkProcessDispatch {
     # .DESCRIPTION
     # Groups are pulled one at a time from -GroupProvider; -JobBuilder turns each
     # into job hashtables; jobs run up to -MaxConcurrent at once across all groups;
-    # -GroupCompleteCallback fires when a group's last job finishes. Anything your
-    # callbacks output is discarded.
+    # -GroupCompleteCallback fires when a group's last job finishes. Apart from the
+    # return values described below, anything your callbacks output is discarded.
+    # Leave a callback early with return: continue and break end it too, but warn.
     #
     # The dispatcher keeps its own state on each job hashtable. Don't use these keys
     # for anything else: GroupKey, SlotReleased, Proc, StdoutTask, StderrTask,
@@ -1373,8 +1345,8 @@ function Invoke-PkProcessDispatch {
     # { param($runningJobs) } run on every loop pass, with the jobs currently running.
     # -AbortPollCallback (its name before 3.0) also works.
     # .PARAMETER CancelToken
-    # Stops the dispatcher when cancelled. An abort stops it either way, without
-    # cancelling this token.
+    # Stops the dispatcher when canceled. An abort stops it either way, without
+    # canceling this token.
     # .PARAMETER AbortTimeoutSeconds
     # How long an abort waits for running jobs before force-stopping them
     # (default 60). A force-stopped program is killed along with anything it
@@ -1447,9 +1419,8 @@ function Invoke-PkProcessDispatch {
     # Invoke-PkProcessBatch has the same check, so its error names the batch.
     if ($pkTimeoutSeconds -lt 0) { throw "Invoke-PkProcessDispatch: -TimeoutSeconds must be 0 (no limit) or more." }
 
-    # Two pool threads per running process for its output reads - make sure
-    # they exist up front. For a shared budget, the slots free right now
-    # are the best available measure of its size.
+    # Size the thread pool up front. For a shared budget, its free slots now
+    # are the best measure of its size.
     $pkPoolSizeHint = 0
     if ($pkMaxConcurrent -is [int]) { $pkPoolSizeHint = $pkMaxConcurrent }
     elseif ($pkMaxConcurrent -is [System.Threading.SemaphoreSlim]) { $pkPoolSizeHint = $pkMaxConcurrent.CurrentCount }
@@ -1483,10 +1454,9 @@ function Invoke-PkProcessDispatch {
             $pkCancelToken = $pkOwnCts.Token
         }
     } else {
-        # The caller's own token: nothing would cancel it on Ctrl+C. Run on
-        # a linked source that an abort DOES cancel (and that still follows
-        # the caller's token). In a worker it also follows the run's token,
-        # so the run being cancelled for any reason stops this dispatcher.
+        # Nothing cancels the caller's token on Ctrl+C, so run on a linked
+        # source an abort does cancel. In a worker it also follows the run's
+        # token.
         $pkLinkTokens = [System.Collections.Generic.List[System.Threading.CancellationToken]]::new()
         $pkLinkTokens.Add($pkCancelToken)
         if ($null -ne $global:PkCancelToken) { $pkLinkTokens.Add($global:PkCancelToken) }
@@ -1510,20 +1480,17 @@ function Invoke-PkProcessDispatch {
 }
 
 function Add-PkDispatchGroupJobs {
-    # Builds one group's jobs, tags them with the group and queues them.
-    # Returns how many were queued. Its own function, not inline in the
-    # dispatch loop, so the group's job list dies with this call. Kept in the
-    # loop's frame it stayed alive for the whole run, and with it every
-    # finished job's output, even output the caller had already dropped.
-    # Nulling the variables in the loop didn't help once the kit had run many
-    # times in a session (most likely PowerShell's compiled code keeping its
-    # own references); a separate call did.
+    # Builds one group's jobs, tags them with the group and queues them;
+    # returns how many. Its own function so the group's job list dies with
+    # this call: in the dispatch loop's frame it kept every finished job's
+    # output alive for the whole run, and nulling the variables there didn't
+    # release it.
     param(
         [Parameter(Mandatory)][scriptblock]$JobBuilder,
         $GroupInfo,
         [Parameter(Mandatory)][object]$GroupKey,
         [Parameter(Mandatory)][System.Collections.Generic.Queue[hashtable]]$Pending,
-        [hashtable]$CallbackWarned
+        [hashtable]$CallbackContext
     )
     # pk-prefixed, parameters included: inside a worker runspace the kit isn't
     # a module, so a callback without .GetNewClosure() sees this frame's
@@ -1532,12 +1499,11 @@ function Add-PkDispatchGroupJobs {
     $pkGroupInfo = $GroupInfo
     $pkGroupKey = $GroupKey
     $pkPending = $Pending
-    $pkCallbackWarned = $CallbackWarned
-    Remove-Variable -Name JobBuilder, GroupInfo, GroupKey, Pending, CallbackWarned -Scope Local
-    $pkRawJobs = Invoke-PkCallback -PkCallback $pkJobBuilder -PkArgs @(,$pkGroupInfo) -PkName 'ProcessDispatch: -JobBuilder' -PkWarned $pkCallbackWarned
-    # Assigned inside each branch, NOT `$pkJobs = if (...) {...} else {...}`:
-    # captured through an if/else, a single hashtable gets
-    # enumerated into its key/value pairs.
+    $pkCallbackContext = $CallbackContext
+    Remove-Variable -Name JobBuilder, GroupInfo, GroupKey, Pending, CallbackContext -Scope Local
+    $pkRawJobs = Invoke-PkCallback -PkCallback $pkJobBuilder -PkArgs @(,$pkGroupInfo) -PkName '-JobBuilder' -PkContext $pkCallbackContext
+    # Assigned in each branch, not `$x = if ... else ...`: captured that way,
+    # a single hashtable is enumerated into its key/value pairs.
     if ($null -eq $pkRawJobs) { $pkRawJobList = @() } else { $pkRawJobList = @($pkRawJobs) }
     # Keep only real job hashtables: a builder that lets a stray
     # value escape (a HashSet.Add's True, say) must not crash the run.
@@ -1614,38 +1580,36 @@ function Invoke-PkProcessDispatchCore {
     # The job -JobStarter is working on: not in $pkRunning yet, but it may
     # already have a program and a shared slot.
     $pkStarting = $null
-    # Callbacks that used continue/break, so each is only warned about once.
-    $pkCallbackWarned = @{}
-    # Teardown is in a finally, guarded by this flag, not in a catch: when
-    # PowerShell stops the script (Ctrl+C outside Invoke-PkRun, the runspace
-    # engine force-stopping a worker) catch blocks are skipped and only
-    # finally blocks run.
+    # Invoke-PkCallback's -PkContext: callbacks that used continue/break are
+    # warned about once each, under this prefix.
+    $pkCallbackContext = @{ Prefix = 'ProcessDispatch: '; Warned = @{} }
+    # Teardown is in a finally, guarded by this flag: when PowerShell stops
+    # the script (Ctrl+C outside Invoke-PkRun, the runspace engine
+    # force-stopping a worker), catch blocks are skipped.
     $pkLoopDone = $false
     try {
     while ((-not $pkCancelToken.IsCancellationRequested) -and `
            (-not $pkProviderExhausted -or $pkActiveGroupCount -gt 0 -or $pkPending.Count -gt 0 -or $pkRunning.Count -gt 0)) {
 
         for ($pkH = $pkHeldGroups.Count - 1; $pkH -ge 0; $pkH--) {
-            if ([bool](Invoke-PkCallback -PkCallback $pkGroupReleaseCheck -PkArgs @(,$pkHeldGroups[$pkH]) -PkName 'ProcessDispatch: -GroupReleaseCheck' -PkWarned $pkCallbackWarned)) {
+            if ([bool](Invoke-PkCallback -PkCallback $pkGroupReleaseCheck -PkArgs @(,$pkHeldGroups[$pkH]) -PkName '-GroupReleaseCheck' -PkContext $pkCallbackContext)) {
                 $pkHeldGroups.RemoveAt($pkH)
                 $pkActiveGroupCount--
             }
         }
 
         while ((-not $pkProviderExhausted) -and $pkActiveGroupCount -lt $pkMaxQueueAhead -and (-not $pkCancelToken.IsCancellationRequested)) {
-            $pkGroupInfo = Invoke-PkCallback -PkCallback $pkGroupProvider -PkName 'ProcessDispatch: -GroupProvider' -PkWarned $pkCallbackWarned
+            $pkGroupInfo = Invoke-PkCallback -PkCallback $pkGroupProvider -PkName '-GroupProvider' -PkContext $pkCallbackContext
             if ($null -eq $pkGroupInfo) { $pkProviderExhausted = $true; break }
-            # A fresh object per group, NOT the group value itself: two
-            # groups that compare equal (the same folder name, say) must not
-            # share one job count. Jobs carry this key as .GroupKey and the
-            # group value itself as .Group.
+            # A fresh key per group, not the group value: two groups that
+            # compare equal (the same folder name) mustn't share a job count.
             $pkGroupKey = [object]::new()
-            $pkJobCount = Add-PkDispatchGroupJobs -JobBuilder $pkJobBuilder -GroupInfo $pkGroupInfo -GroupKey $pkGroupKey -Pending $pkPending -CallbackWarned $pkCallbackWarned
+            $pkJobCount = Add-PkDispatchGroupJobs -JobBuilder $pkJobBuilder -GroupInfo $pkGroupInfo -GroupKey $pkGroupKey -Pending $pkPending -CallbackContext $pkCallbackContext
             $pkState = @{ GroupInfo = $pkGroupInfo; Outstanding = $pkJobCount; Completed = $false }
             $pkGroupStates[$pkGroupKey] = $pkState
             $pkActiveGroupCount++
             if ($pkState.Outstanding -le 0) {
-                $null = Invoke-PkCallback -PkCallback $pkGroupCompleteCallback -PkArgs @(,$pkGroupInfo) -PkName 'ProcessDispatch: -GroupCompleteCallback' -PkWarned $pkCallbackWarned
+                $null = Invoke-PkCallback -PkCallback $pkGroupCompleteCallback -PkArgs @(,$pkGroupInfo) -PkName '-GroupCompleteCallback' -PkContext $pkCallbackContext
                 $pkState.Completed = $true
                 if ($null -ne $pkGroupReleaseCheck) { $pkHeldGroups.Add($pkGroupInfo) } else { $pkActiveGroupCount-- }
                 $pkGroupResults.Add([pscustomobject][ordered]@{ GroupInfo = $pkGroupInfo; Completed = $true; Aborted = $false })
@@ -1655,23 +1619,23 @@ function Invoke-PkProcessDispatchCore {
         # Main thread: this is what notices an abort and cancels the token.
         # Worker: just reads the flag; the main thread cancels the token.
         $null = Test-PkAbortSignal
-        if ($pkPollCallback) { $null = Invoke-PkCallback -PkCallback $pkPollCallback -PkArgs @(,@($pkRunning)) -PkName 'ProcessDispatch: -PollCallback' -PkWarned $pkCallbackWarned }
+        # This and the per-job callbacks below inline Invoke-PkCallback.
+        if ($pkPollCallback) {
+            $pkCbDone = $false
+            $null = do { & $pkPollCallback @($pkRunning); $pkCbDone = $true } while ($false)
+            if (-not $pkCbDone) { Write-PkCallbackLoopWarning -PkName '-PollCallback' -PkContext $pkCallbackContext }
+        }
 
         while ($pkPending.Count -gt 0 -and (-not $pkCancelToken.IsCancellationRequested) -and `
                $(if ($pkIsSharedBudget) { $pkMaxConcurrent.Wait(0) } else { $pkRunning.Count -lt $pkMaxConcurrent })) {
             $pkJob = $pkPending.Dequeue()
             try {
-                # Don't trust the starter's output shape: a starter that
-                # forgets to return the job (or leaks other output) would
-                # leave something un-pollable in $pkRunning and spin forever.
-                # The running job is always the caller's own job object, so
-                # the fields its builder set are still there at finalize
-                # time. If the starter output a DIFFERENT hashtable (a bare
-                # `Start-PkProcess ...` outputs its start result), fold that
-                # one's fields into the job rather than swapping the job out.
-                # A job object that has been round once already (JobFinalize
-                # put the SAME object back on the queue) still carries its
-                # old, disposed process - clear that before it starts again.
+                # The running job is always the caller's own object: a starter
+                # that forgets to return it, or leaks other output, would
+                # otherwise leave something un-pollable running. A different
+                # hashtable it outputs (a bare Start-PkProcess result) has its
+                # fields folded in. A job JobFinalize re-queued still carries
+                # its old, disposed process: cleared first.
                 if ($pkJob['SlotReleased']) {
                     $pkJob['Proc'] = $null; $pkJob['StdoutTask'] = $null; $pkJob['StderrTask'] = $null; $pkJob['Stopwatch'] = $null
                 }
@@ -1681,7 +1645,9 @@ function Invoke-PkProcessDispatchCore {
                 $pkStartFailureText = "ProcessDispatch: a job couldn't start: "
                 $pkJob['TimeLimit'] = Get-PkJobTimeLimit -Job $pkJob -DefaultTimeoutSeconds $pkTimeoutSeconds
                 $pkStartFailureText = "ProcessDispatch: JobStarter failed to start a job: "
-                $pkStartedRaw = Invoke-PkCallback -PkCallback $pkJobStarter -PkArgs @(,$pkJob) -PkName 'ProcessDispatch: -JobStarter' -PkWarned $pkCallbackWarned
+                $pkCbDone = $false
+                $pkStartedRaw = do { & $pkJobStarter $pkJob; $pkCbDone = $true } while ($false)
+                if (-not $pkCbDone) { Write-PkCallbackLoopWarning -PkName '-JobStarter' -PkContext $pkCallbackContext }
                 foreach ($pkItem in @($pkStartedRaw)) {
                     if ($pkItem -isnot [hashtable] -or [object]::ReferenceEquals($pkItem, $pkJob)) { continue }
                     foreach ($pkItemKey in @($pkItem.Keys)) {
@@ -1696,12 +1662,11 @@ function Invoke-PkProcessDispatchCore {
                 $pkRunning.Add($pkJob)
                 $pkStarting = $null
             } catch {
-                # Release BEFORE reporting: if reporting throws, the slot
-                # would otherwise leak (this job never reached $pkRunning, so
-                # the outer cleanup can't find it). $pkStarting is cleared
-                # first, so the teardown can't release the same slot again.
-                # A starter that started its program and then threw: nothing
-                # tracks that program now, so kill it before its slot goes back.
+                # Release before reporting: this job isn't in $pkRunning, so if
+                # reporting threw, nothing would release its slot. A program the
+                # starter started before throwing is killed first: nothing else
+                # tracks it. $pkStarting is cleared before the release, so the
+                # teardown can't release the slot again.
                 if ($pkJob['Proc'] -is [System.Diagnostics.Process]) {
                     try { $null = Stop-PkProcessTree -Process $pkJob['Proc'] } catch { }   # best effort; the failed start is still reported below
                     try { $pkJob['Proc'].Dispose() } catch { }
@@ -1716,7 +1681,7 @@ function Invoke-PkProcessDispatchCore {
                     $pkState = $pkGroupStates[$pkKey]
                     $pkState.Outstanding--
                     if ($pkState.Outstanding -le 0 -and -not $pkState.Completed) {
-                        $null = Invoke-PkCallback -PkCallback $pkGroupCompleteCallback -PkArgs @(,$pkState.GroupInfo) -PkName 'ProcessDispatch: -GroupCompleteCallback' -PkWarned $pkCallbackWarned
+                        $null = Invoke-PkCallback -PkCallback $pkGroupCompleteCallback -PkArgs @(,$pkState.GroupInfo) -PkName '-GroupCompleteCallback' -PkContext $pkCallbackContext
                         $pkState.Completed = $true
                         $pkActiveGroupCount--
                         $pkGroupResults.Add([pscustomobject][ordered]@{ GroupInfo = $pkState.GroupInfo; Completed = $true; Aborted = $false })
@@ -1733,18 +1698,20 @@ function Invoke-PkProcessDispatchCore {
         $pkStillRunning = [System.Collections.Generic.List[hashtable]]::new()
         foreach ($pkJob in $pkRunning) {
             if ($pkJob['TimeLimit'] -gt 0) { Stop-PkTimedOutJob -Job $pkJob }
-            if (Invoke-PkCallback -PkCallback $pkJobPollCompleted -PkArgs @(,$pkJob) -PkName 'ProcessDispatch: -JobPollCompleted' -PkWarned $pkCallbackWarned) {
+            $pkCbDone = $false
+            $pkPolled = do { & $pkJobPollCompleted $pkJob; $pkCbDone = $true } while ($false)
+            if (-not $pkCbDone) { Write-PkCallbackLoopWarning -PkName '-JobPollCompleted' -PkContext $pkCallbackContext }
+            if ($pkPolled) {
                 $pkPendingBefore = $pkPending.Count
-                $null = Invoke-PkCallback -PkCallback $pkJobFinalize -PkArgs @($pkJob, $pkPending) -PkName 'ProcessDispatch: -JobFinalize' -PkWarned $pkCallbackWarned
+                $pkCbDone = $false
+                $null = do { & $pkJobFinalize $pkJob $pkPending; $pkCbDone = $true } while ($false)
+                if (-not $pkCbDone) { Write-PkCallbackLoopWarning -PkName '-JobFinalize' -PkContext $pkCallbackContext }
                 try { if ($pkJob['Proc']) { $pkJob['Proc'].Dispose() } } catch { }   # a failed Dispose can't affect the result already taken
                 if ($pkIsSharedBudget) { $null = $pkMaxConcurrent.Release() }
                 $pkJob['SlotReleased'] = $true
-                # Whatever JobFinalize queued (a retry, follow-up steps) is counted
-                # into its group HERE, by looking at the queue - not by trusting a
-                # returned flag. A flag with nothing queued would hang the group
-                # forever; two follow-ups would let it finish early.
-                # Only when the queue actually grew - walking it on every finished
-                # job would cost a full pass over a large batch each time.
+                # Whatever JobFinalize queued (a retry, follow-ups) joins its group
+                # here, read off the queue rather than a returned flag. Only when the
+                # queue grew: walking it for every job is slow on a large batch.
                 if ($pkPending.Count -gt $pkPendingBefore) {
                     $pkQueuedIndex = 0
                     foreach ($pkQueued in $pkPending) {
@@ -1761,7 +1728,7 @@ function Invoke-PkProcessDispatchCore {
                         $pkState = $pkGroupStates[$pkKey]
                         $pkState.Outstanding--
                         if ($pkState.Outstanding -le 0 -and -not $pkState.Completed) {
-                            $null = Invoke-PkCallback -PkCallback $pkGroupCompleteCallback -PkArgs @(,$pkState.GroupInfo) -PkName 'ProcessDispatch: -GroupCompleteCallback' -PkWarned $pkCallbackWarned
+                            $null = Invoke-PkCallback -PkCallback $pkGroupCompleteCallback -PkArgs @(,$pkState.GroupInfo) -PkName '-GroupCompleteCallback' -PkContext $pkCallbackContext
                             $pkState.Completed = $true
                             $pkActiveGroupCount--
                             $pkGroupResults.Add([pscustomobject][ordered]@{ GroupInfo = $pkState.GroupInfo; Completed = $true; Aborted = $false })
@@ -1774,12 +1741,10 @@ function Invoke-PkProcessDispatchCore {
                 $pkStillRunning.Add($pkJob)
             }
         }
-        # A job that finished freed a slot: go straight round and refill it.
-        # Not on a shared budget, where a sibling dispatcher only looks for a
-        # free slot every 50 ms: refilling at once took every slot until this
-        # dispatcher's queue ran out, and the sibling got none.
-        # The wait's 50 ms cap is how soon an abort flag or a sibling's released
-        # slot is noticed, neither of which wakes it.
+        # A finished job freed a slot: refill it right away. Not on a shared
+        # budget, where a sibling dispatcher only looks every 50 ms and
+        # refilling at once starved it. The 50 ms cap is how soon an abort or a
+        # sibling's released slot is noticed: neither wakes the wait.
         $pkAnyFinished = ($pkStillRunning.Count -lt $pkRunning.Count)
         $pkRunning = $pkStillRunning
 
@@ -1794,18 +1759,20 @@ function Invoke-PkProcessDispatchCore {
             $pkStillWaiting = [System.Collections.Generic.List[hashtable]]::new()
             foreach ($pkJob in $pkRunning) {
                 if ($pkJob['TimeLimit'] -gt 0) { Stop-PkTimedOutJob -Job $pkJob }
-                if (Invoke-PkCallback -PkCallback $pkJobPollCompleted -PkArgs @(,$pkJob) -PkName 'ProcessDispatch: -JobPollCompleted' -PkWarned $pkCallbackWarned) {
+                $pkCbDone = $false
+                $pkPolled = do { & $pkJobPollCompleted $pkJob; $pkCbDone = $true } while ($false)
+                if (-not $pkCbDone) { Write-PkCallbackLoopWarning -PkName '-JobPollCompleted' -PkContext $pkCallbackContext }
+                if ($pkPolled) {
                     $pkPendingBefore = $pkPending.Count
-                    $null = Invoke-PkCallback -PkCallback $pkJobFinalize -PkArgs @($pkJob, $pkPending) -PkName 'ProcessDispatch: -JobFinalize' -PkWarned $pkCallbackWarned
+                    $pkCbDone = $false
+                    $null = do { & $pkJobFinalize $pkJob $pkPending; $pkCbDone = $true } while ($false)
+                    if (-not $pkCbDone) { Write-PkCallbackLoopWarning -PkName '-JobFinalize' -PkContext $pkCallbackContext }
                     try { if ($pkJob['Proc']) { $pkJob['Proc'].Dispose() } } catch { }
                     if ($pkIsSharedBudget) { $null = $pkMaxConcurrent.Release() }
                     $pkJob['SlotReleased'] = $true
-                    # Whatever JobFinalize queued (a retry, follow-up steps) is counted
-                    # into its group HERE, by looking at the queue - not by trusting a
-                    # returned flag. A flag with nothing queued would hang the group
-                    # forever; two follow-ups would let it finish early.
-                    # Only when the queue actually grew - walking it on every finished
-                    # job would cost a full pass over a large batch each time.
+                    # Whatever JobFinalize queued (a retry, follow-ups) joins its group
+                    # here, read off the queue rather than a returned flag. Only when the
+                    # queue grew: walking it for every job is slow on a large batch.
                     if ($pkPending.Count -gt $pkPendingBefore) {
                         $pkQueuedIndex = 0
                         foreach ($pkQueued in $pkPending) {
@@ -1822,7 +1789,7 @@ function Invoke-PkProcessDispatchCore {
                             $pkState = $pkGroupStates[$pkKey]
                             $pkState.Outstanding--
                             if ($pkState.Outstanding -le 0 -and -not $pkState.Completed) {
-                                $null = Invoke-PkCallback -PkCallback $pkGroupCompleteCallback -PkArgs @(,$pkState.GroupInfo) -PkName 'ProcessDispatch: -GroupCompleteCallback' -PkWarned $pkCallbackWarned
+                                $null = Invoke-PkCallback -PkCallback $pkGroupCompleteCallback -PkArgs @(,$pkState.GroupInfo) -PkName '-GroupCompleteCallback' -PkContext $pkCallbackContext
                                 $pkState.Completed = $true
                                 $pkActiveGroupCount--
                                 $pkGroupResults.Add([pscustomobject][ordered]@{ GroupInfo = $pkState.GroupInfo; Completed = $true; Aborted = $false })
@@ -1839,27 +1806,28 @@ function Invoke-PkProcessDispatchCore {
             if ($pkRunning.Count -gt 0) { [System.Threading.Thread]::Sleep(250) }
         }
 
-        # ---- BLOCK: mandatory final completion-check pass ----
-        # A window-close can exit the loop above before a single poll, and
-        # a job can finish in the last 250ms before the deadline. One more
-        # pass so a finished job is never thrown away as "force-stopped".
-        # (keep in sync with the two blocks above, except the time limit:
-        # whatever is still running is force-stopped together just below)
+        # ---- BLOCK: final pass ----
+        # A window close can end the loop above before any poll, and a job can
+        # finish just before the deadline: a finished job mustn't count as
+        # force-stopped. Keep in sync with the two blocks above, minus the time
+        # limit (whatever is left is force-stopped just below).
         if ($pkRunning.Count -gt 0) {
             $pkStillWaiting = [System.Collections.Generic.List[hashtable]]::new()
             foreach ($pkJob in $pkRunning) {
-                if (Invoke-PkCallback -PkCallback $pkJobPollCompleted -PkArgs @(,$pkJob) -PkName 'ProcessDispatch: -JobPollCompleted' -PkWarned $pkCallbackWarned) {
+                $pkCbDone = $false
+                $pkPolled = do { & $pkJobPollCompleted $pkJob; $pkCbDone = $true } while ($false)
+                if (-not $pkCbDone) { Write-PkCallbackLoopWarning -PkName '-JobPollCompleted' -PkContext $pkCallbackContext }
+                if ($pkPolled) {
                     $pkPendingBefore = $pkPending.Count
-                    $null = Invoke-PkCallback -PkCallback $pkJobFinalize -PkArgs @($pkJob, $pkPending) -PkName 'ProcessDispatch: -JobFinalize' -PkWarned $pkCallbackWarned
+                    $pkCbDone = $false
+                    $null = do { & $pkJobFinalize $pkJob $pkPending; $pkCbDone = $true } while ($false)
+                    if (-not $pkCbDone) { Write-PkCallbackLoopWarning -PkName '-JobFinalize' -PkContext $pkCallbackContext }
                     try { if ($pkJob['Proc']) { $pkJob['Proc'].Dispose() } } catch { }
                     if ($pkIsSharedBudget) { $null = $pkMaxConcurrent.Release() }
                     $pkJob['SlotReleased'] = $true
-                    # Whatever JobFinalize queued (a retry, follow-up steps) is counted
-                    # into its group HERE, by looking at the queue - not by trusting a
-                    # returned flag. A flag with nothing queued would hang the group
-                    # forever; two follow-ups would let it finish early.
-                    # Only when the queue actually grew - walking it on every finished
-                    # job would cost a full pass over a large batch each time.
+                    # Whatever JobFinalize queued (a retry, follow-ups) joins its group
+                    # here, read off the queue rather than a returned flag. Only when the
+                    # queue grew: walking it for every job is slow on a large batch.
                     if ($pkPending.Count -gt $pkPendingBefore) {
                         $pkQueuedIndex = 0
                         foreach ($pkQueued in $pkPending) {
@@ -1876,7 +1844,7 @@ function Invoke-PkProcessDispatchCore {
                             $pkState = $pkGroupStates[$pkKey]
                             $pkState.Outstanding--
                             if ($pkState.Outstanding -le 0 -and -not $pkState.Completed) {
-                                $null = Invoke-PkCallback -PkCallback $pkGroupCompleteCallback -PkArgs @(,$pkState.GroupInfo) -PkName 'ProcessDispatch: -GroupCompleteCallback' -PkWarned $pkCallbackWarned
+                                $null = Invoke-PkCallback -PkCallback $pkGroupCompleteCallback -PkArgs @(,$pkState.GroupInfo) -PkName '-GroupCompleteCallback' -PkContext $pkCallbackContext
                                 $pkState.Completed = $true
                                 $pkActiveGroupCount--
                                 $pkGroupResults.Add([pscustomobject][ordered]@{ GroupInfo = $pkState.GroupInfo; Completed = $true; Aborted = $false })
@@ -1899,7 +1867,7 @@ function Invoke-PkProcessDispatchCore {
             Stop-PkJobProcesses -Jobs $pkRunning
             foreach ($pkJob in $pkRunning) {
                 try { if ($pkJob['Proc']) { $null = $pkJob['Proc'].WaitForExit(5000) } } catch { }
-                try { $null = Invoke-PkCallback -PkCallback $pkJobAbortCleanup -PkArgs @(,$pkJob) -PkName 'ProcessDispatch: -JobAbortCleanup' -PkWarned $pkCallbackWarned } catch { }
+                try { $null = Invoke-PkCallback -PkCallback $pkJobAbortCleanup -PkArgs @(,$pkJob) -PkName '-JobAbortCleanup' -PkContext $pkCallbackContext } catch { }
                 try { if ($pkJob['Proc']) { $pkJob['Proc'].Dispose() } } catch { }
                 if ($pkIsSharedBudget) { try { $null = $pkMaxConcurrent.Release() } catch { } }
                 $pkJob['SlotReleased'] = $true
@@ -1909,19 +1877,18 @@ function Invoke-PkProcessDispatchCore {
     $pkLoopDone = $true
     } finally {
         if (-not $pkLoopDone) {
-            # Best-effort teardown on the way out of an error or a stop; an
-            # error carries on up by itself. A job with SlotReleased set was
-            # already finalized or force-stopped, and its process disposed:
-            # left alone, since a disposed Process makes Stop-PkProcessTree
-            # throw part-way through. Same per-job steps as the abort wait's
-            # force-stop above; keep the two in step.
+            # Best-effort teardown after an error or a stop (an error carries
+            # on up by itself). Jobs with SlotReleased set are already done and
+            # disposed, and a disposed Process makes Stop-PkProcessTree throw
+            # part-way. Same per-job steps as the force-stop above; keep the
+            # two in step.
             $pkTearDown = [System.Collections.Generic.List[hashtable]]::new()
             foreach ($pkJob in $pkRunning) { if (-not $pkJob['SlotReleased']) { $pkTearDown.Add($pkJob) } }
             if ($null -ne $pkStarting -and -not $pkTearDown.Contains($pkStarting)) { $pkTearDown.Add($pkStarting) }
             Stop-PkJobProcesses -Jobs $pkTearDown
             foreach ($pkJob in $pkTearDown) {
                 try { if ($pkJob['Proc']) { $null = $pkJob['Proc'].WaitForExit(5000) } } catch { }
-                try { $null = Invoke-PkCallback -PkCallback $pkJobAbortCleanup -PkArgs @(,$pkJob) -PkName 'ProcessDispatch: -JobAbortCleanup' -PkWarned $pkCallbackWarned } catch { }
+                try { $null = Invoke-PkCallback -PkCallback $pkJobAbortCleanup -PkArgs @(,$pkJob) -PkName '-JobAbortCleanup' -PkContext $pkCallbackContext } catch { }
                 if ($pkIsSharedBudget) { try { $null = $pkMaxConcurrent.Release() } catch { } }
                 $pkJob['SlotReleased'] = $true
                 try { if ($pkJob['Proc']) { $pkJob['Proc'].Dispose() } } catch { }
@@ -1934,7 +1901,7 @@ function Invoke-PkProcessDispatchCore {
     # never be reported.
     if ($pkPending.Count -gt 0) {
         foreach ($pkJob in $pkPending) {
-            try { $null = Invoke-PkCallback -PkCallback $pkJobAbortCleanup -PkArgs @(,$pkJob) -PkName 'ProcessDispatch: -JobAbortCleanup' -PkWarned $pkCallbackWarned } catch { }
+            try { $null = Invoke-PkCallback -PkCallback $pkJobAbortCleanup -PkArgs @(,$pkJob) -PkName '-JobAbortCleanup' -PkContext $pkCallbackContext } catch { }
             $pkKey = $pkJob['GroupKey']
             if ($pkGroupStates.ContainsKey($pkKey)) { $pkGroupStates[$pkKey].Outstanding-- }
         }
@@ -1944,11 +1911,10 @@ function Invoke-PkProcessDispatchCore {
     $pkDispatchResult.Aborted = $pkCancelToken.IsCancellationRequested
     foreach ($pkState in $pkGroupStates.Values) {
         if (-not $pkState.Completed) {
-            # An aborted group still gets its callback - it's the only place
-            # the caller can credit the jobs that DID finish before the stop.
-            # Swallowed: one callback failing during teardown shouldn't cost
-            # every other group its result.
-            try { $null = Invoke-PkCallback -PkCallback $pkGroupCompleteCallback -PkArgs @(,$pkState.GroupInfo) -PkName 'ProcessDispatch: -GroupCompleteCallback' -PkWarned $pkCallbackWarned } catch { }
+            # An aborted group still gets its callback: it's where the caller
+            # credits the jobs that did finish. Swallowed, so one failing
+            # callback doesn't cost the other groups their results.
+            try { $null = Invoke-PkCallback -PkCallback $pkGroupCompleteCallback -PkArgs @(,$pkState.GroupInfo) -PkName '-GroupCompleteCallback' -PkContext $pkCallbackContext } catch { }
             $pkState.Completed = $true
             $pkGroupResults.Add([pscustomobject][ordered]@{ GroupInfo = $pkState.GroupInfo; Completed = $false; Aborted = $true })
         }
@@ -2001,7 +1967,7 @@ function Invoke-PkProcessBatch {
     # TimeoutSeconds (overrides -TimeoutSeconds) and any keys of your own, which
     # come back on the result's Command. Inside
     # Invoke-PkRun, Ctrl+C lets running programs finish (up to -AbortTimeoutSeconds)
-    # and starts no new ones; a second Ctrl+C kills them straight away. Every
+    # and starts no new ones; a second Ctrl+C kills them right away. Every
     # command is tried, and one that can't start gets a StartError on its result.
     # Repeats of the same failure for the same program are reported once, with a
     # count at the end.
@@ -2026,7 +1992,7 @@ function Invoke-PkProcessBatch {
     # ExitCode, Stdout, Stderr, StreamTimedOut, StreamError, StartError, Aborted and
     # TimedOut, in the order the programs finished.
     # .EXAMPLE
-    # $commands = foreach ($f in Get-ChildItem *.png) { @{ FilePath = 'cjxl.exe'; Arguments = (ConvertTo-PkArgumentString @($f.FullName, "$($f.FullName).jxl")) } }
+    # $commands = foreach ($f in Get-ChildItem *.png) { @{ FilePath = 'cjxl.exe'; Arguments = @($f.FullName, "$($f.FullName).jxl") } }
     # $batch = Invoke-PkRun { Invoke-PkProcessBatch -Commands $commands -MaxConcurrent 6 }
     # $batch.Results | Format-Table ExitCode, Aborted, TimedOut
     param(
@@ -2055,9 +2021,8 @@ function Invoke-PkProcessBatch {
 
     # Checked once here, so a bad name fails the call instead of every command.
     $null = Resolve-PkEncoding -Encoding $pkOutputEncoding
-    # Invoke-PkProcessDispatch has the same check; this one names the batch.
+    # Invoke-PkProcessDispatch has the same two checks; these name the batch.
     if ($pkMaxConcurrent -lt 1) { throw ("Invoke-PkProcessBatch: -MaxConcurrent must be at least 1 (got " + $pkMaxConcurrent + ").") }
-    # Invoke-PkProcessDispatch has the same check; this one names the batch.
     if ($pkTimeoutSeconds -lt 0) { throw "Invoke-PkProcessBatch: -TimeoutSeconds must be 0 (no limit) or more." }
 
     $pkResults = [System.Collections.Generic.List[object]]::new()
@@ -2068,8 +2033,10 @@ function Invoke-PkProcessBatch {
     $pkStartProcessCore = ${function:Start-PkProcessCore}
     $pkGetJobTimeLimit = ${function:Get-PkJobTimeLimit}
     $pkGetStartFailureCause = ${function:Get-PkStartFailureCause}
-    $pkInvokeCallback = ${function:Invoke-PkCallback}
-    $pkCallbackWarned = @{}
+    $pkWriteCallbackLoopWarning = ${function:Write-PkCallbackLoopWarning}
+    # Invoke-PkCallback's -PkContext: callbacks that used continue/break are
+    # warned about once each, under this prefix.
+    $pkCallbackContext = @{ Prefix = 'Invoke-PkProcessBatch: '; Warned = @{} }
     $pkCallerState = $PSCmdlet.SessionState
     $pkStartFailures = [System.Collections.Specialized.OrderedDictionary]::new([System.StringComparer]::OrdinalIgnoreCase)
 
@@ -2133,7 +2100,12 @@ function Invoke-PkProcessBatch {
         param($pkJob, $pkPendingQueue)
         $pkR = & $pkNewBatchResult -Command $pkJob['Command'] -Completed (Complete-PkProcess -Job $pkJob) -TimedOut ([bool]$pkJob['TimedOut'])
         $pkResults.Add($pkR)
-        if ($null -ne $pkOnComplete) { $null = & $pkInvokeCallback -PkCallback $pkOnComplete -PkArgs @($pkJob['Command'], $pkR) -PkName 'Invoke-PkProcessBatch: -OnComplete' -PkWarned $pkCallbackWarned }
+        if ($null -ne $pkOnComplete) {
+            # Invoke-PkCallback, inlined: this runs per command.
+            $pkCbDone = $false
+            $null = do { & $pkOnComplete $pkJob['Command'] $pkR; $pkCbDone = $true } while ($false)
+            if (-not $pkCbDone) { & $pkWriteCallbackLoopWarning -PkName '-OnComplete' -PkContext $pkCallbackContext }
+        }
         return @{ Success = ($pkR.ExitCode -eq 0) }
     }.GetNewClosure()
 
@@ -2169,7 +2141,7 @@ function Get-PkWorkerSafeFunctionNames {
     return @('Write-PkMessage', 'Test-PkAbortSignal', 'Test-PkCancelRequested', 'Initialize-PkThreadPool', 'Stop-PkProcessTree', 'Stop-PkJobProcesses', 'Resolve-PkEncoding',
              'Start-PkProcess', 'Wait-PkProcess', 'Wait-PkRunningJobs', 'Complete-PkProcess', 'Invoke-PkProcessWithTimeout',
              'Invoke-PkProcessDispatch', 'Invoke-PkProcessDispatchCore', 'Invoke-PkProcessBatch',
-             'Register-PkCancellationSource', 'Unregister-PkCancellationSource', 'New-PkBatchResult', 'ConvertTo-PkArgumentString', 'Get-PkForceStopReason', 'Resolve-PkFileSystemPath', 'Add-PkDispatchGroupJobs', 'Start-PkProcessCore', 'Get-PkJobTimeLimit', 'Stop-PkTimedOutJob', 'Get-PkStartFailureCause', 'Resolve-PkArguments', 'Invoke-PkCallback', 'ConvertTo-PkArgumentStringCore')
+             'Register-PkCancellationSource', 'Unregister-PkCancellationSource', 'New-PkBatchResult', 'ConvertTo-PkArgumentString', 'Get-PkForceStopReason', 'Resolve-PkFileSystemPath', 'Add-PkDispatchGroupJobs', 'Start-PkProcessCore', 'Get-PkJobTimeLimit', 'Stop-PkTimedOutJob', 'Get-PkStartFailureCause', 'Resolve-PkArguments', 'Invoke-PkCallback', 'Write-PkCallbackLoopWarning', 'ConvertTo-PkArgumentStringCore')
 }
 
 function Get-PkHandlerParamCount {
@@ -2186,17 +2158,15 @@ function Get-PkHandlerParamCount {
 }
 
 function Add-PkCrashedJob {
-    # A worker threw: count it, record it with its job on the run's outcome,
-    # announce it, and tell -JobCrashedHandler. Shared by the main loop and
-    # the abort drain. pk-prefixed parameters: when the kit was dot-sourced
-    # rather than a module, a handler built without .GetNewClosure() saw them.
+    # A worker threw: count it, record it with its job, announce it, and tell
+    # -JobCrashedHandler. Shared by the main loop and the abort drain.
     param(
         [Parameter(Mandatory)][System.Collections.Specialized.OrderedDictionary]$PkOutcome,
         [hashtable]$PkJob,
         [Parameter(Mandatory)][System.Management.Automation.ErrorRecord]$PkError,
         [scriptblock]$PkHandler,
         [string]$PkWhen = "",
-        [hashtable]$PkCallbackWarned
+        [hashtable]$PkCallbackContext
     )
     $PkOutcome.CrashedCount++
     $PkOutcome.Crashed.Add([pscustomobject][ordered]@{ Job = $PkJob; Error = $PkError })
@@ -2209,7 +2179,7 @@ function Add-PkCrashedJob {
         $pkParamCount = Get-PkHandlerParamCount -Callback $PkHandler
         $pkHandlerArgs = @($PkError, $PkJob)
         if ($pkParamCount -ne -1 -and $pkParamCount -lt 2) { $pkHandlerArgs = @(,$PkError) }
-        $null = Invoke-PkCallback -PkCallback $PkHandler -PkArgs $pkHandlerArgs -PkName 'Invoke-PkRunspaceJobs: -JobCrashedHandler' -PkWarned $PkCallbackWarned
+        $null = Invoke-PkCallback -PkCallback $PkHandler -PkArgs $pkHandlerArgs -PkName '-JobCrashedHandler' -PkContext $PkCallbackContext
     } catch {
         # Reported, not rethrown: a broken crash handler mustn't take the other workers down.
         Invoke-PkMessageHandler -Level Error -Message ("-JobCrashedHandler threw: " + $_)
@@ -2217,10 +2187,10 @@ function Add-PkCrashedJob {
 }
 
 function Add-PkJobErrors {
-    # A finished worker's non-terminating errors: print each, as always, and
-    # record it with its job on the run's outcome. Shared by the main loop and
-    # the abort drain. Called for a worker that crashed too: its error stream
-    # holds only the errors from before the one that stopped it.
+    # A finished worker's non-terminating errors: print each and record it
+    # with its job. Shared by the main loop and the abort drain. Called for a
+    # crashed worker too: its error stream holds only the errors before the
+    # one that stopped it.
     param(
         [Parameter(Mandatory)][System.Collections.Specialized.OrderedDictionary]$PkOutcome,
         [hashtable]$PkJob,
@@ -2239,30 +2209,31 @@ function Receive-PkCompletedHandles {
         [scriptblock]$ResultHandler,
         [System.Collections.Specialized.OrderedDictionary]$Outcome,
         [scriptblock]$JobCrashedHandler,
-        [hashtable]$CallbackWarned
+        [hashtable]$CallbackContext
     )
     $stillActive = [System.Collections.Generic.List[hashtable]]::new()
     foreach ($h in $Handles) {
         if ($h.Handle.IsCompleted) {
-            # Not $results: when the kit was dot-sourced rather than a module, a
-            # -ResultHandler built without .GetNewClosure() saw this function's
-            # locals, and $results.Add($r) there grew the collection this loop
-            # walks, so it never ended. Same in Invoke-PkRunspaceJobs.
             $pkWorkerOutput = $null
             $pkCrash = $null
             try {
                 try { $pkWorkerOutput = $h.PS.EndInvoke($h.Handle) } catch { $pkCrash = $_ }
-                # Same report as Invoke-PkRunspaceJobs' main loop: the errors
-                # it wrote, then the crash, in the order they happened.
+                # Same as Invoke-PkRunspaceJobs' main loop: its errors, then the
+                # crash, in the order they happened.
                 Add-PkJobErrors -PkOutcome $Outcome -PkJob $h['Job'] -PkErrors $h.PS.Streams.Error
                 if ($null -ne $pkCrash) {
-                    Add-PkCrashedJob -PkOutcome $Outcome -PkJob $h['Job'] -PkError $pkCrash -PkHandler $JobCrashedHandler -PkWhen " during abort drain" -PkCallbackWarned $CallbackWarned
+                    Add-PkCrashedJob -PkOutcome $Outcome -PkJob $h['Job'] -PkError $pkCrash -PkHandler $JobCrashedHandler -PkWhen " during abort drain" -PkCallbackContext $CallbackContext
                 }
             } finally {
                 $h.PS.Dispose()
             }
             if ($null -ne $ResultHandler -and $null -ne $pkWorkerOutput) {
-                foreach ($r in $pkWorkerOutput) { $null = Invoke-PkCallback -PkCallback $ResultHandler -PkArgs @(,$r) -PkName 'Invoke-PkRunspaceJobs: -ResultHandler' -PkWarned $CallbackWarned }
+                foreach ($r in $pkWorkerOutput) {
+                    # Invoke-PkCallback, inlined: this runs per result.
+                    $pkCbDone = $false
+                    $null = do { & $ResultHandler $r; $pkCbDone = $true } while ($false)
+                    if (-not $pkCbDone) { Write-PkCallbackLoopWarning -PkName '-ResultHandler' -PkContext $CallbackContext }
+                }
             }
         } else {
             $stillActive.Add($h)
@@ -2286,7 +2257,7 @@ function Invoke-PkGracefulDrain {
         [string]$AbortWaitMessage,
         [Parameter(Mandatory)][System.Collections.Specialized.OrderedDictionary]$Outcome,
         [scriptblock]$JobCrashedHandler,
-        [hashtable]$CallbackWarned
+        [hashtable]$CallbackContext
     )
 
     if ($Handles.Count -eq 0) {
@@ -2304,14 +2275,14 @@ function Invoke-PkGracefulDrain {
     if ($AbortWaitMessage -ne "") { Invoke-PkMessageHandler -Message $AbortWaitMessage -Level Warn }
 
     while ($localHandles.Count -gt 0 -and -not [PkConsoleCtrl]::IsCloseEvent -and -not [PkConsoleCtrl]::SkipDrain -and $abortDeadline.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
-        $localHandles = Receive-PkCompletedHandles -Handles $localHandles -ResultHandler $ResultHandler -Outcome $Outcome -JobCrashedHandler $JobCrashedHandler -CallbackWarned $CallbackWarned
+        $localHandles = Receive-PkCompletedHandles -Handles $localHandles -ResultHandler $ResultHandler -Outcome $Outcome -JobCrashedHandler $JobCrashedHandler -CallbackContext $CallbackContext
         Receive-PkWorkerMessages -Queue $MessageQueue
         if ($localHandles.Count -gt 0) { [System.Threading.Thread]::Sleep(250) }
     }
 
     # One final pass before declaring anything force-stopped.
     if ($localHandles.Count -gt 0) {
-        $localHandles = Receive-PkCompletedHandles -Handles $localHandles -ResultHandler $ResultHandler -Outcome $Outcome -JobCrashedHandler $JobCrashedHandler -CallbackWarned $CallbackWarned
+        $localHandles = Receive-PkCompletedHandles -Handles $localHandles -ResultHandler $ResultHandler -Outcome $Outcome -JobCrashedHandler $JobCrashedHandler -CallbackContext $CallbackContext
         Receive-PkWorkerMessages -Queue $MessageQueue
     }
 
@@ -2401,11 +2372,9 @@ function Invoke-PkRunspaceJobs {
         [Alias('AbortTimeoutSeconds')]
         [int]$DrainTimeoutSeconds = 60,
         [string]$AbortWaitMessage,
-        # On unless turned off; see $checkSafety below.
         [switch]$CheckWorkerSafety
     )
-    # A switch can't default to on without a lint warning, so "not passed"
-    # means on. A bare -CheckWorkerSafety (the v1 opt-in) still means on.
+    # Not passed means on: a switch can't default to on without a lint warning.
     $checkSafety = (-not $PSBoundParameters.ContainsKey('CheckWorkerSafety')) -or $CheckWorkerSafety.IsPresent
 
     if ($null -eq $JobParams -and $null -eq $NextJobProvider) {
@@ -2416,9 +2385,8 @@ function Invoke-PkRunspaceJobs {
     }
     if ($MaxParallel -lt 1) { throw "Invoke-PkRunspaceJobs: -MaxParallel must be at least 1." }
 
-    # Accept a List, an array, or a single hashtable. A job list built with
-    # `foreach` collapses to ONE bare hashtable when there is only one job -
-    # that must work the same as two.
+    # A List, an array or a single hashtable: a one-job list built with
+    # foreach collapses to a bare hashtable.
     if ($null -ne $JobParams) {
         $normalizedJobs = [System.Collections.Generic.List[hashtable]]::new()
         if ($JobParams -is [hashtable]) {
@@ -2447,8 +2415,8 @@ function Invoke-PkRunspaceJobs {
 
     if ($null -eq $ResultHandler) { $ResultHandler = { param($r) } }
 
-    # Which parameters the worker actually declares - passing one it doesn't
-    # declare fails the whole invoke with an unhelpful binding error.
+    # Passing a parameter the worker doesn't declare fails the whole invoke
+    # with an unhelpful binding error.
     $declaredParams = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     if ($null -ne $WorkerScript.Ast.ParamBlock) {
         foreach ($p in $WorkerScript.Ast.ParamBlock.Parameters) { $null = $declaredParams.Add($p.Name.VariablePath.UserPath) }
@@ -2477,8 +2445,9 @@ function Invoke-PkRunspaceJobs {
     $pool           = $null
     $handles        = [System.Collections.Generic.List[hashtable]]::new()
     $scanExhausted  = $false
-    # Callbacks that used continue/break, so each is only warned about once.
-    $pkCallbackWarned = @{}
+    # Invoke-PkCallback's -PkContext: callbacks that used continue/break are
+    # warned about once each, under this prefix.
+    $pkCallbackContext = @{ Prefix = 'Invoke-PkRunspaceJobs: '; Warned = @{} }
 
     try {
         if ($null -eq $Cts) {
@@ -2519,19 +2488,16 @@ function Invoke-PkRunspaceJobs {
         $pool = [RunspaceFactory]::CreateRunspacePool(1, $MaxParallel, $iss, $Host)
         $pool.Open()
 
-        # Each job starts in the caller's current location, the folder
-        # Start-PkProcess defaults to as well. The real folder, not a drive
-        # name: a New-PSDrive drive doesn't exist in the worker.
+        # Each job starts in the caller's current location: the real folder,
+        # since a New-PSDrive drive doesn't exist in the worker.
         $workerLocation = $ExecutionContext.SessionState.Path.CurrentFileSystemLocation.ProviderPath
-        # Every job runs this: move to that folder, then run the worker in a
-        # scope of its own with the job's values. Set per job because
-        # runspaces are reused: a job that changed folder would otherwise move
-        # the next one too. One script rather than a Set-Location statement
-        # ahead of the worker: with a second statement, a pool runspace's
-        # pipeline hadn't completed after 10 s in testing, on 5.1 and 7. The
-        # prefix shares the worker's first line, so error line numbers still
-        # match its code. If the folder is gone by the time a job starts, the
-        # job runs wherever its runspace already is, without an error per job.
+        # Every job runs this: move to that folder, then run the worker in its
+        # own scope with the job's values. Per job, because runspaces are
+        # reused. One script, not a Set-Location statement before the worker:
+        # with a second statement a pool runspace's pipeline never completed
+        # (5.1 and 7). The prefix shares the worker's first line, so error line
+        # numbers match its code. If the folder is gone, the job runs wherever
+        # its runspace is.
         $jobScript = 'param([string]$PkJobLocation, [hashtable]$PkJobValues) if ($PkJobLocation) { Set-Location -LiteralPath $PkJobLocation -ErrorAction SilentlyContinue }; & {' +
             $WorkerScript.ToString() + "`n} @PkJobValues"
 
@@ -2548,7 +2514,7 @@ function Invoke-PkRunspaceJobs {
                 } else {
                     # Same as the dispatcher's builder: take the job
                     # hashtable, ignore anything else the provider let out.
-                    $nextRaw = Invoke-PkCallback -PkCallback $NextJobProvider -PkName 'Invoke-PkRunspaceJobs: -NextJobProvider' -PkWarned $pkCallbackWarned
+                    $nextRaw = Invoke-PkCallback -PkCallback $NextJobProvider -PkName '-NextJobProvider' -PkContext $pkCallbackContext
                     $nextJob = $null
                     $strayCount = 0
                     foreach ($rawItem in @($nextRaw)) {
@@ -2587,33 +2553,33 @@ function Invoke-PkRunspaceJobs {
 
             $null = Test-PkAbortSignal
             Receive-PkWorkerMessages -Queue $messageQueue
-            if ($null -ne $PollCallback) { $null = Invoke-PkCallback -PkCallback $PollCallback -PkName 'Invoke-PkRunspaceJobs: -PollCallback' -PkWarned $pkCallbackWarned }
+            if ($null -ne $PollCallback) { $null = Invoke-PkCallback -PkCallback $PollCallback -PkName '-PollCallback' -PkContext $pkCallbackContext }
 
             $stillPending = [System.Collections.Generic.List[hashtable]]::new()
             foreach ($h in $handles) {
                 if ($h.Handle.IsCompleted) {
-                    # Not $results: when the kit was dot-sourced rather than a
-                    # module, a -ResultHandler or -JobCrashedHandler built without
-                    # .GetNewClosure() saw this function's locals, and
-                    # $results.Add($r) there grew the collection this loop
-                    # walks, so it never ended. Same in Receive-PkCompletedHandles.
                     $pkWorkerOutput = $null
                     $pkCrash = $null
                     try {
                         try { $pkWorkerOutput = $h.PS.EndInvoke($h.Handle) } catch { $pkCrash = $_ }
-                        # Same report as Receive-PkCompletedHandles: the errors
-                        # it wrote, then the crash, in the order they happened.
+                        # Same as Receive-PkCompletedHandles: its errors, then
+                        # the crash, in the order they happened.
                         Add-PkJobErrors -PkOutcome $outcome -PkJob $h['Job'] -PkErrors $h.PS.Streams.Error
                         if ($null -ne $pkCrash) {
                             # The worker itself threw - there is no result, so
                             # -ResultHandler is never called for this job.
-                            Add-PkCrashedJob -PkOutcome $outcome -PkJob $h['Job'] -PkError $pkCrash -PkHandler $JobCrashedHandler -PkCallbackWarned $pkCallbackWarned
+                            Add-PkCrashedJob -PkOutcome $outcome -PkJob $h['Job'] -PkError $pkCrash -PkHandler $JobCrashedHandler -PkCallbackContext $pkCallbackContext
                         }
                     } finally {
                         $h.PS.Dispose()
                     }
                     if ($null -ne $pkWorkerOutput) {
-                        foreach ($r in $pkWorkerOutput) { $null = Invoke-PkCallback -PkCallback $ResultHandler -PkArgs @(,$r) -PkName 'Invoke-PkRunspaceJobs: -ResultHandler' -PkWarned $pkCallbackWarned }
+                        foreach ($r in $pkWorkerOutput) {
+                            # Invoke-PkCallback, inlined: this runs per result.
+                            $pkCbDone = $false
+                            $null = do { & $ResultHandler $r; $pkCbDone = $true } while ($false)
+                            if (-not $pkCbDone) { Write-PkCallbackLoopWarning -PkName '-ResultHandler' -PkContext $pkCallbackContext }
+                        }
                     }
                 } else {
                     $stillPending.Add($h)
@@ -2621,7 +2587,7 @@ function Invoke-PkRunspaceJobs {
             }
             $handles = $stillPending
             if ($handles.Count -gt 0 -and ($scanExhausted -or $handles.Count -ge $MaxParallel)) {
-                # Until a worker finishes or the token is cancelled. The 100 ms cap
+                # Until a worker finishes or the token is canceled. The 100 ms cap
                 # keeps worker messages, -PollCallback and the abort flag moving.
                 # WaitAny holds 63 handles at most on an STA thread, one of them the
                 # token; a worker past that is only noticed when the time is up.
@@ -2636,7 +2602,7 @@ function Invoke-PkRunspaceJobs {
         }
 
         if ($Cts.Token.IsCancellationRequested) {
-            $drainArgs = @{ Handles = $handles; ResultHandler = $ResultHandler; MessageQueue = $messageQueue; TimeoutSeconds = $DrainTimeoutSeconds; Outcome = $outcome; JobCrashedHandler = $JobCrashedHandler; CallbackWarned = $pkCallbackWarned }
+            $drainArgs = @{ Handles = $handles; ResultHandler = $ResultHandler; MessageQueue = $messageQueue; TimeoutSeconds = $DrainTimeoutSeconds; Outcome = $outcome; JobCrashedHandler = $JobCrashedHandler; CallbackContext = $pkCallbackContext }
             if ($PSBoundParameters.ContainsKey('AbortWaitMessage')) { $drainArgs.AbortWaitMessage = $AbortWaitMessage }
             $drainResult = Invoke-PkGracefulDrain @drainArgs
             $outcome.ForceStoppedCount = $drainResult.ForceStoppedCount
@@ -2644,7 +2610,7 @@ function Invoke-PkRunspaceJobs {
         }
 
         Receive-PkWorkerMessages -Queue $messageQueue
-        if ($null -ne $PollCallback) { $null = Invoke-PkCallback -PkCallback $PollCallback -PkName 'Invoke-PkRunspaceJobs: -PollCallback' -PkWarned $pkCallbackWarned }
+        if ($null -ne $PollCallback) { $null = Invoke-PkCallback -PkCallback $PollCallback -PkName '-PollCallback' -PkContext $pkCallbackContext }
     } finally {
         # Best-effort teardown; whatever exception is already in flight is the one to surface.
         $stillRunning = $false
@@ -2654,16 +2620,13 @@ function Invoke-PkRunspaceJobs {
             } catch { }
         }
         if ($null -ne $pool) {
-            # A worker stuck inside a .NET call can't be stopped, and
-            # Dispose() would sit and wait for it. Close in the background
-            # and move on; the abandoned worker ends when it returns or
-            # the process exits.
+            # A worker stuck in a .NET call can't be stopped, and Dispose()
+            # would wait for it, so close in the background.
             if ($stillRunning) {
-                # An abandoned worker does NOT stop when its blocking call
-                # returns - it can run on to its last line. Cancel the token
-                # so a worker that checks Test-PkCancelRequested before an
-                # irreversible step still gets told, even on a non-abort
-                # exit (one of your callbacks threw).
+                # An abandoned worker can run on to its last line once its call
+                # returns. Cancel the token so one that checks
+                # Test-PkCancelRequested before an irreversible step is told,
+                # even on a non-abort exit (one of your callbacks threw).
                 try { $Cts.Cancel() } catch { }
                 try { $null = $pool.BeginClose($null, $null) } catch { }
             }
@@ -2685,17 +2648,15 @@ function Invoke-PkRunspaceJobs {
 # ==============================================================================
 
 function Get-PkCallerFunction {
-    # Looks function names up in the CALLER's session state, from the caller's
-    # current scope: a script's own functions (.\script.ps1), functions
-    # defined inside the calling function, a calling module's private ones.
-    # Get-Item Function: here would search this module (plus global), and
-    # SessionState.InvokeCommand.GetCommand only finds global functions.
-    # An unbound scriptblock (made from text) run with InvokeScript(SessionState)
-    # runs in that session state, dot-sourced into the caller's current scope.
-    # So the work happens inside & { } and the names are embedded as quoted
-    # literals: nothing is assigned in the caller's scope.
-    # With -FollowAlias, an alias is followed to the function it points at.
-    # Returns a hashtable: requested name -> FunctionInfo (missing = not found).
+    # Looks function names up in the caller's session state, from its current
+    # scope: a script's own functions, functions defined inside the calling
+    # function, a calling module's private ones. Get-Item Function: here would
+    # search this module, and InvokeCommand.GetCommand only finds global ones.
+    # A scriptblock made from text and run with InvokeScript(SessionState) is
+    # dot-sourced into the caller's scope, so the work happens inside & { }
+    # with the names as quoted literals: nothing is assigned there.
+    # -FollowAlias follows an alias to its function. Returns a hashtable:
+    # name -> FunctionInfo (missing = not found).
     param(
         [Parameter(Mandatory)][System.Management.Automation.SessionState]$SessionState,
         [string[]]$Name,
@@ -2740,15 +2701,14 @@ function Get-PkCommandKind {
     # or $null): 'Function' (one of your session's functions - must be
     # shared), 'UnloadableModuleFunction' (from a module a worker can't
     # autoload), or 'Other' (cmdlet, program, autoloadable module function,
-    # or unknown). Works from the Alias: and Function: drives rather than
-    # Get-Command: Get-Command on a name that doesn't resolve searches every
-    # module on $env:PSModulePath, and the check runs on every
-    # Invoke-PkRunspaceJobs call.
+    # or unknown). Uses the Alias: and Function: drives, not Get-Command,
+    # which searches every module on $env:PSModulePath for a name that
+    # doesn't resolve, on every Invoke-PkRunspaceJobs call.
     param([System.Management.Automation.FunctionInfo]$Fn)
     if ($null -eq $Fn) { return 'Other' }
     if ([string]::IsNullOrEmpty($Fn.ModuleName)) { return 'Function' }
-    # The kit's own: a worker gets only the worker-safe ones, so treat the
-    # rest like a function of yours (needs listing), as before the kit was a module.
+    # The kit's own: a worker gets only the worker-safe ones, so the rest are
+    # treated like your own functions.
     if ($Fn.ModuleName -eq 'ParallelKit') { return 'Function' }
     # A module function (Get-FileHash, say) autoloads in a worker like a
     # cmdlet does - but only if the module can be found by name. One imported
@@ -2802,10 +2762,8 @@ function Test-PkHoldsScriptBlock {
         }
     } catch {
         # A collection other threads are changing (a results sink shared by
-        # running workers) can't be enumerated safely; PowerShell may wrap
-        # the "collection was modified" error, so catch it whatever its type.
-        # Skip the value rather than fail the run: such sinks hold results,
-        # not code.
+        # workers) can't be enumerated safely, and PowerShell may wrap the
+        # error, so catch anything. Skip it: such sinks hold results, not code.
         return $false
     }
     return $false
@@ -2946,19 +2904,14 @@ function Test-PkWorkerSafetyCore {
                              Text = ($t.Where + " (line " + $cv.Extent.StartLineNumber + ") casts a scriptblock to the delegate [" + $cv.Type.TypeName.Name + "] - this can hang or crash a worker") })
         }
 
-        # The implicit form: a scriptblock literal passed as an argument to
-        # a method or constructor - $dict.GetOrAdd($k, { ... }),
-        # [System.Lazy[object]]::new({ ... }). No cast is written, but .NET
-        # receives a delegate all the same. .ForEach()/.Where() are
-        # PowerShell's own and take real scriptblocks, so they're fine.
-        # The same goes for a variable assigned a scriptblock literal (or
-        # { }.GetNewClosure()) anywhere in this code, then passed as
-        # $lazy = [System.Lazy[object]]::new($factory). By name, not by flow:
-        # a variable reassigned to something else in between is still flagged.
-        # Methods that only store a value in a collection ($list.Add($sb),
-        # $map.Add($k, $sb), $queue.Enqueue($sb)) aren't flagged: storing a
-        # scriptblock makes no delegate. Not caught as a result: a collection
-        # typed to hold delegates (List[Func[object]]), where .Add converts.
+        # The implicit form: a scriptblock literal, or a variable assigned one
+        # ({ }.GetNewClosure() included) anywhere in this code, passed to a
+        # method or constructor: $dict.GetOrAdd($k, { }),
+        # [System.Lazy[object]]::new($factory). .NET gets a delegate all the
+        # same. Matched by variable name, not flow. .ForEach()/.Where() take
+        # real scriptblocks. Storage methods ($list.Add($sb),
+        # $queue.Enqueue($sb)) make no delegate and aren't flagged, so a
+        # collection typed to hold delegates (List[Func[object]]) isn't caught.
         $storageMethods = @('Add', 'AddRange', 'Insert', 'Enqueue', 'Push', 'TryAdd', 'Contains', 'Remove', 'IndexOf', 'set_Item')
         $scriptBlockVars = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
         foreach ($assign in $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.AssignmentStatementAst] }, $true)) {
@@ -2997,11 +2950,9 @@ function Test-PkWorkerSafetyCore {
 #  Public functions (the ones README.md documents)
 # ==============================================================================
 
-# Imported globally (Import-Module -Global below): a .GetNewClosure() block
-# can only see global functions, so this is what lets the batch's own
-# callbacks, and yours, call them however your script was started.
-# The same list is $publicFunctions in ParallelKit.Harness.ps1 (which checks
-# each has Get-Help help and is visible); keep the two in step.
+# Imported globally: a .GetNewClosure() block only sees global functions,
+# so this lets the batch's callbacks, and yours, call them. The same list is
+# $publicFunctions in ParallelKit.Harness.ps1; keep the two in step.
 Export-ModuleMember -Function @(
     'Set-PkMessageHandler', 'Write-PkMessage', 'Initialize-ParallelKit', 'Register-PkCancellationSource',
     'Unregister-PkCancellationSource', 'Reset-PkAbortState', 'Request-PkAbort', 'Test-PkAbortSignal', 'Test-PkCancelRequested',

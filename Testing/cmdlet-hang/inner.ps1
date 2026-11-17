@@ -78,7 +78,7 @@ for ($n = 0; $n -lt $count; $n++) {
 #   JobParamCmdlet - cmdlets that take no scriptblock
 #   JobParamWhere  - Where-Object/ForEach-Object with an inner scriptblock
 #   JobParamText   - control: the JobParamWhere text, [scriptblock]::Create'd
-#                    in the worker (the proposed workaround)
+#                    in the worker (the README's workaround)
 $jobFns = @{
     JobParamPlain  = { param($i) $n = 0; for ($j = 0; $j -lt 50; $j++) { $n += $j }; $n + $i }
     JobParamCmdlet = { param($i) $null = Get-Date; $null = Test-Path -LiteralPath $env:SystemRoot; $null = 1 | Out-Null; $i }
