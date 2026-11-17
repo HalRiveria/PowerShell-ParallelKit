@@ -3,6 +3,7 @@
 # PowerShell 7.
 #
 # Version 3.2 - https://github.com/HalRiveria/PowerShell-ParallelKit
+# (Initialize-ParallelKit reports the version too: change both together.)
 # Copyright (c) 2026 HalRiveria. MIT License: keep this notice with any copy;
 # the full text is in LICENSE in the repository.
 #
