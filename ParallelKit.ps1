@@ -1728,6 +1728,19 @@ function Wait-PkRunningJobs {
     [System.Threading.Thread]::Sleep($TimeoutMs)
 }
 
+function Get-PkProcessDuration {
+    # How long a program ran, from its start to its exit or kill, as a
+    # [TimeSpan]: not the time it waited for a slot, nor any wait for its
+    # output afterwards. $null if it isn't a Process (a custom starter's),
+    # hasn't exited, or was already disposed (Dispose loses the times).
+    param($Process)
+    if ($Process -isnot [System.Diagnostics.Process]) { return $null }
+    try {
+        if ($Process.HasExited -ne $true) { return $null }
+        return ($Process.ExitTime - $Process.StartTime)
+    } catch { return $null }   # times not readable: no duration, rather than a throw inside -JobFinalize
+}
+
 function Complete-PkProcess {
     # .SYNOPSIS
     # Collects the exit code and output of a program that has exited.
@@ -1746,7 +1759,8 @@ function Complete-PkProcess {
     # .PARAMETER Dispose
     # Dispose the process object afterwards.
     # .OUTPUTS
-    # An object with ExitCode, Stdout, Stderr, StreamTimedOut and StreamError.
+    # An object with ExitCode, Stdout, Stderr, StreamTimedOut, StreamError and
+    # Duration (how long the program ran, from its start to its exit or kill).
 
     # Only -Job by position: otherwise `-Dispose $true` would bind $true to
     # -StreamTimeoutMs (1 ms) and cut the output off without an error.
@@ -1763,7 +1777,7 @@ function Complete-PkProcess {
     if ($StreamTimeoutMs -lt 0) {
         throw ("Complete-PkProcess: -StreamTimeoutMs must be 0 or more (got " + $StreamTimeoutMs + "). It's how long to wait for the output after the program exits, in milliseconds; 0 doesn't wait.")
     }
-    $result = [ordered]@{ ExitCode = $null; Stdout = $null; Stderr = $null; StreamTimedOut = $false; StreamError = $null }
+    $result = [ordered]@{ ExitCode = $null; Stdout = $null; Stderr = $null; StreamTimedOut = $false; StreamError = $null; Duration = $null }
     # A custom starter's job may have no read tasks, and a read can fail.
     # Neither throws: this runs inside JobFinalize, where a throw stops the
     # whole dispatcher.
@@ -1790,6 +1804,8 @@ function Complete-PkProcess {
         elseif (-not $task.IsCompleted -and $task -is [PkStreamReadTask]) { $result[$stream] = $task.Snapshot() }
     }
     $result.ExitCode = $Job['Proc'].ExitCode
+    # The program's end, not the output's: before Dispose, which loses it.
+    $result.Duration = Get-PkProcessDuration -Process $Job['Proc']
     if ($Dispose) { $Job['Proc'].Dispose() }
     return [pscustomobject]$result
 }
@@ -1819,7 +1835,8 @@ function Invoke-PkProcessWithTimeout {
     # Keep going during an abort, for a cleanup or restore step that has to run
     # because of it.
     # .OUTPUTS
-    # An object with ExitCode, Stdout, Stderr, StreamTimedOut and StreamError.
+    # An object with ExitCode, Stdout, Stderr, StreamTimedOut, StreamError and
+    # Duration (how long the program ran, from its start to its exit or kill).
     # .EXAMPLE
     # $r = Invoke-PkProcessWithTimeout -FilePath git.exe -Arguments 'rev-parse HEAD' -TimeoutMs 10000
     param(
@@ -2544,19 +2561,23 @@ function Invoke-PkProcessDispatchCore {
 function New-PkBatchResult {
     # One Invoke-PkProcessBatch result, the same shape however the command
     # ended: ran (-Completed is Complete-PkProcess's object), couldn't start
-    # (-StartError), or stopped by an abort (-Aborted).
+    # (-StartError), or stopped by an abort (-Aborted; -Process is its program,
+    # if it was started, for how long it ran).
     param(
         [hashtable]$Command,
         $Completed = $null,
         [string]$StartError = $null,
         [switch]$Aborted,
-        [bool]$TimedOut = $false
+        [bool]$TimedOut = $false,
+        $Process = $null
     )
     $r = [ordered]@{ Command = $Command; ExitCode = $null; Stdout = $null; Stderr = $null; StreamTimedOut = $false; StreamError = $null
-                     StartError = $null; Aborted = [bool]$Aborted; TimedOut = $TimedOut }
+                     StartError = $null; Aborted = [bool]$Aborted; TimedOut = $TimedOut; Duration = $null }
     if ($null -ne $Completed) {
         $r.ExitCode = $Completed.ExitCode; $r.Stdout = $Completed.Stdout; $r.Stderr = $Completed.Stderr
-        $r.StreamTimedOut = $Completed.StreamTimedOut; $r.StreamError = $Completed.StreamError
+        $r.StreamTimedOut = $Completed.StreamTimedOut; $r.StreamError = $Completed.StreamError; $r.Duration = $Completed.Duration
+    } elseif ($null -ne $Process) {
+        $r.Duration = Get-PkProcessDuration -Process $Process
     }
     if ($StartError) { $r.StartError = $StartError }
     return [pscustomobject]$r
@@ -2607,8 +2628,8 @@ function Invoke-PkProcessBatch {
     # or a [System.Text.Encoding]. Default: the console's code page.
     # .OUTPUTS
     # An object with Results, Aborted and ForceKilledCount. Each result has Command,
-    # ExitCode, Stdout, Stderr, StreamTimedOut, StreamError, StartError, Aborted and
-    # TimedOut, in the order the programs finished.
+    # ExitCode, Stdout, Stderr, StreamTimedOut, StreamError, StartError, Aborted,
+    # TimedOut and Duration, in the order the programs finished.
     # .EXAMPLE
     # $commands = foreach ($f in Get-ChildItem *.png) { @{ FilePath = 'cjxl.exe'; Arguments = @($f.FullName, "$($f.FullName).jxl") } }
     # $batch = Invoke-PkRun { Invoke-PkProcessBatch -Commands $commands -MaxConcurrent 6 }
@@ -2738,7 +2759,9 @@ function Invoke-PkProcessBatch {
 
     $pkJobAbortCleanup = {
         param($pkJob)
-        $pkResults.Add((& $pkNewBatchResult -Command $pkJob['Command'] -Aborted))
+        # Called after a force-stop's kill and before the program is disposed,
+        # so a started program's run time can still be read.
+        $pkResults.Add((& $pkNewBatchResult -Command $pkJob['Command'] -Aborted -Process $pkJob['Proc']))
     }.GetNewClosure()
 
     $pkDispatchParams = @{
@@ -2765,7 +2788,7 @@ function Invoke-PkProcessBatch {
 
 function Get-PkWorkerSafeFunctionNames {
     # Kit functions every worker runspace gets automatically.
-    return @('Write-PkMessage', 'Test-PkAbortSignal', 'Test-PkCancelRequested', 'Initialize-PkThreadPool', 'Stop-PkProcessTree', 'Stop-PkProcessTreeCore', 'Split-PkTaskkillArguments', 'Stop-PkJobProcesses', 'Resolve-PkEncoding',
+    return @('Write-PkMessage', 'Test-PkAbortSignal', 'Test-PkCancelRequested', 'Initialize-PkThreadPool', 'Stop-PkProcessTree', 'Stop-PkProcessTreeCore', 'Split-PkTaskkillArguments', 'Stop-PkJobProcesses', 'Get-PkProcessDuration', 'Resolve-PkEncoding',
              'Start-PkProcess', 'Wait-PkProcess', 'Wait-PkRunningJobs', 'Complete-PkProcess', 'Invoke-PkProcessWithTimeout',
              'Invoke-PkProcessDispatch', 'Invoke-PkProcessDispatchCore', 'Invoke-PkProcessBatch',
              'Register-PkCancellationSource', 'Unregister-PkCancellationSource', 'New-PkBatchResult', 'ConvertTo-PkArgumentString', 'Get-PkForceStopReason', 'Resolve-PkFileSystemPath', 'Add-PkDispatchGroupJobs', 'Start-PkProcessCore', 'Get-PkJobTimeLimit', 'Stop-PkTimedOutJob', 'Get-PkStartFailureCause', 'Resolve-PkArguments', 'Invoke-PkCallback', 'Write-PkCallbackLoopWarning', 'ConvertTo-PkArgumentStringCore')
