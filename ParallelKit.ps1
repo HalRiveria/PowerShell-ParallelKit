@@ -1593,6 +1593,10 @@ function Invoke-PkProcessDispatchCore {
     # The job -JobStarter is working on: not in $pkRunning yet, but it may
     # already have a program and a shared slot.
     $pkStarting = $null
+    # The job -JobFinalize is working on. It has finished, so if -JobFinalize
+    # throws, the teardown skips -JobAbortCleanup for it (that's for jobs it
+    # kills) and only gives back its slot.
+    $pkFinalizing = $null
     # Invoke-PkCallback's -PkContext: callbacks that used continue/break are
     # warned about once each, under this prefix.
     $pkCallbackContext = @{ Prefix = 'ProcessDispatch: '; Warned = @{} }
@@ -1717,7 +1721,9 @@ function Invoke-PkProcessDispatchCore {
             if ($pkPolled) {
                 $pkPendingBefore = $pkPending.Count
                 $pkCbDone = $false
+                $pkFinalizing = $pkJob
                 $null = do { & $pkJobFinalize $pkJob $pkPending; $pkCbDone = $true } while ($false)
+                $pkFinalizing = $null
                 if (-not $pkCbDone) { Write-PkCallbackLoopWarning -PkName '-JobFinalize' -PkContext $pkCallbackContext }
                 # Marked done first: a stop landing after the Release or the
                 # Dispose would otherwise have the teardown release the slot a
@@ -1781,7 +1787,9 @@ function Invoke-PkProcessDispatchCore {
                 if ($pkPolled) {
                     $pkPendingBefore = $pkPending.Count
                     $pkCbDone = $false
+                    $pkFinalizing = $pkJob
                     $null = do { & $pkJobFinalize $pkJob $pkPending; $pkCbDone = $true } while ($false)
+                    $pkFinalizing = $null
                     if (-not $pkCbDone) { Write-PkCallbackLoopWarning -PkName '-JobFinalize' -PkContext $pkCallbackContext }
                     $pkJob['SlotReleased'] = $true   # first: see the main poll pass
                     if ($pkIsSharedBudget) { $null = $pkMaxConcurrent.Release() }
@@ -1836,7 +1844,9 @@ function Invoke-PkProcessDispatchCore {
                 if ($pkPolled) {
                     $pkPendingBefore = $pkPending.Count
                     $pkCbDone = $false
+                    $pkFinalizing = $pkJob
                     $null = do { & $pkJobFinalize $pkJob $pkPending; $pkCbDone = $true } while ($false)
+                    $pkFinalizing = $null
                     if (-not $pkCbDone) { Write-PkCallbackLoopWarning -PkName '-JobFinalize' -PkContext $pkCallbackContext }
                     $pkJob['SlotReleased'] = $true   # first: see the main poll pass
                     if ($pkIsSharedBudget) { $null = $pkMaxConcurrent.Release() }
@@ -1904,7 +1914,9 @@ function Invoke-PkProcessDispatchCore {
             Stop-PkJobProcesses -Jobs $pkTearDown
             foreach ($pkJob in $pkTearDown) {
                 try { if ($pkJob['Proc']) { $null = $pkJob['Proc'].WaitForExit(5000) } } catch { }
-                try { $null = Invoke-PkCallback -PkCallback $pkJobAbortCleanup -PkArgs @(,$pkJob) -PkName '-JobAbortCleanup' -PkContext $pkCallbackContext } catch { }
+                if (-not [object]::ReferenceEquals($pkJob, $pkFinalizing)) {
+                    try { $null = Invoke-PkCallback -PkCallback $pkJobAbortCleanup -PkArgs @(,$pkJob) -PkName '-JobAbortCleanup' -PkContext $pkCallbackContext } catch { }
+                }
                 if ($pkIsSharedBudget) { try { $null = $pkMaxConcurrent.Release() } catch { } }
                 $pkJob['SlotReleased'] = $true
                 try { if ($pkJob['Proc']) { $pkJob['Proc'].Dispose() } } catch { }

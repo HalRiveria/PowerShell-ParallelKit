@@ -3049,6 +3049,32 @@ Stop-StrayPings 53
 Test-Assert ($null -eq $dispThrew -and $dispKilled -and $dispLeft -eq 0 -and $dispLive.Proc.HasExited) ("Stop-PkProcessTree kills a live tree listed beside a disposed process (" + $dispLeft + " left, returned " + $dispKilled + ", threw: " + $dispThrew + ")")
 try { if (-not $dispLive.Proc.HasExited) { $dispLive.Proc.Kill() } } catch { }  # cleanup after a failure; already-exited is fine
 $dispLive.Proc.Dispose()
+
+# A -JobFinalize that throws: the job it was finalizing had finished, so the
+# teardown must not call -JobAbortCleanup on it (that deletes a killed job's
+# partial output), only on the job it kills. Both slots still come back.
+Reset-Harness
+$fcJobs = @(@{ Name = 'run'; FilePath = $cmdExe; Arguments = ('/c ""' + $pingExe + '" -n 55 127.0.0.1"') }, @{ Name = 'done'; FilePath = $cmdExe; Arguments = '/c exit 0' })
+$fcFeed = @{ Given = $false }
+$fcCleaned = [System.Collections.Generic.List[string]]::new()
+$fcBudget = [System.Threading.SemaphoreSlim]::new(2, 2)
+$fcWait = [System.Diagnostics.Stopwatch]::StartNew()
+$fcProblem = $null
+try {
+    $null = Invoke-PkProcessDispatch -MaxConcurrent $fcBudget `
+        -GroupProvider { if ($fcFeed.Given) { return $null }; $fcFeed.Given = $true; return 'g' }.GetNewClosure() `
+        -JobBuilder { param($g) return $fcJobs }.GetNewClosure() `
+        -JobPollCompleted {
+            param($job)
+            if ($job['Name'] -ne 'done') { return $false }
+            return ($job['Proc'].HasExited -and ((Get-LimitPingCount 55) -ge 1 -or $fcWait.Elapsed.TotalSeconds -gt 15))
+        }.GetNewClosure() `
+        -JobFinalize { param($job, $q) $null = Complete-PkProcess -Job $job; throw "finalize failed" } `
+        -JobAbortCleanup { param($job) $fcCleaned.Add($job['Name']) }.GetNewClosure()
+} catch { $fcProblem = [string]$_ }
+$fcLeft = Get-LimitPingCount 55
+Stop-StrayPings 55
+Test-Assert ($fcProblem -like '*finalize failed*' -and ($fcCleaned -join ',') -eq 'run' -and $fcLeft -eq 0 -and $fcBudget.CurrentCount -eq 2) ("a -JobFinalize that throws gets no -JobAbortCleanup for its finished job, only for the killed one (cleaned: " + ($fcCleaned -join ',') + ", " + $fcLeft + " left, " + $fcBudget.CurrentCount + " of 2 slots free)")
 Reset-Harness
 Write-Host ""
 
