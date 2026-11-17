@@ -3088,7 +3088,8 @@ $kwOk = ($b.Results.Count -eq 4 -and $kwList.Count -ge 2); $kwDetail = "results 
 '@
 }
 $kwEpilogue = @'
-[pscustomobject]@{ Ok = [bool]$kwOk; Detail = [string]$kwDetail; Warned = @($kwMessages | Where-Object { $_ -like "*'continue' or 'break'*" }).Count }
+$kwWarnings = @($kwMessages | Where-Object { $_ -like "*'continue' or 'break'*" })
+[pscustomobject]@{ Ok = [bool]$kwOk; Detail = [string]$kwDetail; Warned = $kwWarnings.Count; Text = ($kwWarnings -join ' | ') }
 '@
 $kwSavedHandler = [PkState]::MessageHandler
 foreach ($kwName in $kwCases.Keys) {
@@ -3114,9 +3115,14 @@ foreach ($kwName in $kwCases.Keys) {
             # to the console, once however many messages the handler got.
             $kwWarned = ([regex]::Matches($kwConsole, "'continue' or 'break'")).Count -eq 1
         } else {
-            $kwWarned = ($null -ne $kwOut -and $kwOut.Warned -eq 1)
+            # The warning names the parameter and the engine it was given to.
+            $kwEngine = 'ProcessDispatch'
+            if ($kwName -like '*(batch)') { $kwEngine = 'Invoke-PkProcessBatch' }
+            elseif ($kwName -in '-ResultHandler', '-PollCallback', '-NextJobProvider', '-JobCrashedHandler') { $kwEngine = 'Invoke-PkRunspaceJobs' }
+            $kwExpected = $kwEngine + ': ' + ($kwName -split ' ')[0] + " used 'continue' or 'break'"
+            $kwWarned = ($null -ne $kwOut -and $kwOut.Warned -eq 1 -and $kwOut.Text.StartsWith($kwExpected))
         }
-        $kwDetailText = if ($null -ne $kwOut) { $kwOut.Detail + ", warnings " + $kwOut.Warned } elseif ($kwFinished) { "error: " + $kwError } else { "still running after 20 s" }
+        $kwDetailText = if ($null -ne $kwOut) { $kwOut.Detail + ", warnings " + $kwOut.Warned + ": " + $kwOut.Text } elseif ($kwFinished) { "error: " + $kwError } else { "still running after 20 s" }
         Test-Assert ($kwFinished -and $null -ne $kwOut -and $kwOut.Ok -and $kwWarned) ("'" + $kwKeyword + "' in " + $kwName + " ends only the callback, with one warning (" + $kwDetailText + ")")
     }
 }
