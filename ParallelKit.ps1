@@ -1915,9 +1915,9 @@ function Invoke-PkProcessDispatchCore {
         if (-not $pkLoopDone) {
             # Best-effort teardown after an error or a stop (an error carries
             # on up by itself). Jobs with SlotReleased set are already done:
-            # their slot is released and their process disposed or about to
-            # be. Same per-job steps as the force-stop above; keep the two in
-            # step.
+            # their slot is released and their process disposed, or both are
+            # about to be. Same per-job steps as the force-stop above; keep the
+            # two in step.
             $pkTearDown = [System.Collections.Generic.List[hashtable]]::new()
             foreach ($pkJob in $pkRunning) { if (-not $pkJob['SlotReleased']) { $pkTearDown.Add($pkJob) } }
             if ($null -ne $pkStarting -and -not $pkTearDown.Contains($pkStarting)) { $pkTearDown.Add($pkStarting) }
