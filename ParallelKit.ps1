@@ -1783,9 +1783,10 @@ function Complete-PkProcess {
     # that limit was hit. The stream it gave up on comes back with what arrived
     # before then: cut short, not lost. Its read carries on in the background
     # until that program lets go of it (it's killed with PowerShell at the
-    # latest), dropping what arrives after. A stream whose read failed comes
-    # back $null, with the reason in StreamError, even if the other stream
-    # timed out.
+    # latest), dropping what arrives after: the text handed over is that
+    # stream's text from then on, and calling this again on the same job
+    # returns the same. A stream whose read failed comes back $null, with the
+    # reason in StreamError, even if the other stream timed out.
     # .PARAMETER Job
     # What Start-PkProcess returned, or a dispatcher job with the same keys.
     # .PARAMETER StreamTimeoutMs
@@ -1825,12 +1826,12 @@ function Complete-PkProcess {
         } catch {
             $result.StreamError = [string]$_.Exception.Message
         }
-        # WaitAll throws only once every task has finished, so a read that
-        # failed while the other stream was still held open shows up here.
-        if ($null -eq $result.StreamError) {
-            foreach ($task in $tasks) {
-                if ($task.IsFaulted) { $result.StreamError = [string]$task.Exception.GetBaseException().Message; break }
-            }
+        # The failed read's own reason, rather than WaitAll's wrapper. Read
+        # from the tasks: WaitAll throws only once every task has finished,
+        # so it says nothing of a read that failed while the other stream was
+        # still held open.
+        foreach ($task in $tasks) {
+            if ($task.IsFaulted) { $result.StreamError = [string]$task.Exception.GetBaseException().Message; break }
         }
     }
     # The output's end (both streams closed, or the timeout) is separate from

@@ -4568,7 +4568,9 @@ try {
     Start-Sleep -Seconds 3
     $baHeldLater = Get-HarnessReadState $s['StdoutTask'] 'TestHeldLength'
     $baStillReading = -not $s['StdoutTask'].IsCompleted
+    $baAgain = Complete-PkProcess $s -StreamTimeoutMs 0
     $baLength = ([string]$r.Stdout).Length
+    Test-Assert ($baAgain.Stdout -ceq $r.Stdout) ("a second Complete-PkProcess on the same job returns the same text (" + ([string]$baAgain.Stdout).Length + " characters, first " + $baLength + ")")
     Test-Assert ($r.StreamTimedOut -and $r.Stdout -match 'first' -and $baStillReading -and $baHeldAtResult -eq $baLength -and $baHeldLater -eq $baLength) ("a program that keeps writing after the result: the buffer stays at the result's " + $baLength + " characters (at the result " + $baHeldAtResult + ", 3 s later " + $baHeldLater + ", still reading " + $baStillReading + ")")
 } finally { Stop-HarnessPingsOf -ParentId $s['Proc'].Id }
 $baEnded = $s['StdoutTask'].Wait(10000) -and $s['StderrTask'].Wait(10000)
@@ -4600,6 +4602,13 @@ $baHeld = [System.Threading.Tasks.TaskCompletionSource[string]]::new()
 $r = Complete-PkProcess @{ Proc = $s['Proc']; StdoutTask = $baFailed.Task; StderrTask = $baHeld.Task } -StreamTimeoutMs 300 -Dispose
 $baHeld.SetResult('')
 Test-Assert ($r.StreamTimedOut -and $r.StreamError -match 'the read failed' -and $null -eq $r.Stdout) ("a read that failed while the other stream timed out is reported in StreamError (StreamTimedOut " + $r.StreamTimedOut + ", StreamError '" + $r.StreamError + "')")
+# And when the other stream ended normally: the read's own reason, not
+# WaitAll's "One or more errors occurred".
+$s = Start-PkProcess -FilePath $cmdExe -Arguments '/d /c exit 0'
+$null = $s['Proc'].WaitForExit(10000)
+$null = [System.Threading.Tasks.Task]::WaitAll(@($s['StdoutTask'], $s['StderrTask']), 10000)
+$r = Complete-PkProcess @{ Proc = $s['Proc']; StdoutTask = $baFailed.Task; StderrTask = $s['StderrTask'] } -StreamTimeoutMs 300 -Dispose
+Test-Assert (-not $r.StreamTimedOut -and $r.StreamError -eq 'Test: the read failed.' -and $null -eq $r.Stdout) ("a failed read next to one that ended gives the read's own reason (StreamError '" + $r.StreamError + "')")
 Write-Host ""
 
 Set-PkMessageHandler -Handler $null
