@@ -4683,6 +4683,43 @@ try {
 }
 Write-Host ""
 
+Write-Host "=== BC: up-front checks: mandatory worker parameters, a code page as a string ===" -ForegroundColor Cyan
+Reset-Harness
+# A job that leaves out a mandatory parameter is refused before anything
+# starts, like a key the worker doesn't declare. It used to run, fail in
+# binding, and land in Errors.
+$bcRan = [System.Collections.Generic.List[object]]::new()
+$bcError = $null
+try {
+    $null = Invoke-PkRunspaceJobs -MaxParallel 2 -JobParams @(@{ Name = 'a'; Id = 1 }, @{ Id = 2 }) -WorkerScript { param([Parameter(Mandatory)][string]$Name, $Id) $Id } -ResultHandler { param($r) $bcRan.Add($r) }.GetNewClosure()
+} catch { $bcError = [string]$_ }
+Test-Assert ($bcError -match "job 1 doesn't supply 'Name'" -and $bcError -match 'Nothing was started' -and $bcRan.Count -eq 0) ("-JobParams: a job missing a mandatory parameter is refused before anything starts (" + $bcError + "; ran " + $bcRan.Count + ")")
+# The same for a -NextJobProvider job, as it arrives.
+$bcFeed = [System.Collections.Generic.Queue[hashtable]]::new(); $bcFeed.Enqueue(@{ Name = 'a' }); $bcFeed.Enqueue(@{ Other = 1 })
+$bcError = $null
+try {
+    $null = Invoke-PkRunspaceJobs -MaxParallel 1 -NextJobProvider { if ($bcFeed.Count -gt 0) { return $bcFeed.Dequeue() }; return $null }.GetNewClosure() -WorkerScript { param([Parameter(Mandatory)][string]$Name, $Other) $Name }
+} catch { $bcError = [string]$_ }
+Test-Assert ($bcError -match "doesn't supply 'Name'") ("-NextJobProvider: a job missing a mandatory parameter is refused as it arrives (" + $bcError + ")")
+# Not refused: a mandatory CancelToken (the kit supplies it), Mandatory =
+# $false, and parameter sets (which parameters are needed depends on the set).
+$bcOut = Invoke-PkRunspaceJobs -MaxParallel 2 -JobParams @(@{ Id = 1 }) -WorkerScript { param([Parameter(Mandatory)][System.Threading.CancellationToken]$CancelToken, [Parameter(Mandatory = $false)]$Opt, $Id) $Id }
+Test-Assert ($bcOut.Errors.Count -eq 0) ("a mandatory CancelToken and Mandatory = `$false aren't counted as missing (" + $bcOut.Errors.Count + " errors)")
+$bcOut = Invoke-PkRunspaceJobs -MaxParallel 2 -JobParams @(@{ A = 1 }) -WorkerScript { param([Parameter(Mandatory, ParameterSetName = 'A')]$A, [Parameter(Mandatory, ParameterSetName = 'B')]$B) $A }
+Test-Assert ($bcOut.Errors.Count -eq 0) ("a worker with parameter sets isn't refused for the other set's mandatory parameter (" + $bcOut.Errors.Count + " errors)")
+
+# A code page read from a CSV or config file is a string.
+$bcResolve = { param($e) & (Get-Module ParallelKit) { param($x) try { (Resolve-PkEncoding -Encoding $x).CodePage } catch { 'refused' } } $e }
+$bcCodePages = @((& $bcResolve '65001'), (& $bcResolve ' 437 '), (& $bcResolve 65001))
+Test-Assert ($bcCodePages[0] -eq 65001 -and $bcCodePages[1] -eq 437 -and $bcCodePages[2] -eq 65001) ("-OutputEncoding '65001' as a string is taken as code page 65001, like the number (" + ($bcCodePages -join ', ') + ")")
+$bcError = $null
+try { $null = Invoke-PkProcessBatch -OutputEncoding '99999999999' -Commands @(@{ FilePath = $cmdExe; Arguments = '/c exit 0' }) } catch { $bcError = [string]$_ }
+Test-Assert ($bcError -like "*'99999999999' isn't an encoding*") ("a string of digits that isn't a code page is still refused (" + $bcError + ")")
+$bcOk = $null
+try { $bcOk = (Invoke-PkProcessWithTimeout -FilePath $cmdExe -Arguments '/d /c echo ok' -OutputEncoding '65001').Stdout } catch { $bcOk = [string]$_ }
+Test-Assert ($bcOk -match '^ok') ("a program runs with -OutputEncoding '65001' ('" + ([string]$bcOk).Trim() + "')")
+Write-Host ""
+
 Set-PkMessageHandler -Handler $null
 Reset-PkAbortState
 
