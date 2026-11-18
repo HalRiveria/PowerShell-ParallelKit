@@ -4701,6 +4701,11 @@ try {
     $null = Invoke-PkRunspaceJobs -MaxParallel 1 -NextJobProvider { if ($bcFeed.Count -gt 0) { return $bcFeed.Dequeue() }; return $null }.GetNewClosure() -WorkerScript { param([Parameter(Mandatory)][string]$Name, $Other) $Name }
 } catch { $bcError = [string]$_ }
 Test-Assert ($bcError -match "doesn't supply 'Name'") ("-NextJobProvider: a job missing a mandatory parameter is refused as it arrives (" + $bcError + ")")
+# A case-sensitive hashtable's 'name' binds to $Name, so it isn't missing.
+$bcJob = [hashtable]::new(); $bcJob['name'] = 'a'
+$bcOut = $null; $bcError = $null
+try { $bcOut = Invoke-PkRunspaceJobs -MaxParallel 1 -JobParams @(,$bcJob) -WorkerScript { param([Parameter(Mandatory)][string]$Name) $Name } } catch { $bcError = [string]$_ }
+Test-Assert ($null -eq $bcError -and $null -ne $bcOut -and $bcOut.Errors.Count -eq 0) ("a mandatory parameter supplied in another case, in a case-sensitive hashtable, isn't counted as missing (" + $bcError + ")")
 # Not refused: a mandatory CancelToken (the kit supplies it), Mandatory =
 # $false, and parameter sets (which parameters are needed depends on the set).
 $bcOut = Invoke-PkRunspaceJobs -MaxParallel 2 -JobParams @(@{ Id = 1 }) -WorkerScript { param([Parameter(Mandatory)][System.Threading.CancellationToken]$CancelToken, [Parameter(Mandatory = $false)]$Opt, $Id) $Id }
@@ -4710,8 +4715,9 @@ Test-Assert ($bcOut.Errors.Count -eq 0) ("a worker with parameter sets isn't ref
 
 # A code page read from a CSV or config file is a string.
 $bcResolve = { param($e) & (Get-Module ParallelKit) { param($x) try { (Resolve-PkEncoding -Encoding $x).CodePage } catch { 'refused' } } $e }
-$bcCodePages = @((& $bcResolve '65001'), (& $bcResolve ' 437 '), (& $bcResolve 65001))
+$bcCodePages = @((& $bcResolve '65001'), (& $bcResolve ' 437 '), (& $bcResolve 65001), (& $bcResolve ([long]65001)))
 Test-Assert ($bcCodePages[0] -eq 65001 -and $bcCodePages[1] -eq 437 -and $bcCodePages[2] -eq 65001) ("-OutputEncoding '65001' as a string is taken as code page 65001, like the number (" + ($bcCodePages -join ', ') + ")")
+Test-Assert ($bcCodePages[3] -eq 65001) ("so is 65001 as an Int64, as ConvertFrom-Json gives it on PowerShell 7 (" + $bcCodePages[3] + ")")
 $bcError = $null
 try { $null = Invoke-PkProcessBatch -OutputEncoding '99999999999' -Commands @(@{ FilePath = $cmdExe; Arguments = '/c exit 0' }) } catch { $bcError = [string]$_ }
 Test-Assert ($bcError -like "*'99999999999' isn't an encoding*") ("a string of digits that isn't a code page is still refused (" + $bcError + ")")

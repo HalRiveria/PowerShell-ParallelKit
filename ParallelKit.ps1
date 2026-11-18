@@ -1345,8 +1345,10 @@ function Resolve-PkEncoding {
     # .NET Framework doesn't know the name 'utf8'; no BOM either way, since
     # this only decodes.
     if ($Encoding -is [string] -and $Encoding -in @('utf8', 'utf-8')) { return [System.Text.UTF8Encoding]::new($false) }
+    # Any whole number, too: ConvertFrom-Json on 7 gives an Int64.
     $codePage = 0
-    if ($Encoding -is [string] -and $Encoding.Trim() -match '^[0-9]+$' -and [int]::TryParse($Encoding.Trim(), [ref]$codePage)) { $Encoding = $codePage }
+    $digits = ([string]$Encoding).Trim()
+    if ($digits -match '^[0-9]+$' -and [int]::TryParse($digits, [ref]$codePage)) { $Encoding = $codePage }
     try {
         if ($Encoding -is [int]) { return [System.Text.Encoding]::GetEncoding([int]$Encoding) }
         return [System.Text.Encoding]::GetEncoding([string]$Encoding)
@@ -3163,9 +3165,6 @@ function Invoke-PkRunspaceJobs {
     # Passing a parameter the worker doesn't declare fails the whole invoke
     # with an unhelpful binding error.
     $declaredParams = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-    if ($null -ne $WorkerScript.Ast.ParamBlock) {
-        foreach ($p in $WorkerScript.Ast.ParamBlock.Parameters) { $null = $declaredParams.Add($p.Name.VariablePath.UserPath) }
-    }
     # Leaving out a mandatory one fails that job in binding, after others have
     # started. Not checked with parameter sets, where what's needed depends on
     # the set, and not for CancelToken, which is filled in when a job leaves
@@ -3174,6 +3173,7 @@ function Invoke-PkRunspaceJobs {
     $hasParameterSets = $false
     if ($null -ne $WorkerScript.Ast.ParamBlock) {
         foreach ($workerParam in $WorkerScript.Ast.ParamBlock.Parameters) {
+            $null = $declaredParams.Add($workerParam.Name.VariablePath.UserPath)
             $isMandatory = $false
             foreach ($paramAttr in $workerParam.Attributes) {
                 if ($paramAttr -isnot [System.Management.Automation.Language.AttributeAst]) { continue }
@@ -3202,8 +3202,10 @@ function Invoke-PkRunspaceJobs {
                     throw ("Invoke-PkRunspaceJobs: job " + $jobIndex + " supplies '" + $key + "', but -WorkerScript's param() block doesn't declare it. Nothing was started.")
                 }
             }
+            # -contains, not ContainsKey: case-insensitive like binding, even
+            # for a case-sensitive [hashtable]::new() job.
             foreach ($mandatoryParam in $mandatoryParams) {
-                if (-not $JobParams[$jobIndex].ContainsKey($mandatoryParam)) {
+                if (@($JobParams[$jobIndex].Keys) -notcontains $mandatoryParam) {
                     throw ("Invoke-PkRunspaceJobs: job " + $jobIndex + " doesn't supply '" + $mandatoryParam + "', which -WorkerScript's param() block makes mandatory. Nothing was started.")
                 }
             }
@@ -3318,7 +3320,7 @@ function Invoke-PkRunspaceJobs {
                     }
                 }
                 foreach ($mandatoryParam in $mandatoryParams) {
-                    if (-not $nextJob.ContainsKey($mandatoryParam)) {
+                    if (@($nextJob.Keys) -notcontains $mandatoryParam) {   # case-insensitive, as for -JobParams above
                         throw ("Invoke-PkRunspaceJobs: a job from -NextJobProvider doesn't supply '" + $mandatoryParam + "', which -WorkerScript's param() block makes mandatory.")
                     }
                 }
