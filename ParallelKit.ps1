@@ -164,7 +164,7 @@ public static class PkState
 
     // Bump this, and the check after the type definitions, whenever any C#
     // in this file changes: a session keeps the types it compiled first.
-    public const int TypesVersion = 8;
+    public const int TypesVersion = 9;
 
     // Locked: Register-/Unregister-PkCancellationSource are callable from
     // worker runspaces, and List<T> is not safe for concurrent writers.
@@ -247,8 +247,12 @@ public sealed class PkStartedProcess
 
 // Reads one of a program's output streams to its end, in chunks, so what has
 // arrived can be taken at any time (Snapshot): a program the program started
-// can hold the stream open long after it exits. The task's result is the
-// whole text, at the end of the stream. The reader's decoder carries a
+// can hold the stream open long after it exits. The first snapshot taken
+// before the end is the stream's text from then on: the read carries on to
+// the end, so the program holding the stream never blocks on a full pipe,
+// but drops what it reads, which nobody can get any more. The task's result
+// is that snapshot, or the whole text if none was taken. The reader is
+// closed at the end of the stream. The reader's decoder carries a
 // character split across two reads over to the next, so a snapshot never
 // ends in half a character. Each read runs on a thread of its own
 // (LongRunning), not a thread-pool thread: a read blocks until every holder
@@ -261,23 +265,43 @@ public sealed class PkStreamReadTask : Task<string>
     private sealed class Buffer
     {
         private readonly TextReader _reader;
+        // Null once the text is kept: at a snapshot or at the end of the
+        // stream, whichever comes first. The builder goes then, so the text
+        // isn't held twice.
         private StringBuilder _text = new StringBuilder();
-        private string _final;
+        private string _kept;
         private readonly object _gate = new object();
+        public volatile bool ReaderClosed;
         public Buffer(TextReader reader) { _reader = reader; }
         public string Pump()
         {
-            char[] chunk = new char[4096];
-            int n;
-            while ((n = _reader.Read(chunk, 0, chunk.Length)) > 0)
+            try
             {
-                lock (_gate) { _text.Append(chunk, 0, n); }
+                char[] chunk = new char[4096];
+                int n;
+                while ((n = _reader.Read(chunk, 0, chunk.Length)) > 0)
+                {
+                    lock (_gate) { if (_text != null) { _text.Append(chunk, 0, n); } }
+                }
+                return Keep();
             }
-            // The builder goes once the text is final, so it isn't held twice.
-            lock (_gate) { _final = _text.ToString(); _text = null; return _final; }
+            finally
+            {
+                // Closes the pipe now rather than at the next garbage collection.
+                try { _reader.Dispose(); ReaderClosed = true; }
+                catch (Exception) { }   // a close that fails must not hide the read's own result or error
+            }
         }
         // Locked: the reader may be appending while Complete-PkProcess takes it.
-        public string Snapshot() { lock (_gate) { return _final != null ? _final : _text.ToString(); } }
+        public string Keep()
+        {
+            lock (_gate)
+            {
+                if (_text != null) { _kept = _text.ToString(); _text = null; }
+                return _kept;
+            }
+        }
+        public int HeldLength { get { lock (_gate) { return _text != null ? _text.Length : _kept.Length; } } }
     }
 
     private readonly Buffer _buffer;
@@ -290,8 +314,14 @@ public sealed class PkStreamReadTask : Task<string>
         return task;
     }
 
-    // The text that has arrived so far; all of it once the task has finished.
-    public string Snapshot() { return _buffer.Snapshot(); }
+    // The text that has arrived so far, kept as the stream's text from then
+    // on; all of it if the stream has already ended.
+    public string Snapshot() { return _buffer.Keep(); }
+
+    // Test-only reads: how many characters the buffer holds, and whether the
+    // reader has been closed.
+    public int TestHeldLength { get { return _buffer.HeldLength; } }
+    public bool TestReaderClosed { get { return _buffer.ReaderClosed; } }
 }
 
 // A Windows Job Object with KILL_ON_JOB_CLOSE: every child process assigned
@@ -782,7 +812,7 @@ public static class PkChildProcessJob
 # A session that loaded an older copy keeps its compiled types. Say so,
 # rather than fail later with a missing-method error. Keep this number in
 # sync with [PkState]::TypesVersion.
-if ((& { try { [PkState]::TypesVersion } catch { 0 } }) -ne 8) {
+if ((& { try { [PkState]::TypesVersion } catch { 0 } }) -ne 9) {
     throw "ParallelKit: this PowerShell session already loaded an older version of the kit, and its compiled parts can't be swapped out. Close this window and start a new one."
 }
 
@@ -1753,7 +1783,10 @@ function Complete-PkProcess {
     # that limit was hit. The stream it gave up on comes back with what arrived
     # before then: cut short, not lost. Its read carries on in the background
     # until that program lets go of it (it's killed with PowerShell at the
-    # latest). A stream whose read failed (StreamError) comes back $null.
+    # latest), dropping what arrives after: the text handed over is that
+    # stream's text from then on, and calling this again on the same job
+    # returns the same. A stream whose read failed comes back $null, with the
+    # reason in StreamError, even if the other stream timed out.
     # .PARAMETER Job
     # What Start-PkProcess returned, or a dispatcher job with the same keys.
     # .PARAMETER StreamTimeoutMs
@@ -1793,12 +1826,20 @@ function Complete-PkProcess {
         } catch {
             $result.StreamError = [string]$_.Exception.Message
         }
+        # The failed read's own reason, rather than WaitAll's wrapper. Read
+        # from the tasks: WaitAll throws only once every task has finished,
+        # so it says nothing of a read that failed while the other stream was
+        # still held open.
+        foreach ($task in $tasks) {
+            if ($task.IsFaulted) { $result.StreamError = [string]$task.Exception.GetBaseException().Message; break }
+        }
     }
     # The output's end (both streams closed, or the timeout) is separate from
     # the program's end (the exit code, below): a program it started can hold
     # a stream open after it exits. A stream still open at the timeout gives
     # the text that arrived before it, each stream on its own; its read
-    # carries on in the background until that program lets go.
+    # carries on in the background until that program lets go, dropping
+    # what arrives after (Snapshot keeps the text it returns).
     $ranToCompletion = [System.Threading.Tasks.TaskStatus]::RanToCompletion
     foreach ($stream in 'Stdout', 'Stderr') {
         $task = $Job[$stream + 'Task']

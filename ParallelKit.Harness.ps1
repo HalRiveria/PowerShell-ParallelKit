@@ -4546,6 +4546,71 @@ try {
 }
 Write-Host ""
 
+Write-Host "=== BA: after a stream timeout, the read drains without keeping the text ===" -ForegroundColor Cyan
+# The read of a held stream goes on to its end, but nobody can get what it
+# reads after the result was handed over, so it isn't kept. The reader is
+# closed at the end of every stream, rather than at the next garbage
+# collection. Test-only reads that a build without them lacks count as a
+# failure, not an error.
+Reset-Harness
+function Get-HarnessReadState($Task, [string]$Name) {
+    try { return $Task.$Name } catch { return 'missing' }   # an older build has no such test-only read
+}
+function Stop-HarnessPingsOf([int]$ParentId) {
+    foreach ($p in @(Get-CimInstance Win32_Process -Filter ("ParentProcessId=" + $ParentId + " AND Name='PING.EXE'"))) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }
+}
+# A ping that writes a line a second, holding the output after cmd exits.
+$s = Start-PkProcess -FilePath $cmdExe -Arguments '/d /c echo first& start /b ping -t 127.0.0.1'
+try {
+    $null = $s['Proc'].WaitForExit(10000)
+    $r = Complete-PkProcess $s -StreamTimeoutMs 1500
+    $baHeldAtResult = Get-HarnessReadState $s['StdoutTask'] 'TestHeldLength'
+    Start-Sleep -Seconds 3
+    $baHeldLater = Get-HarnessReadState $s['StdoutTask'] 'TestHeldLength'
+    $baStillReading = -not $s['StdoutTask'].IsCompleted
+    $baAgain = Complete-PkProcess $s -StreamTimeoutMs 0
+    $baLength = ([string]$r.Stdout).Length
+    Test-Assert ($baAgain.Stdout -ceq $r.Stdout) ("a second Complete-PkProcess on the same job returns the same text (" + ([string]$baAgain.Stdout).Length + " characters, first " + $baLength + ")")
+    Test-Assert ($r.StreamTimedOut -and $r.Stdout -match 'first' -and $baStillReading -and $baHeldAtResult -eq $baLength -and $baHeldLater -eq $baLength) ("a program that keeps writing after the result: the buffer stays at the result's " + $baLength + " characters (at the result " + $baHeldAtResult + ", 3 s later " + $baHeldLater + ", still reading " + $baStillReading + ")")
+} finally { Stop-HarnessPingsOf -ParentId $s['Proc'].Id }
+$baEnded = $s['StdoutTask'].Wait(10000) -and $s['StderrTask'].Wait(10000)
+$baFinal = $null; if ($baEnded) { $baFinal = $s['StdoutTask'].Result }
+Test-Assert ($baEnded -and $baFinal -eq $r.Stdout -and ([string]$baFinal).Length -eq $baLength) ("once the writer is killed the read ends, and its result is the text handed over, not what came after (" + $baEnded + ", " + ([string]$baFinal).Length + " characters)")
+Test-Assert ((Get-HarnessReadState $s['StdoutTask'] 'TestReaderClosed') -eq $true) "a held stream's reader is closed when the stream ends"
+$s['Proc'].Dispose()
+
+foreach ($baPath in 'created in the job', 'Process.Start fallback') {
+    [PkChildProcessJob]::TestUseProcessStart = ($baPath -eq 'Process.Start fallback')
+    try {
+        $s = Start-PkProcess -FilePath $cmdExe -Arguments '/d /c echo out& echo err 1>&2'
+        $r = Complete-PkProcess $s -Dispose
+    } finally { [PkChildProcessJob]::TestUseProcessStart = $false }
+    $baOut = Get-HarnessReadState $s['StdoutTask'] 'TestReaderClosed'
+    $baErr = Get-HarnessReadState $s['StderrTask'] 'TestReaderClosed'
+    Test-Assert ($r.Stdout -match 'out' -and $r.Stderr -match 'err' -and $baOut -eq $true -and $baErr -eq $true) ($baPath + ": both readers are closed once a program's output ends (stdout " + $baOut + ", stderr " + $baErr + ")")
+}
+
+# One read fails while the other stream is still held: the failure is
+# reported, not just the timeout. Task.WaitAll with a timeout throws only once
+# every task has finished, so it didn't throw here.
+$s = Start-PkProcess -FilePath $cmdExe -Arguments '/d /c exit 0'
+$null = $s['Proc'].WaitForExit(10000)
+$null = [System.Threading.Tasks.Task]::WaitAll(@($s['StdoutTask'], $s['StderrTask']), 10000)
+$baFailed = [System.Threading.Tasks.TaskCompletionSource[string]]::new()
+$baFailed.SetException([System.IO.IOException]::new('Test: the read failed.'))
+$baHeld = [System.Threading.Tasks.TaskCompletionSource[string]]::new()
+$r = Complete-PkProcess @{ Proc = $s['Proc']; StdoutTask = $baFailed.Task; StderrTask = $baHeld.Task } -StreamTimeoutMs 300 -Dispose
+$baHeld.SetResult('')
+Test-Assert ($r.StreamTimedOut -and $r.StreamError -match 'the read failed' -and $null -eq $r.Stdout) ("a read that failed while the other stream timed out is reported in StreamError (StreamTimedOut " + $r.StreamTimedOut + ", StreamError '" + $r.StreamError + "')")
+# And when the other stream ended normally: the read's own reason, not
+# WaitAll's "One or more errors occurred".
+$s = Start-PkProcess -FilePath $cmdExe -Arguments '/d /c exit 0'
+$null = $s['Proc'].WaitForExit(10000)
+$null = [System.Threading.Tasks.Task]::WaitAll(@($s['StdoutTask'], $s['StderrTask']), 10000)
+$r = Complete-PkProcess @{ Proc = $s['Proc']; StdoutTask = $baFailed.Task; StderrTask = $s['StderrTask'] } -StreamTimeoutMs 300 -Dispose
+Test-Assert (-not $r.StreamTimedOut -and $r.StreamError -eq 'Test: the read failed.' -and $null -eq $r.Stdout) ("a failed read next to one that ended gives the read's own reason (StreamError '" + $r.StreamError + "')")
+Write-Host ""
+
 Set-PkMessageHandler -Handler $null
 Reset-PkAbortState
 
