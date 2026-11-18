@@ -1791,7 +1791,9 @@ function Complete-PkProcess {
     # What Start-PkProcess returned, or a dispatcher job with the same keys.
     # .PARAMETER StreamTimeoutMs
     # How long to wait for the output after the program exits,
-    # in milliseconds (default 15000); 0 or more, and 0 doesn't wait.
+    # in milliseconds (default 15000); 0 or more, and 0 doesn't wait. On a job
+    # the dispatcher's default -JobPollCompleted has already waited on, only
+    # what's left of it, so with the default nothing.
     # .PARAMETER Dispose
     # Dispose the process object afterwards.
     # .OUTPUTS
@@ -1804,6 +1806,7 @@ function Complete-PkProcess {
     param(
         [Parameter(Mandatory, Position = 0)]
         [hashtable]$Job,
+        # The dispatcher's default -JobPollCompleted waits the same 15 s: keep the two in step.
         [int]$StreamTimeoutMs = 15000,
         [switch]$Dispose
     )
@@ -1820,9 +1823,15 @@ function Complete-PkProcess {
     $tasks = [System.Collections.Generic.List[System.Threading.Tasks.Task]]::new()
     if ($null -ne $Job['StdoutTask']) { $tasks.Add($Job['StdoutTask']) }
     if ($null -ne $Job['StderrTask']) { $tasks.Add($Job['StderrTask']) }
+    # The dispatcher's default poll waits for the output alongside the other
+    # jobs, timing it with OutputWait, and the final pass after an abort's
+    # wait sets OutputWaitOver: what's left of the wait, and none at all then.
+    $waitMs = $StreamTimeoutMs
+    if ($Job['OutputWaitOver']) { $waitMs = 0 }
+    elseif ($Job['OutputWait'] -is [System.Diagnostics.Stopwatch]) { $waitMs = [int][Math]::Max(0, $StreamTimeoutMs - $Job['OutputWait'].ElapsedMilliseconds) }
     if ($tasks.Count -gt 0) {
         try {
-            if (-not [System.Threading.Tasks.Task]::WaitAll($tasks.ToArray(), $StreamTimeoutMs)) { $result.StreamTimedOut = $true }
+            if (-not [System.Threading.Tasks.Task]::WaitAll($tasks.ToArray(), $waitMs)) { $result.StreamTimedOut = $true }
         } catch {
             $result.StreamError = [string]$_.Exception.Message
         }
@@ -1944,7 +1953,8 @@ function Invoke-PkProcessDispatch {
     #
     # The dispatcher keeps its own state on each job hashtable. Don't use these keys
     # for anything else: GroupKey, SlotReleased, Proc, StdoutTask, StderrTask,
-    # Stopwatch, TimeLimit, TimedOut, StartFailureReported. It also sets Group to
+    # Stopwatch, TimeLimit, TimedOut, StartFailureReported, OutputWait,
+    # OutputWaitOver. It also sets Group to
     # the job's group, unless the job already has a Group of its own. The default
     # starter reads FilePath, Arguments (a string as written, or a list quoted one
     # argument per element), WorkingDirectory and OutputEncoding from the job. A
@@ -1960,8 +1970,11 @@ function Invoke-PkProcessDispatch {
     # { param($job) } that starts the job and returns it with .Proc set. Default:
     # Start-PkProcess on the job's FilePath and Arguments.
     # .PARAMETER JobPollCompleted
-    # { param($job) } returning $true once the job is finished. Default:
-    # $job['Proc'].HasExited. Only its last output value counts.
+    # { param($job) } returning $true once the job is finished. Only its last
+    # output value counts. Default: once the program has exited and its output
+    # has been read, or 15 s after the exit if a program it started holds the
+    # output open (the job keeps its slot meanwhile), so Complete-PkProcess in
+    # -JobFinalize doesn't wait and the other jobs carry on.
     # .PARAMETER JobFinalize
     # { param($job, $pendingQueue) } called once per finished job; collect its
     # result with Complete-PkProcess. Enqueue new job hashtables onto $pendingQueue
@@ -2083,7 +2096,25 @@ function Invoke-PkProcessDispatch {
     }
     # The default poll reads $pkJob['Proc'], so a started job must have one.
     $pkRequireProc = ($null -eq $pkJobPollCompleted)
-    if ($null -eq $pkJobPollCompleted)      { $pkJobPollCompleted      = { param($pkJob) return $pkJob['Proc'].HasExited } }
+    if ($null -eq $pkJobPollCompleted) {
+        # Done once the program has exited and its output has been read, so
+        # Complete-PkProcess in -JobFinalize has nothing to wait for: waiting
+        # there would stall the whole loop. A job whose output a leftover
+        # program holds open keeps its slot until the reads end or 15 s pass
+        # (Complete-PkProcess's default -StreamTimeoutMs; keep the two in
+        # step), timed by OutputWait, which Complete-PkProcess reads. After an
+        # abort's wait the final pass sets OutputWaitOver: it takes what has
+        # arrived.
+        $pkJobPollCompleted = {
+            param($pkJob)
+            if (-not $pkJob['Proc'].HasExited) { return $false }
+            $pkOut = $pkJob['StdoutTask']; $pkErr = $pkJob['StderrTask']
+            if (($pkOut -isnot [System.Threading.Tasks.Task] -or $pkOut.IsCompleted) -and ($pkErr -isnot [System.Threading.Tasks.Task] -or $pkErr.IsCompleted)) { return $true }
+            if ($pkJob['OutputWaitOver']) { return $true }
+            if ($pkJob['OutputWait'] -isnot [System.Diagnostics.Stopwatch]) { $pkJob['OutputWait'] = [System.Diagnostics.Stopwatch]::StartNew() }
+            return ($pkJob['OutputWait'].ElapsedMilliseconds -ge 15000)
+        }
+    }
     if ($null -eq $pkJobAbortCleanup)       { $pkJobAbortCleanup       = { param($pkJob) } }
     if ($null -eq $pkGroupCompleteCallback) { $pkGroupCompleteCallback = { param($pkGroup) } }
 
@@ -2301,6 +2332,7 @@ function Invoke-PkProcessDispatchCore {
                 # its old, disposed process: cleared first.
                 if ($pkJob['SlotReleased']) {
                     $pkJob['Proc'] = $null; $pkJob['StdoutTask'] = $null; $pkJob['StderrTask'] = $null; $pkJob['Stopwatch'] = $null
+                    $pkJob['OutputWait'] = $null; $pkJob['OutputWaitOver'] = $null
                 }
                 $pkJob['SlotReleased'] = $false
                 $pkStarting = $pkJob
@@ -2486,6 +2518,11 @@ function Invoke-PkProcessDispatchCore {
         # force-stopped. Keep in sync with the two blocks above, minus the time
         # limit (whatever is left is force-stopped just below).
         if ($pkRunning.Count -gt 0) {
+            # The wait is over: a job whose program has finished, and that is
+            # only waiting for its output, takes what has arrived (the default
+            # poll and Complete-PkProcess read this) rather than being
+            # force-stopped.
+            foreach ($pkJob in $pkRunning) { $pkJob['OutputWaitOver'] = $true }
             $pkStillWaiting = [System.Collections.Generic.List[hashtable]]::new()
             foreach ($pkJob in $pkRunning) {
                 $pkCbDone = $false
