@@ -164,7 +164,7 @@ public static class PkState
 
     // Bump this, and the check after the type definitions, whenever any C#
     // in this file changes: a session keeps the types it compiled first.
-    public const int TypesVersion = 7;
+    public const int TypesVersion = 8;
 
     // Locked: Register-/Unregister-PkCancellationSource are callable from
     // worker runspaces, and List<T> is not safe for concurrent writers.
@@ -250,9 +250,12 @@ public sealed class PkStartedProcess
 // can hold the stream open long after it exits. The task's result is the
 // whole text, at the end of the stream. The reader's decoder carries a
 // character split across two reads over to the next, so a snapshot never
-// ends in half a character. A read blocks a thread-pool thread, as
-// ReadToEndAsync did; it ends when every holder of the stream's write end
-// has let go (at the latest when PowerShell exits: they're in the Job Object).
+// ends in half a character. Each read runs on a thread of its own
+// (LongRunning), not a thread-pool thread: a read blocks until every holder
+// of the stream's write end has let go (at the latest when PowerShell exits:
+// they're in the Job Object), and leftover programs holding their output
+// would otherwise use up the pool, so a new program's reads would wait for
+// the pool to grow and hit their stream timeout.
 public sealed class PkStreamReadTask : Task<string>
 {
     private sealed class Buffer
@@ -278,7 +281,7 @@ public sealed class PkStreamReadTask : Task<string>
     }
 
     private readonly Buffer _buffer;
-    private PkStreamReadTask(Buffer buffer) : base(new Func<string>(buffer.Pump)) { _buffer = buffer; }
+    private PkStreamReadTask(Buffer buffer) : base(new Func<string>(buffer.Pump), TaskCreationOptions.LongRunning) { _buffer = buffer; }
 
     public static PkStreamReadTask Run(TextReader reader)
     {
@@ -779,7 +782,7 @@ public static class PkChildProcessJob
 # A session that loaded an older copy keeps its compiled types. Say so,
 # rather than fail later with a missing-method error. Keep this number in
 # sync with [PkState]::TypesVersion.
-if ((& { try { [PkState]::TypesVersion } catch { 0 } }) -ne 7) {
+if ((& { try { [PkState]::TypesVersion } catch { 0 } }) -ne 8) {
     throw "ParallelKit: this PowerShell session already loaded an older version of the kit, and its compiled parts can't be swapped out. Close this window and start a new one."
 }
 
@@ -934,9 +937,9 @@ function Initialize-PkChildProcessJob {
 }
 
 function Initialize-PkThreadPool {
-    # Each redirected child holds two pool threads for its output reads, and
-    # the pool grows slowly past its minimum, so a burst of processes could
-    # stall their reads. Raise the minimum up front.
+    # Raises the pool's minimum, since the pool grows slowly past it. This was
+    # for the output reads, two per program; those now run on threads of their
+    # own (PkStreamReadTask), so the kit's own work doesn't depend on it.
     param([int]$MaxConcurrentProcesses = 0)
     $clampedProcs = [Math]::Min([Math]::Max($MaxConcurrentProcesses, 0), 16000)
     $minimumWorkerThreads = [Math]::Max(128, (2 * $clampedProcs) + 32)

@@ -4488,6 +4488,64 @@ $dStopped = Get-HarnessDuration $byN[2]; $dWaiting = Get-HarnessDuration $byN[3]
 Test-Assert ($byN.Count -eq 4 -and $byN[2].Aborted -and $dStopped -is [double] -and $dStopped -gt 0 -and $dStopped -le 5 -and $byN[3].Aborted -and $null -eq $dWaiting -and $null -eq $dFailed) ("an abort: the force-stopped program has the time it ran, one never started and one that couldn't start have `$null (" + $dStopped + ", " + $dWaiting + ", " + $dFailed + ")")
 Write-Host ""
 
+Write-Host "=== AZ: programs left holding their output don't hold up a new program's ===" -ForegroundColor Cyan
+# Each holder is a ping, started by a cmd that exits at once, holding stdout
+# and stderr: two blocked reads. Enough of them to take more threads than the
+# pool's minimum. With the reads on pool threads, the new program's reads
+# queued behind the holders' while the pool grew a thread at a time, and it
+# came back empty at its stream timeout. In a fresh PowerShell: earlier
+# sections raise this one's pool minimum (the 20,000-job dispatch to over
+# 2000), and once raised, lowering it again doesn't bring back the slow growth.
+Reset-Harness
+$azScript = Join-Path $env:TEMP ("pk-heldreads-" + [guid]::NewGuid().ToString("N") + ".ps1")
+[System.IO.File]::WriteAllText($azScript, @'
+param([string]$Kit)
+Set-StrictMode -Version Latest
+. $Kit
+$null = Initialize-ParallelKit
+$minWorker = 0; $minIo = 0
+[System.Threading.ThreadPool]::GetMinThreads([ref]$minWorker, [ref]$minIo)
+$count = [int][Math]::Ceiling($minWorker / 2) + 20
+$cmd = Join-Path $env:SystemRoot 'System32\cmd.exe'
+$held = [System.Collections.Generic.List[hashtable]]::new()
+try {
+    for ($i = 0; $i -lt $count; $i++) { $held.Add((Start-PkProcess -FilePath $cmd -Arguments '/d /c start /b ping -n 91 127.0.0.1 >nul')) }
+    foreach ($s in $held) { $null = $s['Proc'].WaitForExit(10000) }
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $r = Invoke-PkProcessWithTimeout -FilePath $cmd -Arguments '/d /c echo plain' -StreamTimeoutMs 5000
+    $sw.Stop()
+    [Console]::Out.WriteLine('RESULT|' + ([string]$r.Stdout).Trim() + '|' + $r.StreamTimedOut + '|' + [math]::Round($sw.Elapsed.TotalSeconds, 2) + '|' + $count + '|' + $minWorker)
+} finally {
+    # Only the pings this script's own cmds started, found by parent PID.
+    $parents = @{}; foreach ($s in $held) { $parents[[int]$s['Proc'].Id] = $true }
+    foreach ($p in @(Get-CimInstance Win32_Process -Filter "Name='PING.EXE'")) {
+        if ($parents.ContainsKey([int]$p.ParentProcessId)) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }
+    }
+    $tasks = [System.Collections.Generic.List[System.Threading.Tasks.Task]]::new()
+    foreach ($s in $held) { $tasks.Add($s['StdoutTask']); $tasks.Add($s['StderrTask']) }
+    $drained = $false
+    try { $drained = [System.Threading.Tasks.Task]::WaitAll($tasks.ToArray(), 15000) } catch { $drained = $true }   # a faulted read has still ended, which is all this waits for
+    [Console]::Out.WriteLine('DRAINED|' + $drained + '|' + $tasks.Count)
+}
+'@)
+try {
+    $azRun = Invoke-PkProcessWithTimeout -FilePath $selfExe -Arguments ('-NoProfile -ExecutionPolicy Bypass -File "' + $azScript + '" -Kit "' + (Join-Path $PSScriptRoot 'ParallelKit.ps1') + '"') -TimeoutMs 120000
+    $azLines = @(([string]$azRun.Stdout) -split "`r?`n")
+    $azResult = @($azLines | Where-Object { $_ -like 'RESULT|*' })
+    $azDrain = @($azLines | Where-Object { $_ -like 'DRAINED|*' })
+    $azOk = $false; $azText = ([string]$azRun.Stdout + [string]$azRun.Stderr).Trim()
+    if ($azResult.Count -eq 1) {
+        $f = $azResult[0].Split('|')
+        $azOk = ($f[1] -eq 'plain' -and $f[2] -eq 'False' -and [double]$f[3] -lt 2.5)
+        $azText = $f[4] + " programs' output held open (pool minimum " + $f[5] + "): '" + $f[1] + "', StreamTimedOut=" + $f[2] + ", " + $f[3] + " s"
+    }
+    Test-Assert $azOk ("a new program still gets its output well inside its stream timeout while others' output is held open (" + $azText + ")")
+    Test-Assert ($azDrain.Count -eq 1 -and $azDrain[0] -like 'DRAINED|True|*') ("once the holders are killed, all their reads end (" + ($azDrain -join '') + ")")
+} finally {
+    [System.IO.File]::Delete($azScript)
+}
+Write-Host ""
+
 Set-PkMessageHandler -Handler $null
 Reset-PkAbortState
 
