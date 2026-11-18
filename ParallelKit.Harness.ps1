@@ -4611,6 +4611,78 @@ $r = Complete-PkProcess @{ Proc = $s['Proc']; StdoutTask = $baFailed.Task; Stder
 Test-Assert (-not $r.StreamTimedOut -and $r.StreamError -eq 'Test: the read failed.' -and $null -eq $r.Stdout) ("a failed read next to one that ended gives the read's own reason (StreamError '" + $r.StreamError + "')")
 Write-Host ""
 
+Write-Host "=== BB: a job waiting for its output doesn't hold up the others ===" -ForegroundColor Cyan
+# Each held command's cmd exits at once and leaves a ping holding its output
+# for a few seconds, so its output ends well inside the stream timeout. The
+# wait for it used to run inside -JobFinalize, on the dispatch loop's own
+# thread: no other job was polled, started, timed or stopped meanwhile. The
+# pings carry -w 4321 so this section can find and kill its own.
+Reset-Harness
+function Stop-HarnessTaggedPings {
+    foreach ($p in @(Get-CimInstance Win32_Process -Filter "Name='PING.EXE' AND CommandLine LIKE '%-w 4321 %'")) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }
+}
+function New-HarnessHeldCommand([int]$Seconds, $Key) {
+    return @{ FilePath = $cmdExe; Arguments = ('/d /c echo held& start /b ping -n ' + ($Seconds + 1) + ' -w 4321 127.0.0.1 >nul'); Key = $Key }
+}
+try {
+    # Two slots: one job waits about 6 s for its output while four 1 s
+    # programs go through the other slot, finishing by about 4 s.
+    $bbAt = [System.Collections.Generic.List[double]]::new()
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $bbCommands = @(New-HarnessHeldCommand -Seconds 6 -Key 'held') + @(1..4 | ForEach-Object { @{ FilePath = $cmdExe; Arguments = '/d /c ping -n 2 127.0.0.1 >nul'; Key = 'quick' } })
+    $b = Invoke-PkProcessBatch -MaxConcurrent 2 -Commands $bbCommands -OnComplete { param($c, $r) if ($c['Key'] -eq 'quick') { $bbAt.Add($sw.Elapsed.TotalSeconds) } }.GetNewClosure()
+    $sw.Stop()
+    $bbLast = $null; if ($bbAt.Count -gt 0) { $bbLast = [math]::Round(($bbAt | Measure-Object -Maximum).Maximum, 1) }
+    $bbHeld = @($b.Results | Where-Object { $_.Command['Key'] -eq 'held' -and $_.Stdout -match 'held' -and -not $_.StreamTimedOut })
+    Test-Assert ($bbAt.Count -eq 4 -and $bbLast -lt 5.5 -and $bbHeld.Count -eq 1) ("batch: other programs keep running through the free slot while one waits for its output (last of 4 done at " + $bbLast + " s; the held one whole: " + ($bbHeld.Count -eq 1) + ")")
+
+    # One job waits for its output while the other passes its time limit:
+    # the limit is still enforced on time.
+    $b = Invoke-PkProcessBatch -MaxConcurrent 2 -Commands @((New-HarnessHeldCommand -Seconds 6 -Key 'held'), @{ FilePath = $pingExe; Arguments = '-n 30 127.0.0.1'; TimeoutSeconds = 2; Key = 'limited' })
+    $bbLimited = @($b.Results | Where-Object { $_.Command['Key'] -eq 'limited' })
+    $bbKilledAt = $null; if ($bbLimited.Count -eq 1 -and $null -ne $bbLimited[0].Duration) { $bbKilledAt = [math]::Round($bbLimited[0].Duration.TotalSeconds, 1) }
+    Test-Assert ($bbLimited.Count -eq 1 -and $bbLimited[0].TimedOut -and $null -ne $bbKilledAt -and $bbKilledAt -lt 3.5) ("batch: a program's 2 s time limit is enforced while another waits for its output (killed at " + $bbKilledAt + " s)")
+
+    # An abort while a job waits for its output: acted on at once, and after
+    # the abort's wait the job keeps what arrived rather than counting as
+    # force-stopped (its program had finished).
+    Reset-PkAbortState
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $b = Invoke-PkProcessBatch -MaxConcurrent 2 -AbortTimeoutSeconds 1 -OnComplete { param($c, $r) if ($c['Key'] -eq 'quick') { Request-PkAbort } } -Commands @((New-HarnessHeldCommand -Seconds 8 -Key 'held'), @{ FilePath = $cmdExe; Arguments = '/d /c ping -n 2 127.0.0.1 >nul'; Key = 'quick' })
+    $sw.Stop()
+    Reset-PkAbortState
+    $bbHeld = @($b.Results | Where-Object { $_.Command['Key'] -eq 'held' })
+    $bbHeldText = 'no result'
+    if ($bbHeld.Count -eq 1) { $bbHeldText = "Aborted " + $bbHeld[0].Aborted + ", StreamTimedOut " + $bbHeld[0].StreamTimedOut + ", Stdout '" + ([string]$bbHeld[0].Stdout).Trim() + "'" }
+    Test-Assert ($b.Aborted -and $sw.Elapsed.TotalSeconds -lt 5 -and $bbHeld.Count -eq 1 -and -not $bbHeld[0].Aborted -and $bbHeld[0].StreamTimedOut -and $bbHeld[0].Stdout -match 'held' -and $b.ForceKilledCount -eq 0) ("batch: an abort while a job waits for its output ends the run in time, and that job keeps what arrived (" + [math]::Round($sw.Elapsed.TotalSeconds, 1) + " s, " + $bbHeldText + ", force-stopped " + $b.ForceKilledCount + ")")
+
+    # Output held past the 15 s stream timeout: the poll gives up at 15 s, and
+    # Complete-PkProcess doesn't wait another 15 on top.
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $b = Invoke-PkProcessBatch -Commands @(New-HarnessHeldCommand -Seconds 25 -Key 'long')
+    $sw.Stop()
+    $bbLong = @($b.Results)
+    Test-Assert ($bbLong.Count -eq 1 -and $bbLong[0].StreamTimedOut -and $bbLong[0].Stdout -match 'held' -and $sw.Elapsed.TotalSeconds -ge 14 -and $sw.Elapsed.TotalSeconds -lt 20) ("batch: output held past the stream timeout is given up on once, after 15 s (" + [math]::Round($sw.Elapsed.TotalSeconds, 1) + " s)")
+    Stop-HarnessTaggedPings
+
+    # The dispatcher's default poll, with Complete-PkProcess in -JobFinalize:
+    # the same time-limit case.
+    $bbFeed = @{ Given = $false }
+    $bbJobs = @((New-HarnessHeldCommand -Seconds 6 -Key 'held'), @{ FilePath = $pingExe; Arguments = '-n 30 127.0.0.1'; TimeoutSeconds = 2; Key = 'limited' })
+    $bbDone = @{}
+    $null = Invoke-PkProcessDispatch -MaxConcurrent 2 `
+        -GroupProvider { if ($bbFeed.Given) { return $null }; $bbFeed.Given = $true; return @{ Name = 'held' } }.GetNewClosure() `
+        -JobBuilder { param($g) return $bbJobs }.GetNewClosure() `
+        -JobFinalize { param($j, $q) $bbDone[$j['Key']] = @{ Result = (Complete-PkProcess -Job $j); TimedOut = $j['TimedOut'] } }.GetNewClosure()
+    $bbKilledAt = $null; if ($bbDone.ContainsKey('limited') -and $null -ne $bbDone['limited'].Result.Duration) { $bbKilledAt = [math]::Round($bbDone['limited'].Result.Duration.TotalSeconds, 1) }
+    $bbWhole = ($bbDone.ContainsKey('held') -and $bbDone['held'].Result.Stdout -match 'held' -and -not $bbDone['held'].Result.StreamTimedOut)
+    Test-Assert ($bbDone.Count -eq 2 -and $bbDone['limited'].TimedOut -and $null -ne $bbKilledAt -and $bbKilledAt -lt 3.5 -and $bbWhole) ("dispatcher: with the default poll, a 2 s time limit is enforced while another job waits for its output (killed at " + $bbKilledAt + " s; the held one whole: " + $bbWhole + ")")
+} finally {
+    Stop-HarnessTaggedPings
+    Reset-PkAbortState
+}
+Write-Host ""
+
 Set-PkMessageHandler -Handler $null
 Reset-PkAbortState
 
