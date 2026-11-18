@@ -4488,6 +4488,37 @@ $dStopped = Get-HarnessDuration $byN[2]; $dWaiting = Get-HarnessDuration $byN[3]
 Test-Assert ($byN.Count -eq 4 -and $byN[2].Aborted -and $dStopped -is [double] -and $dStopped -gt 0 -and $dStopped -le 5 -and $byN[3].Aborted -and $null -eq $dWaiting -and $null -eq $dFailed) ("an abort: the force-stopped program has the time it ran, one never started and one that couldn't start have `$null (" + $dStopped + ", " + $dWaiting + ", " + $dFailed + ")")
 Write-Host ""
 
+Write-Host "=== AZ: programs left holding their output don't hold up a new program's ===" -ForegroundColor Cyan
+# Each holder is a ping, started by a cmd that exits at once, holding stdout
+# and stderr: two blocked reads. Enough of them to take more threads than the
+# pool's minimum. With the reads on pool threads, the new program's reads
+# queued behind the holders' while the pool grew a thread at a time, and it
+# came back empty at its stream timeout.
+Reset-Harness
+$azWorker = 0; $azIo = 0
+[System.Threading.ThreadPool]::GetMinThreads([ref]$azWorker, [ref]$azIo)
+$azCount = [int][Math]::Ceiling($azWorker / 2) + 20
+$azHeld = [System.Collections.Generic.List[hashtable]]::new()
+try {
+    for ($i = 0; $i -lt $azCount; $i++) { $azHeld.Add((Start-PkProcess -FilePath $cmdExe -Arguments '/d /c start /b ping -n 91 127.0.0.1 >nul')) }
+    foreach ($s in $azHeld) { $null = $s['Proc'].WaitForExit(10000) }
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $r = Invoke-PkProcessWithTimeout -FilePath $cmdExe -Arguments '/d /c echo plain' -StreamTimeoutMs 5000
+    $sw.Stop()
+    Test-Assert ($r.Stdout -match 'plain' -and -not $r.StreamTimedOut -and $sw.Elapsed.TotalSeconds -lt 2.5) ("with " + $azCount + " programs' output held open (pool minimum " + $azWorker + "), a new program still gets its output well inside its stream timeout ('" + ([string]$r.Stdout).Trim() + "', StreamTimedOut=" + $r.StreamTimedOut + ", " + [math]::Round($sw.Elapsed.TotalSeconds, 2) + " s)")
+} finally {
+    # Only the pings this section's own cmds started.
+    $azParents = @{}; foreach ($s in $azHeld) { $azParents[[int]$s['Proc'].Id] = $true }
+    foreach ($p in @(Get-CimInstance Win32_Process -Filter "Name='PING.EXE' AND CommandLine LIKE '%-n 91 127.0.0.1%'")) {
+        if ($azParents.ContainsKey([int]$p.ParentProcessId)) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }
+    }
+    foreach ($s in $azHeld) {
+        $null = [System.Threading.Tasks.Task]::WaitAll(@($s['StdoutTask'], $s['StderrTask']), 10000)
+        $s['Proc'].Dispose()
+    }
+}
+Write-Host ""
+
 Set-PkMessageHandler -Handler $null
 Reset-PkAbortState
 
