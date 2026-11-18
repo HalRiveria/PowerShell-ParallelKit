@@ -1824,11 +1824,13 @@ function Complete-PkProcess {
     if ($null -ne $Job['StdoutTask']) { $tasks.Add($Job['StdoutTask']) }
     if ($null -ne $Job['StderrTask']) { $tasks.Add($Job['StderrTask']) }
     # The dispatcher's default poll waits for the output alongside the other
-    # jobs, timing it with OutputWait, and the final pass after an abort's
-    # wait sets OutputWaitOver: what's left of the wait, and none at all then.
+    # jobs, timing it with OutputWait: only what's left of the wait here. The
+    # final pass after an abort's wait sets OutputWaitOver: at most 250 ms
+    # then, enough for a program that exited just before to have its output
+    # read to the end, short enough for a window close.
     $waitMs = $StreamTimeoutMs
-    if ($Job['OutputWaitOver']) { $waitMs = 0 }
-    elseif ($Job['OutputWait'] -is [System.Diagnostics.Stopwatch]) { $waitMs = [int][Math]::Max(0, $StreamTimeoutMs - $Job['OutputWait'].ElapsedMilliseconds) }
+    if ($Job['OutputWait'] -is [System.Diagnostics.Stopwatch]) { $waitMs = [int][Math]::Max(0, $StreamTimeoutMs - $Job['OutputWait'].ElapsedMilliseconds) }
+    if ($Job['OutputWaitOver']) { $waitMs = [Math]::Min($waitMs, 250) }
     if ($tasks.Count -gt 0) {
         try {
             if (-not [System.Threading.Tasks.Task]::WaitAll($tasks.ToArray(), $waitMs)) { $result.StreamTimedOut = $true }
