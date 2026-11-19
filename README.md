@@ -84,7 +84,7 @@ Requires Windows, with Windows PowerShell 5.1 or PowerShell 7. Download `Paralle
 
 ```powershell
 . "$PSScriptRoot\ParallelKit.ps1"
-$null = Initialize-ParallelKit -MaxConcurrentProcesses 8
+$null = Initialize-ParallelKit
 ```
 
 If you downloaded the file, Windows marks it as coming from the internet and your execution policy may refuse to load it. Run `Unblock-File .\ParallelKit.ps1` once to clear that.
@@ -99,7 +99,7 @@ Dot-source it. It loads itself as an in-memory module named `ParallelKit`: nothi
 
 Its public functions are imported globally, so they stay available for the rest of that PowerShell session, and a `.GetNewClosure()` block can call them however your script was started. Its internal helpers stay inside the module.
 
-`Initialize-ParallelKit` is optional. It registers the Ctrl+C handler, sets up child-process cleanup and sizes the thread pool up front; the engines set up what they need on first use either way. It returns an object with `AbortHandler`, `ChildProcessJob` and `ThreadPool`, each `$true` if that part worked (a failed abort handler or child-process cleanup also prints a warning), `Version`, the kit's version, and `StartMode`, how the kit starts programs here: `CreatedInJob` (inside the Job Object, the normal case), `AddedToJob` (started, then added to it just after) or `NoJob` (no cleanup if PowerShell is killed). It's the default for the session, not a promise for every program: one whose start can't be set up inside the Job Object falls back to `AddedToJob`, with a warning.
+`Initialize-ParallelKit` is optional. It registers the Ctrl+C handler and sets up child-process cleanup up front; the engines set up what they need on first use either way. The kit leaves the thread pool's settings alone. It returns an object with `AbortHandler` and `ChildProcessJob`, each `$true` if that part worked (a failure also prints a warning), `ThreadPool`, always `$true` (kept for scripts that check it), `Version`, the kit's version, and `StartMode`, how the kit starts programs here: `CreatedInJob` (inside the Job Object, the normal case), `AddedToJob` (started, then added to it just after) or `NoJob` (no cleanup if PowerShell is killed). It's the default for the session, not a promise for every program: one whose start can't be set up inside the Job Object falls back to `AddedToJob`, with a warning.
 
 Each public function has built-in help: `Get-Help Invoke-PkProcessBatch -Full` shows its parameters, their defaults, what it returns and an example.
 
