@@ -1167,7 +1167,9 @@ Test-Assert ($watches.Count -eq 2 -and $null -ne $watches[1] -and -not [object]:
 # runner doesn't fail it: linear bookkeeping takes about 4 times as long. A
 # PowerShell-level walk of the queue per job made it 9 (7.7 s for 20,000
 # jobs on 5.1, inside the old 15 s limit). The quicker of two 5,000-job
-# runs, so a slow spell there can't hide a walk.
+# runs, so a slow spell there can't hide a walk. A ceiling of 45 s (about
+# 3 times CI's slowest 5.1 runner) still catches a gross slowdown per job,
+# which the ratio can't see.
 Reset-Harness
 function Measure-HarnessBookkeeping {
     param([int]$Count)
@@ -1186,7 +1188,7 @@ $small = [Math]::Min((Measure-HarnessBookkeeping -Count 5000).Seconds, (Measure-
 $big = Measure-HarnessBookkeeping -Count 20000
 $ratio = $big.Seconds / [Math]::Max($small, 0.001)
 Test-Assert ($big.Done -eq 20000) "a 20,000-job group runs to completion"
-Test-Assert ($ratio -lt 8) ("and the dispatcher's own bookkeeping grows in step with the job count (" + [math]::Round($big.Seconds, 1) + "s for 20,000 jobs, " + [math]::Round($ratio, 1) + " times 5,000's " + [math]::Round($small, 2) + "s; linear is about 4)")
+Test-Assert ($ratio -lt 8 -and $big.Seconds -lt 45) ("and the dispatcher's own bookkeeping grows in step with the job count (" + [math]::Round($big.Seconds, 1) + "s for 20,000 jobs, " + [math]::Round($ratio, 1) + " times 5,000's " + [math]::Round($small, 2) + "s; linear is about 4)")
 Write-Host ""
 
 # ==============================================================================
