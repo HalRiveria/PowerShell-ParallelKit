@@ -1163,19 +1163,32 @@ Test-Assert ($watches.Count -eq 2 -and $null -ne $watches[1] -and -not [object]:
 
 # A large batch isn't slowed by per-job queue walks. No processes: the
 # starter/poll are stubs, so this times the dispatcher's own bookkeeping.
+# Measured as a ratio, 20,000 jobs against 5,000 in the same run, so a slow
+# runner doesn't fail it: linear bookkeeping takes about 4 times as long. A
+# PowerShell-level walk of the queue per job made it 9 (7.7 s for 20,000
+# jobs on 5.1, inside the old 15 s limit). The quicker of two 5,000-job
+# runs, so a slow spell there can't hide a walk. A ceiling of 45 s (about
+# 3 times CI's slowest 5.1 runner) still catches a gross slowdown per job,
+# which the ratio can't see.
 Reset-Harness
-$bigCount = 20000
-$feed = @{ Given = $false }
-$done = @{ Count = 0 }
-$sw = [System.Diagnostics.Stopwatch]::StartNew()
-$d = Invoke-PkProcessDispatch -MaxConcurrent 1000 `
-    -GroupProvider { if ($feed.Given) { return $null }; $feed.Given = $true; return @{ Name = 'big' } }.GetNewClosure() `
-    -JobBuilder { param($g) $jobs = [System.Collections.Generic.List[hashtable]]::new(); for ($i = 0; $i -lt $bigCount; $i++) { $jobs.Add(@{ Id = $i }) }; return $jobs }.GetNewClosure() `
-    -JobStarter { param($job) return $job } -JobPollCompleted { param($job) return $true } `
-    -JobFinalize { param($job, $pending) $done.Count++ }.GetNewClosure()
-$sw.Stop()
-Test-Assert ($done.Count -eq $bigCount) "a 20,000-job group runs to completion"
-Test-Assert ($sw.Elapsed.TotalSeconds -lt 15) ("and the dispatcher's own bookkeeping stays quick (" + [math]::Round($sw.Elapsed.TotalSeconds, 1) + "s for 20,000 jobs)")
+function Measure-HarnessBookkeeping {
+    param([int]$Count)
+    $feed = @{ Given = $false }
+    $done = @{ Count = 0 }
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $null = Invoke-PkProcessDispatch -MaxConcurrent 1000 `
+        -GroupProvider { if ($feed.Given) { return $null }; $feed.Given = $true; return @{ Name = 'big' } }.GetNewClosure() `
+        -JobBuilder { param($g) $jobs = [System.Collections.Generic.List[hashtable]]::new(); for ($i = 0; $i -lt $Count; $i++) { $jobs.Add(@{ Id = $i }) }; return $jobs }.GetNewClosure() `
+        -JobStarter { param($job) return $job } -JobPollCompleted { param($job) return $true } `
+        -JobFinalize { param($job, $pending) $done.Count++ }.GetNewClosure()
+    $sw.Stop()
+    return @{ Done = $done.Count; Seconds = $sw.Elapsed.TotalSeconds }
+}
+$small = [Math]::Min((Measure-HarnessBookkeeping -Count 5000).Seconds, (Measure-HarnessBookkeeping -Count 5000).Seconds)
+$big = Measure-HarnessBookkeeping -Count 20000
+$ratio = $big.Seconds / [Math]::Max($small, 0.001)
+Test-Assert ($big.Done -eq 20000) "a 20,000-job group runs to completion"
+Test-Assert ($ratio -lt 8 -and $big.Seconds -lt 45) ("and the dispatcher's own bookkeeping grows in step with the job count (" + [math]::Round($big.Seconds, 1) + "s for 20,000 jobs, " + [math]::Round($ratio, 1) + " times 5,000's " + [math]::Round($small, 2) + "s; linear is about 4)")
 Write-Host ""
 
 # ==============================================================================
