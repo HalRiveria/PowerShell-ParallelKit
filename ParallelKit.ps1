@@ -1337,13 +1337,18 @@ function Resolve-PkArguments {
 
 function Resolve-PkEncoding {
     # -OutputEncoding as given (an Encoding, a code page number, or a name
-    # like 'utf-8' or 'utf8') -> an Encoding, or $null for "not set".
+    # like 'utf-8' or 'utf8') -> an Encoding, or $null for "not set". A code
+    # page can come as a string of digits too ('65001' from a CSV or config).
     param($Encoding)
     if ($null -eq $Encoding -or ($Encoding -is [string] -and $Encoding -eq '')) { return $null }
     if ($Encoding -is [System.Text.Encoding]) { return $Encoding }
     # .NET Framework doesn't know the name 'utf8'; no BOM either way, since
     # this only decodes.
     if ($Encoding -is [string] -and $Encoding -in @('utf8', 'utf-8')) { return [System.Text.UTF8Encoding]::new($false) }
+    # Any whole number, too: ConvertFrom-Json on 7 gives an Int64.
+    $codePage = 0
+    $digits = ([string]$Encoding).Trim()
+    if ($digits -match '^[0-9]+$' -and [int]::TryParse($digits, [ref]$codePage)) { $Encoding = $codePage }
     try {
         if ($Encoding -is [int]) { return [System.Text.Encoding]::GetEncoding([int]$Encoding) }
         return [System.Text.Encoding]::GetEncoding([string]$Encoding)
@@ -1417,8 +1422,8 @@ function Start-PkProcess {
     # paths, so a relative path is relative to your current location, and drives
     # like Data:\ or ~ work.
     # .PARAMETER OutputEncoding
-    # How to decode its output: a name like 'utf-8', a code page number, or a
-    # [System.Text.Encoding]. Default: the console's code page.
+    # How to decode its output: a name like 'utf-8', a code page number (65001
+    # or '65001'), or a [System.Text.Encoding]. Default: the console's code page.
     # .OUTPUTS
     # A hashtable @{ Proc; StdoutTask; StderrTask; Stopwatch }. Proc is the
     # program's Process. Read its output from StdoutTask and StderrTask: Proc's
@@ -2707,8 +2712,8 @@ function Invoke-PkProcessBatch {
     # Kill a program still running after this long (default 0, no limit). Its
     # result has TimedOut = $true.
     # .PARAMETER OutputEncoding
-    # How to decode every program's output: a name like 'utf-8', a code page number,
-    # or a [System.Text.Encoding]. Default: the console's code page.
+    # How to decode every program's output: a name like 'utf-8', a code page number
+    # (65001 or '65001'), or a [System.Text.Encoding]. Default: the console's code page.
     # .OUTPUTS
     # An object with Results, Aborted and ForceKilledCount. Each result has Command,
     # ExitCode, Stdout, Stderr, StreamTimedOut, StreamError, StartError, Aborted,
@@ -3055,7 +3060,8 @@ function Invoke-PkRunspaceJobs {
     # $CancelToken, it gets the run's cancellation token.
     # .PARAMETER JobParams
     # A list or array of job hashtables, or a single one. Use this or
-    # -NextJobProvider.
+    # -NextJobProvider. Checked before anything starts: a key the worker
+    # doesn't declare, or a mandatory parameter a job leaves out, is an error.
     # .PARAMETER NextJobProvider
     # { } returning the next job hashtable, or $null when there are no more. Runs on
     # the main thread, so jobs can be produced lazily. Only its last value counts:
@@ -3159,9 +3165,34 @@ function Invoke-PkRunspaceJobs {
     # Passing a parameter the worker doesn't declare fails the whole invoke
     # with an unhelpful binding error.
     $declaredParams = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    # Leaving out a mandatory one fails that job in binding, after others have
+    # started. Not checked with parameter sets, where what's needed depends on
+    # the set, and not for CancelToken, which is filled in when a job leaves
+    # it out.
+    $mandatoryParams = [System.Collections.Generic.List[string]]::new()
+    $hasParameterSets = $false
     if ($null -ne $WorkerScript.Ast.ParamBlock) {
-        foreach ($p in $WorkerScript.Ast.ParamBlock.Parameters) { $null = $declaredParams.Add($p.Name.VariablePath.UserPath) }
+        foreach ($workerParam in $WorkerScript.Ast.ParamBlock.Parameters) {
+            $null = $declaredParams.Add($workerParam.Name.VariablePath.UserPath)
+            $isMandatory = $false
+            foreach ($paramAttr in $workerParam.Attributes) {
+                if ($paramAttr -isnot [System.Management.Automation.Language.AttributeAst]) { continue }
+                if ($paramAttr.TypeName.GetReflectionAttributeType() -ne [System.Management.Automation.ParameterAttribute]) { continue }
+                foreach ($namedArg in $paramAttr.NamedArguments) {
+                    if ($namedArg.ArgumentName -eq 'ParameterSetName') { $hasParameterSets = $true }
+                    if ($namedArg.ArgumentName -ne 'Mandatory') { continue }
+                    $mandatoryValue = $true
+                    if (-not $namedArg.ExpressionOmitted) {
+                        try { $mandatoryValue = [bool]$namedArg.Argument.SafeGetValue() } catch { $mandatoryValue = $false }   # not a constant: left to binding, as before
+                    }
+                    if ($mandatoryValue) { $isMandatory = $true }
+                }
+            }
+            $workerParamName = $workerParam.Name.VariablePath.UserPath
+            if ($isMandatory -and $workerParamName -ne 'CancelToken') { $mandatoryParams.Add($workerParamName) }
+        }
     }
+    if ($hasParameterSets) { $mandatoryParams.Clear() }
 
     # A fixed list can be checked before a single worker starts.
     if ($null -ne $JobParams) {
@@ -3169,6 +3200,13 @@ function Invoke-PkRunspaceJobs {
             foreach ($key in $JobParams[$jobIndex].Keys) {
                 if (-not $declaredParams.Contains([string]$key)) {
                     throw ("Invoke-PkRunspaceJobs: job " + $jobIndex + " supplies '" + $key + "', but -WorkerScript's param() block doesn't declare it. Nothing was started.")
+                }
+            }
+            # -contains, not ContainsKey: case-insensitive like binding, even
+            # for a case-sensitive [hashtable]::new() job.
+            foreach ($mandatoryParam in $mandatoryParams) {
+                if (@($JobParams[$jobIndex].Keys) -notcontains $mandatoryParam) {
+                    throw ("Invoke-PkRunspaceJobs: job " + $jobIndex + " doesn't supply '" + $mandatoryParam + "', which -WorkerScript's param() block makes mandatory. Nothing was started.")
                 }
             }
             if ($checkSafety) {
@@ -3279,6 +3317,11 @@ function Invoke-PkRunspaceJobs {
                 foreach ($key in $nextJob.Keys) {
                     if (-not $declaredParams.Contains([string]$key)) {
                         throw ("Invoke-PkRunspaceJobs: a job supplies '" + $key + "', but -WorkerScript's param() block doesn't declare it.")
+                    }
+                }
+                foreach ($mandatoryParam in $mandatoryParams) {
+                    if (@($nextJob.Keys) -notcontains $mandatoryParam) {   # case-insensitive, as for -JobParams above
+                        throw ("Invoke-PkRunspaceJobs: a job from -NextJobProvider doesn't supply '" + $mandatoryParam + "', which -WorkerScript's param() block makes mandatory.")
                     }
                 }
                 if ($checkSafety -and $null -eq $JobParams) {
