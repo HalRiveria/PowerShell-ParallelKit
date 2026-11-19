@@ -282,7 +282,7 @@ To leave any callback early, use `return`. PowerShell sends a `continue` or `bre
 | `Start-PkProcess -FilePath -Arguments` | Start one hidden, with output captured in the background. Returns `@{ Proc; StdoutTask; StderrTask; Stopwatch }`; throws if it can't start. |
 | `Wait-PkProcess -Process -TimeoutMs` | Wait for exit with a timeout that can't overrun. Returns `$true` if it exited. |
 | `Complete-PkProcess -Job` | Collect exit code and output from a finished one (`-Job` is what `Start-PkProcess` returned). Same result as `Invoke-PkProcessWithTimeout`. |
-| `Stop-PkProcessTree -Process` | Kill one or more programs and every program they started, with `taskkill` (as few calls as Windows' command-line limit allows). For one program, returns `$true` if it killed it (even if part of its tree couldn't be) and `$false` if it had already exited. |
+| `Stop-PkProcessTree -Process` | Kill one or more programs and every program they started. A program the kit started is killed through its own Job Object, which also reaches a child whose parent has already exited; anything else goes to `taskkill /T` (as few calls as Windows' command-line limit allows). For one program, returns `$true` if it killed it (even if part of its tree couldn't be) and `$false` if it had already exited. |
 
 `Invoke-PkProcessWithTimeout` and `Start-PkProcess` also take `-WorkingDirectory`.
 
@@ -418,7 +418,7 @@ The ones in this README: the engines, the [single-process functions](#single-pro
 
 **Does a program I start get my Ctrl+C too?**
 
-No. Programs start without a window, in a hidden console of their own, so Ctrl+C in your window never reaches them. That's what lets them finish while the kit drains. When it does need to stop one (a timeout, or an abort's force-stop), the kit kills it along with anything it started.
+No. Programs start without a window, in a hidden console of their own, so Ctrl+C in your window never reaches them. That's what lets them finish while the kit drains. When it does need to stop one (a timeout, or an abort's force-stop), the kit kills it along with anything it started, through a Job Object of the program's own, so even a child whose parent has already exited goes with it.
 
 **Was this written by AI?**
 

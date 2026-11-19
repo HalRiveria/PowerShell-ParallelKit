@@ -160,11 +160,10 @@ public static class PkState
     public static bool AbortLatched = false;
     public static bool CloseAbort   = false;
     public static object MessageHandler = null;   // a PowerShell scriptblock, or null for the default
-    public static volatile bool ThreadPoolRaised = false;
 
     // Bump this, and the check after the type definitions, whenever any C#
     // in this file changes: a session keeps the types it compiled first.
-    public const int TypesVersion = 10;
+    public const int TypesVersion = 11;
 
     // Locked: Register-/Unregister-PkCancellationSource are callable from
     // worker runspaces, and List<T> is not safe for concurrent writers.
@@ -236,6 +235,7 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Runtime.CompilerServices;
 using Microsoft.Win32.SafeHandles;
 
 public sealed class PkStartedProcess
@@ -415,6 +415,10 @@ public sealed class PkStreamReadTask : Task<string>
 
 // A Windows Job Object with KILL_ON_JOB_CLOSE: every child process assigned
 // to it dies when this process exits for ANY reason, force-kill included.
+// Each program the kit starts also gets a job of its own (its tree job),
+// nested in that one, so the program and everything it started can be
+// killed at once (KillTree), including a child whose parent has already
+// exited, which taskkill /T can't find.
 public static class PkChildProcessJob
 {
     private const int JobObjectExtendedLimitInformation = 9;
@@ -464,6 +468,60 @@ public static class PkChildProcessJob
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool CloseHandle(IntPtr hObject);
 
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool TerminateJobObject(IntPtr hJob, uint uExitCode);
+
+    // A program's tree job, closed by ReleaseTree or, failing that, when its
+    // Process object is collected. Without KILL_ON_JOB_CLOSE: closing it
+    // leaves whatever is still running in the kit's job, as before.
+    private sealed class TreeJob : SafeHandleZeroOrMinusOneIsInvalid
+    {
+        public TreeJob(IntPtr h) : base(true) { SetHandle(h); }
+        protected override bool ReleaseHandle() { return CloseHandle(handle); }
+    }
+    private static readonly ConditionalWeakTable<Process, TreeJob> _treeJobs = new ConditionalWeakTable<Process, TreeJob>();
+
+    // Harness only: start programs without a tree job, to test the taskkill path.
+    public static bool TestNoTreeJob = false;
+
+    private static void AddTree(Process process, IntPtr treeJob)
+    {
+        try { _treeJobs.Add(process, new TreeJob(treeJob)); }
+        catch (ArgumentException) { CloseHandle(treeJob); }   // already has one (can't happen: each start is a new Process)
+    }
+
+    // Kills every process in the program's tree job. False if it has none,
+    // or Windows refused: the caller then uses taskkill.
+    public static bool KillTree(Process process)
+    {
+        if (process == null) { return false; }
+        TreeJob j;
+        if (!_treeJobs.TryGetValue(process, out j)) { return false; }
+        bool added = false;
+        try
+        {
+            j.DangerousAddRef(ref added);
+            return TerminateJobObject(j.DangerousGetHandle(), 1);
+        }
+        catch (ObjectDisposedException) { return false; }   // released meanwhile: taskkill instead
+        finally { if (added) { j.DangerousRelease(); } }
+    }
+
+    // Closes the program's tree job: KillTree can't reach its tree after this.
+    public static void ReleaseTree(Process process)
+    {
+        if (process == null) { return; }
+        TreeJob j;
+        if (_treeJobs.TryGetValue(process, out j)) { _treeJobs.Remove(process); j.Dispose(); }
+    }
+
+    // Harness only: whether the program has a tree job.
+    public static bool TestHasTree(Process process)
+    {
+        TreeJob j;
+        return process != null && _treeJobs.TryGetValue(process, out j);
+    }
+
     // Never closed: Windows closes it when this process exits, and that is
     // what kills the children.
     private static IntPtr _job = IntPtr.Zero;
@@ -501,15 +559,23 @@ public static class PkChildProcessJob
     }
 
     // Never throws: a failed assignment only loses the force-kill cleanup
-    // for that one process.
+    // for that one process. Once it's in the kit's job, it also gets a tree
+    // job (Windows nests it); without one, a kill uses taskkill.
     public static bool Assign(System.Diagnostics.Process process)
     {
         if (_job == IntPtr.Zero || process == null) { return false; }
         try
         {
-            if (AssignProcessToJobObject(_job, process.Handle)) { return true; }
-            LastError = Marshal.GetLastWin32Error();
-            return false;
+            if (!AssignProcessToJobObject(_job, process.Handle)) { LastError = Marshal.GetLastWin32Error(); return false; }
+            if (!TestNoTreeJob)
+            {
+                IntPtr treeJob = CreateJobObject(IntPtr.Zero, null);
+                if (treeJob != IntPtr.Zero)
+                {
+                    if (AssignProcessToJobObject(treeJob, process.Handle)) { AddTree(process, treeJob); } else { CloseHandle(treeJob); }
+                }
+            }
+            return true;
         }
         catch { return false; }
     }
@@ -765,7 +831,7 @@ public static class PkChildProcessJob
         StringBuilder commandLine = BuildCommandLine(fileName, arguments);
 
         IntPtr outRead = IntPtr.Zero, outWrite = IntPtr.Zero, errRead = IntPtr.Zero, errWrite = IntPtr.Zero;
-        IntPtr attrList = IntPtr.Zero, handleArr = IntPtr.Zero, jobArr = IntPtr.Zero;
+        IntPtr attrList = IntPtr.Zero, handleArr = IntPtr.Zero, jobArr = IntPtr.Zero, treeJob = IntPtr.Zero;
         bool attrReady = false, created = false, setupFailed = false;
         IntPtr stdin = IntPtr.Zero;
         PROCESS_INFORMATION pi = new PROCESS_INFORMATION();
@@ -794,8 +860,14 @@ public static class PkChildProcessJob
                     Marshal.WriteIntPtr(handleArr, 0, outWrite);
                     Marshal.WriteIntPtr(handleArr, IntPtr.Size, errWrite);
                     if (stdinInherit) { Marshal.WriteIntPtr(handleArr, 2 * IntPtr.Size, stdin); }
-                    jobArr = Marshal.AllocHGlobal(IntPtr.Size);
+                    // The kit's job, then the program's tree job, which Windows
+                    // nests in it. No tree job if it can't be made: a kill
+                    // then uses taskkill.
+                    if (!TestNoTreeJob) { treeJob = CreateJobObject(IntPtr.Zero, null); }
+                    int jobCount = treeJob != IntPtr.Zero ? 2 : 1;
+                    jobArr = Marshal.AllocHGlobal(IntPtr.Size * jobCount);
                     Marshal.WriteIntPtr(jobArr, _job);
+                    if (jobCount == 2) { Marshal.WriteIntPtr(jobArr, IntPtr.Size, treeJob); }
 
                     IntPtr size = IntPtr.Zero;
                     InitializeProcThreadAttributeList(IntPtr.Zero, 2, 0, ref size);   // fails by design: returns the size
@@ -805,7 +877,7 @@ public static class PkChildProcessJob
                     if (!UpdateProcThreadAttribute(attrList, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, handleArr,
                             (IntPtr)(IntPtr.Size * handleCount), IntPtr.Zero, IntPtr.Zero)
                         || !UpdateProcThreadAttribute(attrList, 0, PROC_THREAD_ATTRIBUTE_JOB_LIST, jobArr,
-                            (IntPtr)IntPtr.Size, IntPtr.Zero, IntPtr.Zero))
+                            (IntPtr)(IntPtr.Size * jobCount), IntPtr.Zero, IntPtr.Zero))
                     {
                         throw new Win32Exception(Marshal.GetLastWin32Error());
                     }
@@ -850,6 +922,7 @@ public static class PkChildProcessJob
                 {
                     if (outRead != IntPtr.Zero) { CloseHandle(outRead); }
                     if (errRead != IntPtr.Zero) { CloseHandle(errRead); }
+                    if (treeJob != IntPtr.Zero) { CloseHandle(treeJob); treeJob = IntPtr.Zero; }
                 }
             }
         }
@@ -882,9 +955,11 @@ public static class PkChildProcessJob
             if (stderrReader != null) { stderrReader.Dispose(); }
             if (errSafe != null) { errSafe.Dispose(); } else { CloseHandle(errRead); }
             CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+            if (treeJob != IntPtr.Zero) { CloseHandle(treeJob); }
             if (proc != null) { proc.Dispose(); }
             throw;
         }
+        if (treeJob != IntPtr.Zero) { AddTree(proc, treeJob); }
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
 
@@ -901,7 +976,7 @@ public static class PkChildProcessJob
 # A session that loaded an older copy keeps its compiled types. Say so,
 # rather than fail later with a missing-method error. Keep this number in
 # sync with [PkState]::TypesVersion.
-if ((& { try { [PkState]::TypesVersion } catch { 0 } }) -ne 10) {
+if ((& { try { [PkState]::TypesVersion } catch { 0 } }) -ne 11) {
     throw "ParallelKit: this PowerShell session already loaded an older version of the kit, and its compiled parts can't be swapped out. Close this window and start a new one."
 }
 
@@ -1626,10 +1701,13 @@ function Stop-PkProcessTree {
     # .SYNOPSIS
     # Kills one or more programs and every program they started.
     # .DESCRIPTION
-    # Uses taskkill /T, in as few calls as Windows' command-line limit allows,
-    # so none is left running and holding a program's output open. If taskkill
-    # can't start, fails, or is still running after 10 seconds (it's killed
-    # then), each program is killed directly.
+    # A program the kit started is killed through its own Job Object, with
+    # everything it started, even a child whose parent has already exited, so
+    # none is left running and holding its output open. Any other program (or
+    # one Windows won't end that way) goes to taskkill /T, in as few calls as
+    # Windows' command-line limit allows; if taskkill can't start, fails, or is
+    # still running after 10 seconds (it's killed then), each program is killed
+    # directly.
     # .PARAMETER Process
     # The program(s), such as the Proc that Start-PkProcess returns.
     # .OUTPUTS
@@ -1661,12 +1739,18 @@ function Stop-PkProcessTreeCore {
     foreach ($p in $Process) { if ($null -ne $p -and $p.HasExited -eq $false -and $null -ne $p.Id) { $alive.Add($p) } }
     if ($alive.Count -eq 0) { return $false }
     $killed = $false
+    # A program the kit started has a tree job: killing that ends the program
+    # and everything it started at once, a child whose parent already exited
+    # included. taskkill /T only finds children through their parent, so it's
+    # for the rest: a program without a tree job, or one Windows wouldn't end.
+    $viaTaskkill = [System.Collections.Generic.List[System.Diagnostics.Process]]::new()
+    foreach ($p in $alive) { if ([PkChildProcessJob]::KillTree($p)) { $killed = $true } else { $viaTaskkill.Add($p) } }
     # One command line for every PID passes Windows' 32,767-character limit at
     # roughly 2,500-3,000 programs, and then taskkill can't start at all: so as
     # many taskkill calls as the limit needs.
     if ($MaxArgumentLength -le 0) { $MaxArgumentLength = 32000 - $TaskkillPath.Length }
-    $ids = [int[]]@(foreach ($p in $alive) { $p.Id })
-    foreach ($taskkillArgs in (Split-PkTaskkillArguments -Ids $ids -MaxLength $MaxArgumentLength)) {
+    $ids = [int[]]@(foreach ($p in $viaTaskkill) { $p.Id })
+    foreach ($taskkillArgs in $(if ($ids.Count -gt 0) { Split-PkTaskkillArguments -Ids $ids -MaxLength $MaxArgumentLength })) {
         $psi = [System.Diagnostics.ProcessStartInfo]::new($TaskkillPath, $taskkillArgs)
         $psi.UseShellExecute = $false
         $psi.CreateNoWindow = $true
@@ -1983,6 +2067,9 @@ function Complete-PkProcess {
     $result.ExitCode = $Job['Proc'].ExitCode
     # The program's end, not the output's: before Dispose, which loses it.
     $result.Duration = Get-PkProcessDuration -Process $Job['Proc']
+    # The program has exited: its tree job's handle can go. Anything it left
+    # running stays in the kit's job, as before.
+    if ($Job['Proc'] -is [System.Diagnostics.Process]) { [PkChildProcessJob]::ReleaseTree($Job['Proc']) }
     if ($Dispose) { $Job['Proc'].Dispose() }
     return [pscustomobject]$result
 }

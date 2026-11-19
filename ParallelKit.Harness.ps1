@@ -1449,7 +1449,9 @@ $parentJob.Proc.Dispose(); if ($null -ne $childProc) { $childProc.Dispose() }
 # A large kill: taskkill prints a line per process it kills (three per
 # `cmd /c ping` tree). Left unread, that fills its output pipe and taskkill
 # blocks until the 10 s wait gives up, leaving most children running.
-$many = @(1..40 | ForEach-Object { Start-PkProcess -FilePath $cmdExe -Arguments (& $nestedPing 49) })
+# Started without tree jobs, so the kill goes to taskkill.
+[PkChildProcessJob]::TestNoTreeJob = $true
+try { $many = @(1..40 | ForEach-Object { Start-PkProcess -FilePath $cmdExe -Arguments (& $nestedPing 49) }) } finally { [PkChildProcessJob]::TestNoTreeJob = $false }
 $waitMany = [System.Diagnostics.Stopwatch]::StartNew()
 while ((Get-HarnessPingCount 49) -lt 40 -and $waitMany.Elapsed.TotalSeconds -lt 15) { Start-Sleep -Milliseconds 200 }
 $startedMany = Get-HarnessPingCount 49
@@ -3395,7 +3397,10 @@ function Protect-HarnessPingChild {
 }
 
 Reset-Harness
-$tkStart = Start-PkProcess -FilePath $cmdExe -Arguments ('/c ""' + $pingExe + '" -n 7 127.0.0.1"')
+# Without a tree job, so the kill goes to taskkill. Section BF has the same
+# protected child killed through the tree job.
+[PkChildProcessJob]::TestNoTreeJob = $true
+try { $tkStart = Start-PkProcess -FilePath $cmdExe -Arguments ('/c ""' + $pingExe + '" -n 7 127.0.0.1"') } finally { [PkChildProcessJob]::TestNoTreeJob = $false }
 $tkChild = Protect-HarnessPingChild -Parent $tkStart.Proc
 $tkKilled = Stop-PkProcessTree -Process $tkStart.Proc
 $tkNote = if ($null -ne $tkChild -and -not $tkChild.HasExited) { "the protected child survived" } else { "taskkill killed the child anyway, so this run doesn't exercise the failure path" }
@@ -4266,6 +4271,8 @@ Test-Assert $compiled "the stand-in taskkill compiles"
 if ($compiled) {
     $tkLog = [System.IO.Path]::ChangeExtension($tkExe, '.log')
     $env:PK_FAKE_TASKKILL_LOG = $tkLog
+    # These test the taskkill path: no tree jobs.
+    [PkChildProcessJob]::TestNoTreeJob = $true
     try {
         # Five programs, an argument limit that fits two PIDs: several
         # taskkill calls, each under the limit. The stand-in fails, so the
@@ -4292,6 +4299,7 @@ if ($compiled) {
         foreach ($h in $tkHung) { Stop-Process -Id $h.ProcessId -Force -ErrorAction SilentlyContinue }
         foreach ($p in $tkProcs) { $p.Dispose() }
     } finally {
+        [PkChildProcessJob]::TestNoTreeJob = $false
         Remove-Item Env:PK_FAKE_TASKKILL_LOG, Env:PK_FAKE_TASKKILL_MODE -ErrorAction SilentlyContinue
         try { [System.IO.File]::Delete($tkLog) } catch { }   # temp file only; best effort
     }
@@ -4302,7 +4310,9 @@ if ($compiled) {
 }
 
 # The real taskkill, one PID per call: each call still kills the whole tree.
-$tkStarted = @(1..3 | ForEach-Object { Start-PkProcess -FilePath $cmdExe -Arguments '/d /c ping -n 30 127.0.0.1 >nul' })
+# Without tree jobs, so the kill goes to taskkill.
+[PkChildProcessJob]::TestNoTreeJob = $true
+try { $tkStarted = @(1..3 | ForEach-Object { Start-PkProcess -FilePath $cmdExe -Arguments '/d /c ping -n 30 127.0.0.1 >nul' }) } finally { [PkChildProcessJob]::TestNoTreeJob = $false }
 $tkPings = @()
 foreach ($s in $tkStarted) {
     $p = $null
@@ -4961,6 +4971,81 @@ foreach ($beWhich in 'Start-PkProcess', 'Invoke-PkProcessWithTimeout', 'Invoke-P
     if ($beErr -like ($beWhich + ': -MaxOutputChars must be 0 (no cap) or more (got -1)*')) { $beErrors += 'ok' } else { $beErrors += ($beWhich + ': ' + $beErr) }
 }
 Test-Assert (@($beErrors | Where-Object { $_ -ne 'ok' }).Count -eq 0 -and $beStarted.Count -eq 0) ("-MaxOutputChars -1 is refused by all four before anything starts (" + ($beErrors -join ' | ') + ")")
+Write-Host ""
+
+Write-Host "=== BF: a kill reaches a child whose parent already exited ===" -ForegroundColor Cyan
+# The program pings for a second, runs an inner cmd that starts a ping
+# (-w 4325) and exits at once, leaving that ping orphaned, then pings
+# (-w 4326) itself. taskkill /T finds a tree through parent PIDs, so it
+# missed the orphan; each program's own Job Object doesn't.
+Reset-Harness
+function Get-HarnessTagPings([string]$Tag) { return @(Get-CimInstance Win32_Process -Filter "Name='PING.EXE' AND CommandLine LIKE '%-w $Tag %'") }
+function Stop-HarnessTagPings { foreach ($tag in '4325', '4326', '4327') { foreach ($p in (Get-HarnessTagPings $tag)) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue } } }
+function Wait-HarnessTagPings([string[]]$Tags) {
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($sw.Elapsed.TotalSeconds -lt 10) {
+        if (@($Tags | Where-Object { @(Get-HarnessTagPings $_).Count -eq 0 }).Count -eq 0) { return $true }
+        Start-Sleep -Milliseconds 100
+    }
+    return $false
+}
+$bfOrphanArgs = '/d /c ping -n 2 127.0.0.1 >nul & ' + $cmdExe + ' /d /c start /b ping -n 60 -w 4325 127.0.0.1 >nul & ping -n 60 -w 4326 127.0.0.1 >nul'
+try {
+    foreach ($bfMode in 'created in the job', 'Process.Start fallback') {
+        [PkChildProcessJob]::TestUseProcessStart = ($bfMode -ne 'created in the job')
+        try { $bfJob = Start-PkProcess -FilePath $cmdExe -Arguments $bfOrphanArgs } finally { [PkChildProcessJob]::TestUseProcessStart = $false }
+        $bfUp = Wait-HarnessTagPings @('4325', '4326')
+        $bfHas = [PkChildProcessJob]::TestHasTree($bfJob['Proc'])
+        $bfKilled = Stop-PkProcessTree -Process $bfJob['Proc']
+        Start-Sleep -Milliseconds 300
+        $bfOrphans = @(Get-HarnessTagPings '4325').Count; $bfOwn = @(Get-HarnessTagPings '4326').Count
+        Test-Assert ($bfUp -and $bfHas -and $bfKilled -and $bfJob['Proc'].HasExited -and $bfOrphans -eq 0 -and $bfOwn -eq 0) ($bfMode + ": Stop-PkProcessTree kills a child whose parent already exited (both pings up: " + $bfUp + ", tree job: " + $bfHas + ", orphans left " + $bfOrphans + ", own left " + $bfOwn + ")")
+        $null = Complete-PkProcess -Job $bfJob -StreamTimeoutMs 0 -Dispose
+        Stop-HarnessTagPings
+    }
+
+    # The time limit: the program and its orphan go, and the orphan no
+    # longer holds the job's output for the stream timeout after the kill.
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $bfB = Invoke-PkProcessBatch -TimeoutSeconds 3 -Commands @(@{ FilePath = $cmdExe; Arguments = $bfOrphanArgs })
+    $sw.Stop()
+    Start-Sleep -Milliseconds 300
+    $bfOrphans = @(Get-HarnessTagPings '4325').Count
+    Test-Assert ($bfB.Results[0].TimedOut -and $bfOrphans -eq 0 -and $sw.Elapsed.TotalSeconds -lt 8) ("batch: a time-limit kill takes the orphan too, and the job ends soon after (" + [math]::Round($sw.Elapsed.TotalSeconds, 1) + " s, orphans left " + $bfOrphans + ")")
+    Stop-HarnessTagPings
+
+    # An abort's force-stop.
+    Reset-PkAbortState
+    $bfB = Invoke-PkProcessBatch -MaxConcurrent 2 -AbortTimeoutSeconds 1 -OnComplete { param($c, $r) if ($c['Key'] -eq 'quick') { Request-PkAbort } } -Commands @(@{ FilePath = $cmdExe; Arguments = $bfOrphanArgs; Key = 'tree' }, @{ FilePath = $cmdExe; Arguments = '/d /c ping -n 4 127.0.0.1 >nul'; Key = 'quick' })
+    Reset-PkAbortState
+    Start-Sleep -Milliseconds 300
+    $bfOrphans = @(Get-HarnessTagPings '4325').Count
+    Test-Assert ($bfB.Aborted -and $bfB.ForceKilledCount -eq 1 -and $bfOrphans -eq 0) ("batch: an abort's force-stop takes the orphan too (force-stopped " + $bfB.ForceKilledCount + ", orphans left " + $bfOrphans + ")")
+    Stop-HarnessTagPings
+
+    # A child that refuses PROCESS_TERMINATE still goes: the job is ended as a whole.
+    $bfStart = Start-PkProcess -FilePath $cmdExe -Arguments ('/c ""' + $pingExe + '" -n 7 127.0.0.1"')
+    $bfChild = Protect-HarnessPingChild -Parent $bfStart.Proc
+    $bfKilled = Stop-PkProcessTree -Process $bfStart.Proc
+    $bfGone = ($null -ne $bfChild -and $bfChild.WaitForExit(3000))
+    Test-Assert ($null -ne $bfChild -and $bfKilled -and $bfGone) ("a child that refuses to be terminated is killed with its program's tree job (child found: " + ($null -ne $bfChild) + ", gone: " + $bfGone + ")")
+    $null = Complete-PkProcess -Job $bfStart -StreamTimeoutMs 0 -Dispose
+    if ($null -ne $bfChild) { $bfChild.Dispose() }
+
+    # Unchanged: a program that exits on its own leaves what it started
+    # running, and Complete-PkProcess lets go of its tree job.
+    $bfJob = Start-PkProcess -FilePath $cmdExe -Arguments '/d /c start /b ping -n 30 -w 4327 127.0.0.1 >nul'
+    $null = Wait-PkProcess -Process $bfJob['Proc'] -TimeoutMs 10000
+    $bfUp = Wait-HarnessTagPings @('4327')
+    $null = Complete-PkProcess -Job $bfJob -StreamTimeoutMs 0
+    $bfReleased = -not [PkChildProcessJob]::TestHasTree($bfJob['Proc'])
+    $bfJob['Proc'].Dispose()
+    Test-Assert ($bfUp -and @(Get-HarnessTagPings '4327').Count -eq 1 -and $bfReleased) ("a leftover from a program that exits on its own keeps running, and the tree job is released (leftover up: " + $bfUp + ", released: " + $bfReleased + ")")
+} finally {
+    [PkChildProcessJob]::TestUseProcessStart = $false
+    Stop-HarnessTagPings
+    Reset-PkAbortState
+}
 Write-Host ""
 
 Set-PkMessageHandler -Handler $null
