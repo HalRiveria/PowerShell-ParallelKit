@@ -13,13 +13,15 @@
 #
 # Expected: SOAK PASSED, exit 0. Exits 1 if the counts after the warm-up
 # rounds keep growing, or a round has start errors, aborts, runspace errors,
-# or the wrong number of timed-out or capped programs. Takes about two
-# minutes with the defaults. On Windows PowerShell 5.1, runspace jobs have
-# been seen leaving a few handles behind each round (with version 3.3 too),
-# so a full run there can fail on handles; -NoRunspace checks the programs
-# on their own.
+# or the wrong number of timed-out or capped programs. Takes about three
+# minutes with the defaults. Handles and threads are compared by their
+# lowest count in each half of the rounds after the warm-up: on Windows
+# PowerShell 5.1, PowerShell's own runspace pool holds tens more handles
+# each round, then lets go of them all at once, 6 to 22 rounds apart, so
+# the count swings by hundreds while the low point stays put. Each half
+# needs at least 25 rounds to take in one of those drops.
 param(
-    [int]$Rounds = 40,
+    [int]$Rounds = 60,
     [int]$WarmupRounds = 5,
     [string]$KitPath = (Join-Path $PSScriptRoot '..\..\ParallelKit.ps1'),
     # To narrow a growth down: leave out the programs or the runspace jobs.
@@ -31,7 +33,8 @@ param(
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-if ($WarmupRounds -lt 1 -or $Rounds -le $WarmupRounds) { throw "-Rounds ($Rounds) must be more than -WarmupRounds ($WarmupRounds), and -WarmupRounds at least 1: growth is measured from the end of the warm-up to the last round." }
+$half = [math]::Floor(($Rounds - $WarmupRounds) / 2)
+if ($WarmupRounds -lt 1 -or $half -lt 25) { throw "-Rounds ($Rounds) must be at least -WarmupRounds ($WarmupRounds) + 50, and -WarmupRounds at least 1: handles and threads are compared between two halves of at least 25 rounds after the warm-up." }
 . (Resolve-Path -LiteralPath $KitPath).ProviderPath
 $null = Initialize-ParallelKit
 $cmd = Join-Path $env:SystemRoot 'System32\cmd.exe'
@@ -79,13 +82,17 @@ try {
         "round {0,3}: {1,5} s  handles {2,6}  threads {3,4}  managed {4,7} MB  private {5,7} MB  (bad {6}, timed out {7}, capped {8}, runspace errors {9})" -f $row.Round, $row.Seconds, $row.Handles, $row.Threads, $row.ManagedMB, $row.PrivateMB, $row.Bad, $row.TimedOut, $row.Capped, $row.RunspaceErrors
     }
 } finally { Stop-SoakHelpers }
+$early = @($log | Where-Object { $_.Round -gt $WarmupRounds -and $_.Round -le $WarmupRounds + $half })
+$late = @($log | Where-Object { $_.Round -gt $Rounds - $half })
+$baseHandles = ($early | Measure-Object Handles -Minimum).Minimum; $lastHandles = ($late | Measure-Object Handles -Minimum).Minimum
+$baseThreads = ($early | Measure-Object Threads -Minimum).Minimum; $lastThreads = ($late | Measure-Object Threads -Minimum).Minimum
 $base = $log[$WarmupRounds - 1]
 $last = $log[$log.Count - 1]
 $problems = @()
-if ($last.Handles -gt $base.Handles * 1.10 + 50) { $problems += "handles grew from $($base.Handles) to $($last.Handles)" }
-if ($last.Threads -gt $base.Threads + 10) { $problems += "threads grew from $($base.Threads) to $($last.Threads)" }
+if ($lastHandles -gt $baseHandles * 1.10 + 50) { $problems += "the lowest handle count grew from $baseHandles to $lastHandles" }
+if ($lastThreads -gt $baseThreads + 10) { $problems += "the lowest thread count grew from $baseThreads to $lastThreads" }
 if ($last.ManagedMB -gt $base.ManagedMB * 1.25 + 5) { $problems += "managed memory grew from $($base.ManagedMB) to $($last.ManagedMB) MB" }
 if (@($log | Where-Object { $_.Bad -gt 0 -or $_.RunspaceErrors -gt 0 -or $_.TimedOut -ne 25 -or $_.Capped -ne 25 }).Count -gt 0) { $problems += "some rounds had start errors, aborts, runspace errors, or the wrong number of timed-out or capped programs" }
 "{0} programs and {1} runspace jobs in {2:N0} s" -f $(if ($NoBatch) { 0 } else { $Rounds * $commands.Count }), $(if ($NoRunspace) { 0 } else { $Rounds * $jobParams.Count }), $total.Elapsed.TotalSeconds
 if ($problems.Count -gt 0) { "SOAK FAILED: " + ($problems -join '; '); exit 1 }
-"SOAK PASSED: after round $WarmupRounds, handles $($base.Handles) -> $($last.Handles), threads $($base.Threads) -> $($last.Threads), managed $($base.ManagedMB) -> $($last.ManagedMB) MB"
+"SOAK PASSED: lowest handles $baseHandles -> $lastHandles, lowest threads $baseThreads -> $lastThreads (the first $half rounds after the warm-up, then the last $half), managed $($base.ManagedMB) -> $($last.ManagedMB) MB (round $WarmupRounds, then the last)"
