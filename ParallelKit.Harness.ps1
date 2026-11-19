@@ -4997,9 +4997,10 @@ try {
         $bfUp = Wait-HarnessTagPings @('4325', '4326')
         $bfHas = [PkChildProcessJob]::TestHasTree($bfJob['Proc'])
         $bfKilled = Stop-PkProcessTree -Process $bfJob['Proc']
+        $bfReleased = -not [PkChildProcessJob]::TestHasTree($bfJob['Proc'])
         Start-Sleep -Milliseconds 300
         $bfOrphans = @(Get-HarnessTagPings '4325').Count; $bfOwn = @(Get-HarnessTagPings '4326').Count
-        Test-Assert ($bfUp -and $bfHas -and $bfKilled -and $bfJob['Proc'].HasExited -and $bfOrphans -eq 0 -and $bfOwn -eq 0) ($bfMode + ": Stop-PkProcessTree kills a child whose parent already exited (both pings up: " + $bfUp + ", tree job: " + $bfHas + ", orphans left " + $bfOrphans + ", own left " + $bfOwn + ")")
+        Test-Assert ($bfUp -and $bfHas -and $bfKilled -and $bfReleased -and $bfJob['Proc'].HasExited -and $bfOrphans -eq 0 -and $bfOwn -eq 0) ($bfMode + ": Stop-PkProcessTree kills a child whose parent already exited, and lets go of the tree job (both pings up: " + $bfUp + ", tree job: " + $bfHas + ", released: " + $bfReleased + ", orphans left " + $bfOrphans + ", own left " + $bfOwn + ")")
         $null = Complete-PkProcess -Job $bfJob -StreamTimeoutMs 0 -Dispose
         Stop-HarnessTagPings
     }
@@ -5021,6 +5022,18 @@ try {
     Start-Sleep -Milliseconds 300
     $bfOrphans = @(Get-HarnessTagPings '4325').Count
     Test-Assert ($bfB.Aborted -and $bfB.ForceKilledCount -eq 1 -and $bfOrphans -eq 0) ("batch: an abort's force-stop takes the orphan too (force-stopped " + $bfB.ForceKilledCount + ", orphans left " + $bfOrphans + ")")
+    Stop-HarnessTagPings
+
+    # If Windows refuses to nest the tree job, the program still starts,
+    # without one, and a kill goes to taskkill.
+    [PkChildProcessJob]::TestRefuseTreeJob = $true
+    try { $bfJob = Start-PkProcess -FilePath $cmdExe -Arguments '/d /c echo refused& ping -n 30 -w 4327 127.0.0.1 >nul' } finally { [PkChildProcessJob]::TestRefuseTreeJob = $false }
+    $bfUp = Wait-HarnessTagPings @('4327')
+    $bfHas = [PkChildProcessJob]::TestHasTree($bfJob['Proc'])
+    $bfKilled = Stop-PkProcessTree -Process $bfJob['Proc']
+    Start-Sleep -Milliseconds 300
+    $bfR = Complete-PkProcess -Job $bfJob -StreamTimeoutMs 2000 -Dispose
+    Test-Assert ($bfUp -and -not $bfHas -and $bfKilled -and @(Get-HarnessTagPings '4327').Count -eq 0 -and $bfR.Stdout -match 'refused') ("a start where Windows refuses the tree job runs without one, and taskkill still kills its tree (tree job: " + $bfHas + ", killed: " + $bfKilled + ", output '" + ([string]$bfR.Stdout).Trim() + "')")
     Stop-HarnessTagPings
 
     # A child that refuses PROCESS_TERMINATE still goes: the job is ended as a whole.

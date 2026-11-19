@@ -481,8 +481,11 @@ public static class PkChildProcessJob
     }
     private static readonly ConditionalWeakTable<Process, TreeJob> _treeJobs = new ConditionalWeakTable<Process, TreeJob>();
 
-    // Harness only: start programs without a tree job, to test the taskkill path.
+    // Harness only: start programs without a tree job, to test the taskkill
+    // path; or have TryStart's first CreateProcess, with the tree job, count
+    // as refused, to test its retry without one.
     public static bool TestNoTreeJob = false;
+    public static bool TestRefuseTreeJob = false;
 
     private static void AddTree(Process process, IntPtr treeJob)
     {
@@ -497,14 +500,17 @@ public static class PkChildProcessJob
         if (process == null) { return false; }
         TreeJob j;
         if (!_treeJobs.TryGetValue(process, out j)) { return false; }
-        bool added = false;
+        bool added = false, ended = false;
         try
         {
             j.DangerousAddRef(ref added);
-            return TerminateJobObject(j.DangerousGetHandle(), 1);
+            ended = TerminateJobObject(j.DangerousGetHandle(), 1);
         }
         catch (ObjectDisposedException) { return false; }   // released meanwhile: taskkill instead
         finally { if (added) { j.DangerousRelease(); } }
+        // The tree is gone: its job's handle can go now rather than with the Process.
+        if (ended) { ReleaseTree(process); }
+        return ended;
     }
 
     // Closes the program's tree job: KillTree can't reach its tree after this.
@@ -753,6 +759,22 @@ public static class PkChildProcessJob
         }
     }
 
+    // The start's two attributes: the handles the child inherits and its
+    // jobs. 0, or the Win32 error (the list is then left uninitialized).
+    private static int SetStartAttributes(IntPtr attrList, IntPtr attrSize, IntPtr handleArr, int handleCount, IntPtr jobArr, int jobCount)
+    {
+        IntPtr size = attrSize;
+        if (!InitializeProcThreadAttributeList(attrList, 2, 0, ref size)) { return Marshal.GetLastWin32Error(); }
+        if (UpdateProcThreadAttribute(attrList, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, handleArr, (IntPtr)(IntPtr.Size * handleCount), IntPtr.Zero, IntPtr.Zero)
+            && UpdateProcThreadAttribute(attrList, 0, PROC_THREAD_ATTRIBUTE_JOB_LIST, jobArr, (IntPtr)(IntPtr.Size * jobCount), IntPtr.Zero, IntPtr.Zero))
+        {
+            return 0;
+        }
+        int e = Marshal.GetLastWin32Error();
+        DeleteProcThreadAttributeList(attrList);
+        return e;
+    }
+
     // How TryStart holds .NET's start lock ("Monitor:<field>" or
     // "Lock:<field>"), or null when it can't and the kit uses Process.Start.
     public static string StartLockKind { get { StartLock l = GetStartLock(); return l == null ? null : l.Kind; } }
@@ -832,6 +854,8 @@ public static class PkChildProcessJob
 
         IntPtr outRead = IntPtr.Zero, outWrite = IntPtr.Zero, errRead = IntPtr.Zero, errWrite = IntPtr.Zero;
         IntPtr attrList = IntPtr.Zero, handleArr = IntPtr.Zero, jobArr = IntPtr.Zero, treeJob = IntPtr.Zero;
+        IntPtr attrSize = IntPtr.Zero;
+        int handleCount = 0, jobCount = 0;
         bool attrReady = false, created = false, setupFailed = false;
         IntPtr stdin = IntPtr.Zero;
         PROCESS_INFORMATION pi = new PROCESS_INFORMATION();
@@ -855,7 +879,7 @@ public static class PkChildProcessJob
                     uint hflags;
                     bool stdinInherit = stdin != IntPtr.Zero && stdin != new IntPtr(-1)
                         && GetHandleInformation(stdin, out hflags) && (hflags & HANDLE_FLAG_INHERIT) != 0;
-                    int handleCount = stdinInherit ? 3 : 2;
+                    handleCount = stdinInherit ? 3 : 2;
                     handleArr = Marshal.AllocHGlobal(IntPtr.Size * handleCount);
                     Marshal.WriteIntPtr(handleArr, 0, outWrite);
                     Marshal.WriteIntPtr(handleArr, IntPtr.Size, errWrite);
@@ -864,23 +888,16 @@ public static class PkChildProcessJob
                     // nests in it. No tree job if it can't be made: a kill
                     // then uses taskkill.
                     if (!TestNoTreeJob) { treeJob = CreateJobObject(IntPtr.Zero, null); }
-                    int jobCount = treeJob != IntPtr.Zero ? 2 : 1;
-                    jobArr = Marshal.AllocHGlobal(IntPtr.Size * jobCount);
+                    jobCount = treeJob != IntPtr.Zero ? 2 : 1;
+                    jobArr = Marshal.AllocHGlobal(IntPtr.Size * 2);
                     Marshal.WriteIntPtr(jobArr, _job);
                     if (jobCount == 2) { Marshal.WriteIntPtr(jobArr, IntPtr.Size, treeJob); }
 
-                    IntPtr size = IntPtr.Zero;
-                    InitializeProcThreadAttributeList(IntPtr.Zero, 2, 0, ref size);   // fails by design: returns the size
-                    attrList = Marshal.AllocHGlobal(size);
-                    if (!InitializeProcThreadAttributeList(attrList, 2, 0, ref size)) { throw new Win32Exception(Marshal.GetLastWin32Error()); }
+                    InitializeProcThreadAttributeList(IntPtr.Zero, 2, 0, ref attrSize);   // fails by design: returns the size
+                    attrList = Marshal.AllocHGlobal(attrSize);
+                    int attrError = SetStartAttributes(attrList, attrSize, handleArr, handleCount, jobArr, jobCount);
+                    if (attrError != 0) { throw new Win32Exception(attrError); }
                     attrReady = true;
-                    if (!UpdateProcThreadAttribute(attrList, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, handleArr,
-                            (IntPtr)(IntPtr.Size * handleCount), IntPtr.Zero, IntPtr.Zero)
-                        || !UpdateProcThreadAttribute(attrList, 0, PROC_THREAD_ATTRIBUTE_JOB_LIST, jobArr,
-                            (IntPtr)(IntPtr.Size * jobCount), IntPtr.Zero, IntPtr.Zero))
-                    {
-                        throw new Win32Exception(Marshal.GetLastWin32Error());
-                    }
                     if (TestFailSetup) { throw new Win32Exception(5); }
                 }
                 catch (Win32Exception e)
@@ -902,10 +919,22 @@ public static class PkChildProcessJob
                 // the program is in the job already, so nothing can escape.
                 uint flags = CREATE_NO_WINDOW | CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT;
                 string dir = String.IsNullOrEmpty(workingDirectory) ? null : workingDirectory;
-                if (!CreateProcess(null, commandLine, IntPtr.Zero, IntPtr.Zero, true, flags, IntPtr.Zero, dir, ref si, out pi))
+                bool started = !TestRefuseTreeJob || jobCount == 1;
+                if (started) { started = CreateProcess(null, commandLine, IntPtr.Zero, IntPtr.Zero, true, flags, IntPtr.Zero, dir, ref si, out pi); }
+                if (!started && jobCount == 2)
                 {
-                    throw new Win32Exception(Marshal.GetLastWin32Error());
+                    // Once more without the tree job, in case that's what Windows
+                    // refused (nesting it): the program still starts, and a kill
+                    // then uses taskkill. A program that can't start at all fails
+                    // again, with its own error.
+                    DeleteProcThreadAttributeList(attrList); attrReady = false;
+                    CloseHandle(treeJob); treeJob = IntPtr.Zero; jobCount = 1;
+                    int retryError = SetStartAttributes(attrList, attrSize, handleArr, handleCount, jobArr, jobCount);
+                    if (retryError != 0) { throw new Win32Exception(retryError); }
+                    attrReady = true;
+                    started = CreateProcess(null, commandLine, IntPtr.Zero, IntPtr.Zero, true, flags, IntPtr.Zero, dir, ref si, out pi);
                 }
+                if (!started) { throw new Win32Exception(Marshal.GetLastWin32Error()); }
                 created = true;
             }
             finally
@@ -1703,11 +1732,12 @@ function Stop-PkProcessTree {
     # .DESCRIPTION
     # A program the kit started is killed through its own Job Object, with
     # everything it started, even a child whose parent has already exited, so
-    # none is left running and holding its output open. Any other program (or
-    # one Windows won't end that way) goes to taskkill /T, in as few calls as
-    # Windows' command-line limit allows; if taskkill can't start, fails, or is
-    # still running after 10 seconds (it's killed then), each program is killed
-    # directly.
+    # none is left running and holding its output open. Any other program, one
+    # without such a job (StartMode NoJob, or Windows refused it), or one
+    # Windows won't end that way goes to taskkill /T, which misses a child
+    # whose parent has exited, in as few calls as Windows' command-line limit
+    # allows; if taskkill can't start, fails, or is still running after 10
+    # seconds (it's killed then), each program is killed directly.
     # .PARAMETER Process
     # The program(s), such as the Proc that Start-PkProcess returns.
     # .OUTPUTS
