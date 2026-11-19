@@ -1353,9 +1353,9 @@ Reset-Harness
 function Get-HarnessShape($o) { if ($o -isnot [System.Management.Automation.PSCustomObject]) { return '(not an object)' }; return ($o.PSObject.Properties.Name -join ',') }
 $shapeBatch = Invoke-PkProcessBatch -Commands @(@{ FilePath = $cmdExe; Arguments = '/c exit 0' })
 Test-Assert ((Get-HarnessShape $shapeBatch) -eq 'Results,Aborted,ForceKilledCount') ("a batch returns an object (" + (Get-HarnessShape $shapeBatch) + ")")
-Test-Assert ((Get-HarnessShape $shapeBatch.Results[0]) -eq 'Command,ExitCode,Stdout,Stderr,StreamTimedOut,StreamError,StartError,Aborted,TimedOut,Duration') ("each batch result is an object, fields in order (" + (Get-HarnessShape $shapeBatch.Results[0]) + ")")
+Test-Assert ((Get-HarnessShape $shapeBatch.Results[0]) -eq 'Command,ExitCode,Stdout,Stderr,StreamTimedOut,StreamError,StartError,Aborted,TimedOut,Duration,StdoutDroppedChars,StderrDroppedChars') ("each batch result is an object, fields in order (" + (Get-HarnessShape $shapeBatch.Results[0]) + ")")
 $shapeOne = Invoke-PkProcessWithTimeout -FilePath $cmdExe -Arguments '/c exit 0'
-Test-Assert ((Get-HarnessShape $shapeOne) -eq 'ExitCode,Stdout,Stderr,StreamTimedOut,StreamError,Duration') ("Invoke-PkProcessWithTimeout returns an object (" + (Get-HarnessShape $shapeOne) + ")")
+Test-Assert ((Get-HarnessShape $shapeOne) -eq 'ExitCode,Stdout,Stderr,StreamTimedOut,StreamError,Duration,StdoutDroppedChars,StderrDroppedChars') ("Invoke-PkProcessWithTimeout returns an object (" + (Get-HarnessShape $shapeOne) + ")")
 $shapeDispatch = Invoke-PkProcessDispatch -MaxConcurrent 1 -GroupProvider { return $null } -JobBuilder { param($g) } -JobFinalize { param($j, $p) }
 Test-Assert ((Get-HarnessShape $shapeDispatch) -eq 'GroupResults,Aborted,ForceKilledCount,JobStarterFailedCount') ("the dispatcher returns an object (" + (Get-HarnessShape $shapeDispatch) + ")")
 $shapeJobs = Invoke-PkRunspaceJobs -MaxParallel 1 -JobParams @{ Id = 1 } -WorkerScript { param($Id) }
@@ -3702,7 +3702,7 @@ function Get-HarnessUnguardedCallbacks {
     # this list. Invoke-PkRun's `& $ScriptBlock` is the run itself, not called
     # from a loop. Returns @{ Calls; Problems }.
     param([string]$Source)
-    $internal = @('$pkNewBatchResult', '$pkGetStartFailureCause', '$pkGetJobTimeLimit', '$pkReportStartFailure', '$pkStartProcessCore', '$pkWriteCallbackLoopWarning')
+    $internal = @('$pkNewBatchResult', '$pkGetStartFailureCause', '$pkGetJobTimeLimit', '$pkGetJobMaxOutputChars', '$pkReportStartFailure', '$pkStartProcessCore', '$pkWriteCallbackLoopWarning')
     $problems = [System.Collections.Generic.List[string]]::new()
     $tokens = $null; $errors = $null
     $ast = [System.Management.Automation.Language.Parser]::ParseInput($Source, [ref]$tokens, [ref]$errors)
@@ -4837,6 +4837,124 @@ try {
 } finally {
     Stop-HarnessTaggedPings
 }
+Write-Host ""
+
+Write-Host "=== BE: -MaxOutputChars keeps the start and the end of long output ===" -ForegroundColor Cyan
+# Past the cap, each stream keeps its first half and its last half, and
+# StdoutDroppedChars / StderrDroppedChars count the rest. 'echo' of 20
+# characters gives 22 with its CRLF.
+Reset-Harness
+function Get-HarnessCapRun {
+    param([string]$Arguments, [int]$Cap, $Encoding = $null)
+    try { return Invoke-PkProcessWithTimeout -FilePath $cmdExe -Arguments $Arguments -MaxOutputChars $Cap -OutputEncoding $Encoding } catch { return [pscustomobject]@{ Stdout = $null; Stderr = $null; StdoutDroppedChars = $null; StderrDroppedChars = $null; Error = [string]$_ } }
+}
+function Format-HarnessCapRun($r) {
+    $e = ''; if ($r.PSObject.Properties['Error']) { $e = ', error: ' + $r.Error }
+    return ("'" + ([string]$r.Stdout -replace "`r", '\r' -replace "`n", '\n') + "', dropped " + $r.StdoutDroppedChars + $e)
+}
+$beR = Get-HarnessCapRun -Arguments '/d /c echo 0123456789ABCDEFGHIJ' -Cap 10
+Test-Assert ($beR.Stdout -ceq "01234HIJ`r`n" -and $beR.StdoutDroppedChars -eq 12) ("past -MaxOutputChars 10, the first 5 and the last 5 characters are kept, and 12 counted as dropped (" + (Format-HarnessCapRun $beR) + ")")
+$beR = Get-HarnessCapRun -Arguments '/d /c echo 0123456789ABCDEFGHIJ' -Cap 22
+Test-Assert ($beR.Stdout -ceq "0123456789ABCDEFGHIJ`r`n" -and $beR.StdoutDroppedChars -eq 0) ("output exactly at the cap comes back whole, nothing dropped (" + (Format-HarnessCapRun $beR) + ")")
+# The largest cap costs nothing until output reaches it: the ring grows
+# with the output, so this doesn't try to allocate a billion characters.
+$beR = Get-HarnessCapRun -Arguments '/d /c echo 0123456789ABCDEFGHIJ' -Cap ([int]::MaxValue)
+Test-Assert ($beR.Stdout -ceq "0123456789ABCDEFGHIJ`r`n" -and $beR.StdoutDroppedChars -eq 0) ("-MaxOutputChars [int]::MaxValue keeps short output whole (" + (Format-HarnessCapRun $beR) + ")")
+# The Process.Start fallback reads through the same capped reader.
+[PkChildProcessJob]::TestUseProcessStart = $true
+try { $beR = Get-HarnessCapRun -Arguments '/d /c echo 0123456789ABCDEFGHIJ' -Cap 10 } finally { [PkChildProcessJob]::TestUseProcessStart = $false }
+Test-Assert ($beR.Stdout -ceq "01234HIJ`r`n" -and $beR.StdoutDroppedChars -eq 12) ("the Process.Start fallback is capped the same way (" + (Format-HarnessCapRun $beR) + ")")
+$beR = Get-HarnessCapRun -Arguments '/d /c 1>&2 echo 0123456789ABCDEFGHIJ' -Cap 10
+Test-Assert ($beR.Stderr -ceq "01234HIJ`r`n" -and $beR.StderrDroppedChars -eq 12 -and $beR.StdoutDroppedChars -eq 0) ("stderr is capped the same way, on its own ('" + ([string]$beR.Stderr -replace "`r", '\r' -replace "`n", '\n') + "', dropped " + $beR.StderrDroppedChars + ")")
+
+# A cut never splits a surrogate pair. cmd /u writes UTF-16: four emoji are
+# 8 characters, plus CRLF. A cap of 6 puts the head's end and the tail's
+# start inside pairs.
+$beEmoji = [char]::ConvertFromUtf32(0x1F600)
+$beR = Get-HarnessCapRun -Arguments ('/d /u /c echo ' + $beEmoji * 4) -Cap 6 -Encoding 'unicode'
+$beText = [string]$beR.Stdout
+$beLone = 0
+for ($i = 0; $i -lt $beText.Length; $i++) {
+    if ([char]::IsHighSurrogate($beText[$i])) { if ($i + 1 -lt $beText.Length -and [char]::IsLowSurrogate($beText[$i + 1])) { $i++ } else { $beLone++ } }
+    elseif ([char]::IsLowSurrogate($beText[$i])) { $beLone++ }
+}
+Test-Assert ($beText -ceq ($beEmoji + "`r`n") -and $beLone -eq 0 -and $beR.StdoutDroppedChars -eq 6) ("a cut inside a surrogate pair drops the whole pair, never half (" + $beText.Length + " characters kept, " + $beLone + " half pairs, dropped " + $beR.StdoutDroppedChars + ")")
+
+# Long output: what's held stays within the cap while the program writes,
+# and the count adds up to the whole.
+$beLoop = '/d /c for /l %i in (1,1,20000) do @echo line%i'
+$beWhole = $null; try { $beWhole = Invoke-PkProcessWithTimeout -FilePath $cmdExe -Arguments $beLoop -TimeoutMs 120000 } catch { }
+$beHeldMax = 0; $beErr = $null; $beR = $null
+try {
+    $beJob = Start-PkProcess -FilePath $cmdExe -Arguments $beLoop -MaxOutputChars 1000
+    while (-not $beJob['Proc'].HasExited) { $beHeldMax = [Math]::Max($beHeldMax, $beJob['StdoutTask'].TestHeldLength); Start-Sleep -Milliseconds 5 }
+    $beR = Complete-PkProcess -Job $beJob -Dispose
+} catch { $beErr = [string]$_ }
+$beWholeLen = -1; if ($null -ne $beWhole) { $beWholeLen = ([string]$beWhole.Stdout).Length }
+$beOk = ($null -ne $beR -and ([string]$beR.Stdout).Length -eq 1000 -and $beR.Stdout.StartsWith("line1`r`nline2`r`n") -and $beR.Stdout.EndsWith("line20000`r`n") -and ($beR.StdoutDroppedChars + 1000) -eq $beWholeLen)
+Test-Assert ($beOk -and $beHeldMax -le 1000) ("20,000 lines under a 1,000-character cap: 1,000 kept, from line1 to line20000, the dropped count adds up to the uncapped " + $beWholeLen + ", and at most " + $beHeldMax + " held while it ran" + $(if ($beErr) { " (error: " + $beErr + ")" }))
+
+# A cap bigger than one read (4,096 characters), so the ring wraps part-way
+# through reads: the kept text is exactly the uncapped text's first and last
+# 10,000 characters.
+$beR = $null; try { $beR = Invoke-PkProcessWithTimeout -FilePath $cmdExe -Arguments $beLoop -MaxOutputChars 20000 -TimeoutMs 120000 } catch { }
+$beExpect = $null; if ($null -ne $beWhole -and $beWholeLen -gt 20000) { $beExpect = $beWhole.Stdout.Substring(0, 10000) + $beWhole.Stdout.Substring($beWholeLen - 10000) }
+Test-Assert ($null -ne $beR -and $null -ne $beExpect -and $beR.Stdout -ceq $beExpect -and $beR.StdoutDroppedChars -eq ($beWholeLen - 20000)) ("a 20,000-character cap keeps exactly the uncapped output's first and last 10,000 characters (" + $(if ($beR) { ([string]$beR.Stdout).Length.ToString() + " kept, dropped " + $beR.StdoutDroppedChars } else { 'no result' }) + ")")
+
+# A stream timeout takes the start and the end of what had arrived.
+try {
+    $beJob = $null; $beR = $null; $beErr = $null
+    try {
+        $beJob = Start-PkProcess -FilePath $cmdExe -Arguments '/d /c echo 0123456789ABCDEFGHIJ& start /b ping -n 9 -w 4321 127.0.0.1 >nul' -MaxOutputChars 10
+        $null = Wait-PkProcess -Process $beJob['Proc'] -TimeoutMs 10000
+        $beR = Complete-PkProcess -Job $beJob -StreamTimeoutMs 500 -Dispose
+    } catch { $beErr = [string]$_ }
+    Test-Assert ($null -ne $beR -and $beR.StreamTimedOut -and $beR.Stdout -ceq "01234HIJ`r`n" -and $beR.StdoutDroppedChars -eq 12) ("at a stream timeout, the capped text so far is handed over, with its count (" + $(if ($beR) { (Format-HarnessCapRun $beR) + ", StreamTimedOut " + $beR.StreamTimedOut } else { $beErr }) + ")")
+} finally { Stop-HarnessTaggedPings }
+
+# The batch: -MaxOutputChars for every command, a command's own key over it
+# (0 opts out), a bad key is that command's start error.
+$beB = $null; $beErr = $null
+try {
+    $beB = Invoke-PkProcessBatch -MaxOutputChars 10 -Commands @(
+        @{ FilePath = $cmdExe; Arguments = '/d /c echo 0123456789ABCDEFGHIJ'; Key = 'capped' },
+        @{ FilePath = $cmdExe; Arguments = '/d /c echo 0123456789ABCDEFGHIJ'; Key = 'own'; MaxOutputChars = 4 },
+        @{ FilePath = $cmdExe; Arguments = '/d /c echo 0123456789ABCDEFGHIJ'; Key = 'out'; MaxOutputChars = 0 },
+        @{ FilePath = $cmdExe; Arguments = '/d /c echo x'; Key = 'bad'; MaxOutputChars = 'lots' })
+} catch { $beErr = [string]$_ }
+$beBy = @{}; if ($null -ne $beB) { foreach ($r in $beB.Results) { $beBy[$r.Command['Key']] = $r } }
+$beText = ($beBy.Keys | Sort-Object | ForEach-Object { $_ + '=' + ([string]$beBy[$_].Stdout).Length + '/' + $beBy[$_].StdoutDroppedChars }) -join ' '
+Test-Assert ($beBy.Count -eq 4 -and $beBy['capped'].Stdout -ceq "01234HIJ`r`n" -and ([string]$beBy['own'].Stdout).Length -eq 4 -and $beBy['own'].StdoutDroppedChars -eq 18 -and ([string]$beBy['out'].Stdout).Length -eq 22 -and $beBy['out'].StdoutDroppedChars -eq 0) ("batch: -MaxOutputChars caps every command, and a command's own MaxOutputChars key overrides it, 0 opting out (" + $beText + $(if ($beErr) { ", error: " + $beErr }) + ")")
+Test-Assert ($beBy.ContainsKey('bad') -and $beBy['bad'].StartError -like "MaxOutputChars must be a whole number of characters*") ("batch: a bad MaxOutputChars key is that command's start error (" + $(if ($beBy.ContainsKey('bad')) { $beBy['bad'].StartError }) + ")")
+
+# The dispatcher's default starter: the same, from -MaxOutputChars and the key.
+$beFeed = @{ Given = $false }
+$beGot = @{}
+$beErr = $null
+try {
+    $null = Invoke-PkProcessDispatch -MaxConcurrent 2 -MaxOutputChars 10 `
+        -GroupProvider { if ($beFeed.Given) { return $null }; $beFeed.Given = $true; return @{ Name = 'cap' } }.GetNewClosure() `
+        -JobBuilder { param($g) return @(@{ FilePath = $cmdExe; Arguments = '/d /c echo 0123456789ABCDEFGHIJ'; Key = 'capped' }, @{ FilePath = $cmdExe; Arguments = '/d /c echo 0123456789ABCDEFGHIJ'; Key = 'own'; MaxOutputChars = '4' }) }.GetNewClosure() `
+        -JobFinalize { param($j, $q) $beGot[$j['Key']] = Complete-PkProcess -Job $j }.GetNewClosure()
+} catch { $beErr = [string]$_ }
+Test-Assert ($beGot.Count -eq 2 -and $beGot['capped'].Stdout -ceq "01234HIJ`r`n" -and ([string]$beGot['own'].Stdout).Length -eq 4 -and $beGot['own'].StdoutDroppedChars -eq 18) ("dispatcher: the default starter takes -MaxOutputChars, and a job's own key (a string here) overrides it (" + (($beGot.Keys | Sort-Object | ForEach-Object { $_ + '=' + ([string]$beGot[$_].Stdout).Length }) -join ' ') + $(if ($beErr) { ", error: " + $beErr }) + ")")
+
+# A negative cap is refused before anything starts.
+$beErrors = @()
+$beStarted = @{ Count = 0 }
+foreach ($beWhich in 'Start-PkProcess', 'Invoke-PkProcessWithTimeout', 'Invoke-PkProcessBatch', 'Invoke-PkProcessDispatch') {
+    $beErr = $null
+    try {
+        switch ($beWhich) {
+            'Start-PkProcess' { $null = Start-PkProcess -FilePath $cmdExe -Arguments '/c exit 0' -MaxOutputChars -1 }
+            'Invoke-PkProcessWithTimeout' { $null = Invoke-PkProcessWithTimeout -FilePath $cmdExe -Arguments '/c exit 0' -MaxOutputChars -1 }
+            'Invoke-PkProcessBatch' { $null = Invoke-PkProcessBatch -Commands @(@{ FilePath = $cmdExe; Arguments = '/c exit 0' }) -MaxOutputChars -1 }
+            'Invoke-PkProcessDispatch' { $null = Invoke-PkProcessDispatch -MaxConcurrent 1 -MaxOutputChars -1 -GroupProvider { $beStarted.Count++; return $null }.GetNewClosure() -JobBuilder { param($g) } -JobFinalize { param($j, $q) } }
+        }
+    } catch { $beErr = [string]$_ }
+    if ($beErr -like ($beWhich + ': -MaxOutputChars must be 0 (no cap) or more (got -1)*')) { $beErrors += 'ok' } else { $beErrors += ($beWhich + ': ' + $beErr) }
+}
+Test-Assert (@($beErrors | Where-Object { $_ -ne 'ok' }).Count -eq 0 -and $beStarted.Count -eq 0) ("-MaxOutputChars -1 is refused by all four before anything starts (" + ($beErrors -join ' | ') + ")")
 Write-Host ""
 
 Set-PkMessageHandler -Handler $null
