@@ -4856,6 +4856,14 @@ $beR = Get-HarnessCapRun -Arguments '/d /c echo 0123456789ABCDEFGHIJ' -Cap 10
 Test-Assert ($beR.Stdout -ceq "01234HIJ`r`n" -and $beR.StdoutDroppedChars -eq 12) ("past -MaxOutputChars 10, the first 5 and the last 5 characters are kept, and 12 counted as dropped (" + (Format-HarnessCapRun $beR) + ")")
 $beR = Get-HarnessCapRun -Arguments '/d /c echo 0123456789ABCDEFGHIJ' -Cap 22
 Test-Assert ($beR.Stdout -ceq "0123456789ABCDEFGHIJ`r`n" -and $beR.StdoutDroppedChars -eq 0) ("output exactly at the cap comes back whole, nothing dropped (" + (Format-HarnessCapRun $beR) + ")")
+# The largest cap costs nothing until output reaches it: the ring grows
+# with the output, so this doesn't try to allocate a billion characters.
+$beR = Get-HarnessCapRun -Arguments '/d /c echo 0123456789ABCDEFGHIJ' -Cap ([int]::MaxValue)
+Test-Assert ($beR.Stdout -ceq "0123456789ABCDEFGHIJ`r`n" -and $beR.StdoutDroppedChars -eq 0) ("-MaxOutputChars [int]::MaxValue keeps short output whole (" + (Format-HarnessCapRun $beR) + ")")
+# The Process.Start fallback reads through the same capped reader.
+[PkChildProcessJob]::TestUseProcessStart = $true
+try { $beR = Get-HarnessCapRun -Arguments '/d /c echo 0123456789ABCDEFGHIJ' -Cap 10 } finally { [PkChildProcessJob]::TestUseProcessStart = $false }
+Test-Assert ($beR.Stdout -ceq "01234HIJ`r`n" -and $beR.StdoutDroppedChars -eq 12) ("the Process.Start fallback is capped the same way (" + (Format-HarnessCapRun $beR) + ")")
 $beR = Get-HarnessCapRun -Arguments '/d /c 1>&2 echo 0123456789ABCDEFGHIJ' -Cap 10
 Test-Assert ($beR.Stderr -ceq "01234HIJ`r`n" -and $beR.StderrDroppedChars -eq 12 -and $beR.StdoutDroppedChars -eq 0) ("stderr is capped the same way, on its own ('" + ([string]$beR.Stderr -replace "`r", '\r' -replace "`n", '\n') + "', dropped " + $beR.StderrDroppedChars + ")")
 
@@ -4885,6 +4893,13 @@ try {
 $beWholeLen = -1; if ($null -ne $beWhole) { $beWholeLen = ([string]$beWhole.Stdout).Length }
 $beOk = ($null -ne $beR -and ([string]$beR.Stdout).Length -eq 1000 -and $beR.Stdout.StartsWith("line1`r`nline2`r`n") -and $beR.Stdout.EndsWith("line20000`r`n") -and ($beR.StdoutDroppedChars + 1000) -eq $beWholeLen)
 Test-Assert ($beOk -and $beHeldMax -le 1000) ("20,000 lines under a 1,000-character cap: 1,000 kept, from line1 to line20000, the dropped count adds up to the uncapped " + $beWholeLen + ", and at most " + $beHeldMax + " held while it ran" + $(if ($beErr) { " (error: " + $beErr + ")" }))
+
+# A cap bigger than one read (4,096 characters), so the ring wraps part-way
+# through reads: the kept text is exactly the uncapped text's first and last
+# 10,000 characters.
+$beR = $null; try { $beR = Invoke-PkProcessWithTimeout -FilePath $cmdExe -Arguments $beLoop -MaxOutputChars 20000 -TimeoutMs 120000 } catch { }
+$beExpect = $null; if ($null -ne $beWhole -and $beWholeLen -gt 20000) { $beExpect = $beWhole.Stdout.Substring(0, 10000) + $beWhole.Stdout.Substring($beWholeLen - 10000) }
+Test-Assert ($null -ne $beR -and $null -ne $beExpect -and $beR.Stdout -ceq $beExpect -and $beR.StdoutDroppedChars -eq ($beWholeLen - 20000)) ("a 20,000-character cap keeps exactly the uncapped output's first and last 10,000 characters (" + $(if ($beR) { ([string]$beR.Stdout).Length.ToString() + " kept, dropped " + $beR.StdoutDroppedChars } else { 'no result' }) + ")")
 
 # A stream timeout takes the start and the end of what had arrived.
 try {

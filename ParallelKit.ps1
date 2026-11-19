@@ -253,8 +253,9 @@ public sealed class PkStartedProcess
 // but drops what it reads, which nobody can get any more. The task's result
 // is that snapshot, or the whole text if none was taken. The reader is
 // closed at the end of the stream. The reader's decoder carries a
-// character split across two reads over to the next, so a snapshot never
-// ends in half a character. Each read runs on a thread of its own
+// character split across two reads over to the next, and a snapshot leaves
+// out a surrogate pair's first half whose second half hasn't arrived, so a
+// snapshot never ends in half a character. Each read runs on a thread of its own
 // (LongRunning), not a thread-pool thread: a read blocks until every holder
 // of the stream's write end has let go (at the latest when PowerShell exits:
 // they're in the Job Object), and leftover programs holding their output
@@ -275,16 +276,18 @@ public sealed class PkStreamReadTask : Task<string>
         private string _kept;
         private readonly object _gate = new object();
         public volatile bool ReaderClosed;
-        // The cap's tail: a ring of the last chars read. Null with no cap.
-        private readonly int _headCap;
+        // The cap's tail: the last chars read, a ring once it's full. It
+        // grows with the output, so a cap costs nothing until output reaches
+        // it. _tailCap is 0 with no cap.
+        private readonly int _headCap, _tailCap;
         private bool _headFull;
-        private readonly char[] _tail;
+        private char[] _tail;
         private int _tailStart, _tailCount;
         private long _total, _dropped;
         public Buffer(TextReader reader, int maxChars)
         {
             _reader = reader;
-            if (maxChars > 0) { _headCap = maxChars / 2; _tail = new char[maxChars - _headCap]; }
+            if (maxChars > 0) { _headCap = maxChars / 2; _tailCap = maxChars - _headCap; }
         }
         public string Pump()
         {
@@ -296,7 +299,7 @@ public sealed class PkStreamReadTask : Task<string>
                 {
                     lock (_gate) { if (_text != null) { Append(chunk, n); } }
                 }
-                return Keep();
+                return Keep(false);
             }
             finally
             {
@@ -309,7 +312,7 @@ public sealed class PkStreamReadTask : Task<string>
         private void Append(char[] chunk, int n)
         {
             _total += n;
-            if (_tail == null) { _text.Append(chunk, 0, n); return; }
+            if (_tailCap == 0) { _text.Append(chunk, 0, n); return; }
             int i = 0;
             if (!_headFull)
             {
@@ -323,27 +326,55 @@ public sealed class PkStreamReadTask : Task<string>
                 _text.Append(chunk, 0, take);
                 i = take;
             }
-            for (; i < n; i++)
-            {
-                if (_tailCount < _tail.Length) { _tail[(_tailStart + _tailCount) % _tail.Length] = chunk[i]; _tailCount++; }
-                else { _tail[_tailStart] = chunk[i]; _tailStart = (_tailStart + 1) % _tail.Length; }
-            }
+            if (i < n) { AppendTail(chunk, i, n - i); }
         }
-        // Locked: the reader may be appending while Complete-PkProcess takes it.
-        public string Keep()
+        // Under _gate. Until the ring is full it's filled in order from 0;
+        // after, _tailStart is the oldest char.
+        private void AppendTail(char[] src, int offset, int count)
+        {
+            if (_tailCount < _tailCap)
+            {
+                int take = Math.Min(_tailCap - _tailCount, count);
+                int need = _tailCount + take;
+                if (_tail == null || _tail.Length < need)
+                {
+                    long size = _tail == null ? 4096 : _tail.Length;
+                    while (size < need) { size *= 2; }
+                    Array.Resize(ref _tail, (int)Math.Min(size, _tailCap));
+                }
+                Array.Copy(src, offset, _tail, _tailCount, take);
+                _tailCount += take; offset += take; count -= take;
+            }
+            if (count == 0) { return; }
+            if (count >= _tailCap)
+            {
+                Array.Copy(src, offset + count - _tailCap, _tail, 0, _tailCap);
+                _tailStart = 0;
+                return;
+            }
+            int first = Math.Min(count, _tailCap - _tailStart);
+            Array.Copy(src, offset, _tail, _tailStart, first);
+            Array.Copy(src, offset + first, _tail, 0, count - first);
+            _tailStart = (_tailStart + count) % _tailCap;
+        }
+        // Locked: the reader may be appending while Complete-PkProcess takes
+        // it. A snapshot (the stream still open) leaves out a last char that
+        // is the first half of a pair whose second half hasn't been read.
+        public string Keep(bool snapshot)
         {
             lock (_gate)
             {
                 if (_text != null)
                 {
-                    if (_tail != null && _tailCount > 0)
+                    if (_tailCount > 0)
                     {
                         int skip = 0;
                         // Once the ring has wrapped, it can start on the second half of a pair.
                         if (_total > _text.Length + _tailCount && Char.IsLowSurrogate(_tail[_tailStart])) { skip = 1; }
-                        for (int k = skip; k < _tailCount; k++) { _text.Append(_tail[(_tailStart + k) % _tail.Length]); }
-                        _tailCount = 0;
+                        for (int k = skip; k < _tailCount; k++) { _text.Append(_tail[(_tailStart + k) % _tailCap]); }
+                        _tail = null; _tailCount = 0;
                     }
+                    if (snapshot && _text.Length > 0 && Char.IsHighSurrogate(_text[_text.Length - 1])) { _text.Length--; }
                     _kept = _text.ToString();
                     _dropped = _total - _kept.Length;
                     _text = null;
@@ -370,7 +401,7 @@ public sealed class PkStreamReadTask : Task<string>
 
     // The text that has arrived so far, kept as the stream's text from then
     // on; all of it if the stream has already ended.
-    public string Snapshot() { return _buffer.Keep(); }
+    public string Snapshot() { return _buffer.Keep(true); }
 
     // How many characters the cap left out of the kept text: 0 with no cap,
     // and until the text is kept (the end of the stream or a snapshot).
@@ -1499,6 +1530,8 @@ function Start-PkProcess {
         $OutputEncoding = $null,
         [int]$MaxOutputChars = 0
     )
+    # Invoke-PkProcessWithTimeout, Invoke-PkProcessBatch and Invoke-PkProcessDispatch
+    # make the same check, naming themselves: keep the four in step.
     if ($MaxOutputChars -lt 0) { throw ("Start-PkProcess: -MaxOutputChars must be 0 (no cap) or more (got " + $MaxOutputChars + "). It's how many characters of each output stream to keep.") }
     return (Start-PkProcessCore -FilePath $FilePath -Arguments $Arguments -WorkingDirectory $WorkingDirectory -OutputEncoding $OutputEncoding -MaxOutputChars $MaxOutputChars -CallerState $PSCmdlet.SessionState)
 }
@@ -2013,6 +2046,8 @@ function Invoke-PkProcessWithTimeout {
     if ($TimeoutMs -lt 1) { throw ("Invoke-PkProcessWithTimeout: -TimeoutMs must be at least 1 (got " + $TimeoutMs + "). It's the program's time limit in milliseconds.") }
     # Complete-PkProcess makes the same check, but only after the program has run.
     if ($StreamTimeoutMs -lt 0) { throw ("Invoke-PkProcessWithTimeout: -StreamTimeoutMs must be 0 or more (got " + $StreamTimeoutMs + "). It's how long to wait for the output after the program exits, in milliseconds; 0 doesn't wait.") }
+    # Start-PkProcess, Invoke-PkProcessBatch and Invoke-PkProcessDispatch make the
+    # same check: keep the four in step.
     if ($MaxOutputChars -lt 0) { throw ("Invoke-PkProcessWithTimeout: -MaxOutputChars must be 0 (no cap) or more (got " + $MaxOutputChars + "). It's how many characters of each output stream to keep.") }
     $job = Start-PkProcessCore -FilePath $FilePath -Arguments $Arguments -WorkingDirectory $WorkingDirectory -OutputEncoding $OutputEncoding -MaxOutputChars $MaxOutputChars -CallerState $PSCmdlet.SessionState
     try {
@@ -2189,7 +2224,8 @@ function Invoke-PkProcessDispatch {
     if ($pkMaxQueueAhead -lt 1) { throw "Invoke-PkProcessDispatch: -MaxQueueAhead must be at least 1." }
     # Invoke-PkProcessBatch makes the same -MaxConcurrent, -TimeoutSeconds,
     # -AbortTimeoutSeconds, -StreamTimeoutMs and -MaxOutputChars checks, so its
-    # errors name the batch: keep the two in step. NaN and +Infinity pass a `-lt 0` test and
+    # errors name the batch: keep the two in step. Start-PkProcess and
+    # Invoke-PkProcessWithTimeout check -MaxOutputChars the same way. NaN and +Infinity pass a `-lt 0` test and
     # acted as no limit. A job's own TimeoutSeconds key follows the same rule
     # (Get-PkJobTimeLimit).
     if ([double]::IsNaN($pkTimeoutSeconds) -or [double]::IsInfinity($pkTimeoutSeconds) -or $pkTimeoutSeconds -lt 0) {
