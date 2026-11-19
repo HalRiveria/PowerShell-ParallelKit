@@ -164,7 +164,7 @@ public static class PkState
 
     // Bump this, and the check after the type definitions, whenever any C#
     // in this file changes: a session keeps the types it compiled first.
-    public const int TypesVersion = 9;
+    public const int TypesVersion = 10;
 
     // Locked: Register-/Unregister-PkCancellationSource are callable from
     // worker runspaces, and List<T> is not safe for concurrent writers.
@@ -259,7 +259,10 @@ public sealed class PkStartedProcess
 // of the stream's write end has let go (at the latest when PowerShell exits:
 // they're in the Job Object), and leftover programs holding their output
 // would otherwise use up the pool, so a new program's reads would wait for
-// the pool to grow and hit their stream timeout.
+// the pool to grow and hit their stream timeout. With a cap (maxChars), only
+// the first half and the last half of a longer stream are kept, never split
+// inside a surrogate pair; DroppedChars counts the rest. The read still goes
+// to the end, so the program never blocks on a full pipe.
 public sealed class PkStreamReadTask : Task<string>
 {
     private sealed class Buffer
@@ -267,12 +270,22 @@ public sealed class PkStreamReadTask : Task<string>
         private readonly TextReader _reader;
         // Null once the text is kept: at a snapshot or at the end of the
         // stream, whichever comes first. The builder goes then, so the text
-        // isn't held twice.
+        // isn't held twice. With a cap, it holds the head (the first half).
         private StringBuilder _text = new StringBuilder();
         private string _kept;
         private readonly object _gate = new object();
         public volatile bool ReaderClosed;
-        public Buffer(TextReader reader) { _reader = reader; }
+        // The cap's tail: a ring of the last chars read. Null with no cap.
+        private readonly int _headCap;
+        private bool _headFull;
+        private readonly char[] _tail;
+        private int _tailStart, _tailCount;
+        private long _total, _dropped;
+        public Buffer(TextReader reader, int maxChars)
+        {
+            _reader = reader;
+            if (maxChars > 0) { _headCap = maxChars / 2; _tail = new char[maxChars - _headCap]; }
+        }
         public string Pump()
         {
             try
@@ -281,7 +294,7 @@ public sealed class PkStreamReadTask : Task<string>
                 int n;
                 while ((n = _reader.Read(chunk, 0, chunk.Length)) > 0)
                 {
-                    lock (_gate) { if (_text != null) { _text.Append(chunk, 0, n); } }
+                    lock (_gate) { if (_text != null) { Append(chunk, n); } }
                 }
                 return Keep();
             }
@@ -292,24 +305,65 @@ public sealed class PkStreamReadTask : Task<string>
                 catch (Exception) { }   // a close that fails must not hide the read's own result or error
             }
         }
+        // Under _gate.
+        private void Append(char[] chunk, int n)
+        {
+            _total += n;
+            if (_tail == null) { _text.Append(chunk, 0, n); return; }
+            int i = 0;
+            if (!_headFull)
+            {
+                int take = Math.Min(_headCap - _text.Length, n);
+                if (take == _headCap - _text.Length)
+                {
+                    _headFull = true;
+                    // The head never ends on the first half of a surrogate pair.
+                    if (take > 0 && Char.IsHighSurrogate(chunk[take - 1])) { take--; }
+                }
+                _text.Append(chunk, 0, take);
+                i = take;
+            }
+            for (; i < n; i++)
+            {
+                if (_tailCount < _tail.Length) { _tail[(_tailStart + _tailCount) % _tail.Length] = chunk[i]; _tailCount++; }
+                else { _tail[_tailStart] = chunk[i]; _tailStart = (_tailStart + 1) % _tail.Length; }
+            }
+        }
         // Locked: the reader may be appending while Complete-PkProcess takes it.
         public string Keep()
         {
             lock (_gate)
             {
-                if (_text != null) { _kept = _text.ToString(); _text = null; }
+                if (_text != null)
+                {
+                    if (_tail != null && _tailCount > 0)
+                    {
+                        int skip = 0;
+                        // Once the ring has wrapped, it can start on the second half of a pair.
+                        if (_total > _text.Length + _tailCount && Char.IsLowSurrogate(_tail[_tailStart])) { skip = 1; }
+                        for (int k = skip; k < _tailCount; k++) { _text.Append(_tail[(_tailStart + k) % _tail.Length]); }
+                        _tailCount = 0;
+                    }
+                    _kept = _text.ToString();
+                    _dropped = _total - _kept.Length;
+                    _text = null;
+                }
                 return _kept;
             }
         }
-        public int HeldLength { get { lock (_gate) { return _text != null ? _text.Length : _kept.Length; } } }
+        public int HeldLength { get { lock (_gate) { return _text != null ? _text.Length + _tailCount : _kept.Length; } } }
+        public long DroppedChars { get { lock (_gate) { return _dropped; } } }
     }
 
     private readonly Buffer _buffer;
     private PkStreamReadTask(Buffer buffer) : base(new Func<string>(buffer.Pump), TaskCreationOptions.LongRunning) { _buffer = buffer; }
 
-    public static PkStreamReadTask Run(TextReader reader)
+    public static PkStreamReadTask Run(TextReader reader) { return Run(reader, 0); }
+
+    // maxChars: 0 for no cap.
+    public static PkStreamReadTask Run(TextReader reader, int maxChars)
     {
-        PkStreamReadTask task = new PkStreamReadTask(new Buffer(reader));
+        PkStreamReadTask task = new PkStreamReadTask(new Buffer(reader, maxChars));
         task.Start(TaskScheduler.Default);
         return task;
     }
@@ -317,6 +371,10 @@ public sealed class PkStreamReadTask : Task<string>
     // The text that has arrived so far, kept as the stream's text from then
     // on; all of it if the stream has already ended.
     public string Snapshot() { return _buffer.Keep(); }
+
+    // How many characters the cap left out of the kept text: 0 with no cap,
+    // and until the text is kept (the end of the stream or a snapshot).
+    public long DroppedChars { get { return _buffer.DroppedChars; } }
 
     // Test-only reads: how many characters the buffer holds, and whether the
     // reader has been closed.
@@ -812,7 +870,7 @@ public static class PkChildProcessJob
 # A session that loaded an older copy keeps its compiled types. Say so,
 # rather than fail later with a missing-method error. Keep this number in
 # sync with [PkState]::TypesVersion.
-if ((& { try { [PkState]::TypesVersion } catch { 0 } }) -ne 9) {
+if ((& { try { [PkState]::TypesVersion } catch { 0 } }) -ne 10) {
     throw "ParallelKit: this PowerShell session already loaded an older version of the kit, and its compiled parts can't be swapped out. Close this window and start a new one."
 }
 
@@ -1424,6 +1482,11 @@ function Start-PkProcess {
     # .PARAMETER OutputEncoding
     # How to decode its output: a name like 'utf-8', a code page number (65001
     # or '65001'), or a [System.Text.Encoding]. Default: the console's code page.
+    # .PARAMETER MaxOutputChars
+    # Keep at most this many characters of each output stream (default 0, no
+    # cap): past it, the first half and the last half, and the result's
+    # StdoutDroppedChars and StderrDroppedChars say how many were left out.
+    # The rest is still read, so the program never stalls on a full pipe.
     # .OUTPUTS
     # A hashtable @{ Proc; StdoutTask; StderrTask; Stopwatch }. Proc is the
     # program's Process. Read its output from StdoutTask and StderrTask: Proc's
@@ -1433,9 +1496,11 @@ function Start-PkProcess {
         [string]$FilePath,
         $Arguments = "",
         [string]$WorkingDirectory = "",
-        $OutputEncoding = $null
+        $OutputEncoding = $null,
+        [int]$MaxOutputChars = 0
     )
-    return (Start-PkProcessCore -FilePath $FilePath -Arguments $Arguments -WorkingDirectory $WorkingDirectory -OutputEncoding $OutputEncoding -CallerState $PSCmdlet.SessionState)
+    if ($MaxOutputChars -lt 0) { throw ("Start-PkProcess: -MaxOutputChars must be 0 (no cap) or more (got " + $MaxOutputChars + "). It's how many characters of each output stream to keep.") }
+    return (Start-PkProcessCore -FilePath $FilePath -Arguments $Arguments -WorkingDirectory $WorkingDirectory -OutputEncoding $OutputEncoding -MaxOutputChars $MaxOutputChars -CallerState $PSCmdlet.SessionState)
 }
 
 function Start-PkProcessCore {
@@ -1448,6 +1513,7 @@ function Start-PkProcessCore {
         $Arguments = "",
         [string]$WorkingDirectory = "",
         $OutputEncoding = $null,
+        [int]$MaxOutputChars = 0,
         [System.Management.Automation.SessionState]$CallerState
     )
     $encoding = Resolve-PkEncoding -Encoding $OutputEncoding
@@ -1520,16 +1586,16 @@ function Start-PkProcessCore {
     if ($null -ne $started) {
         return @{
             Proc       = $started.Process
-            StdoutTask = [PkStreamReadTask]::Run($started.Stdout)
-            StderrTask = [PkStreamReadTask]::Run($started.Stderr)
+            StdoutTask = [PkStreamReadTask]::Run($started.Stdout, $MaxOutputChars)
+            StderrTask = [PkStreamReadTask]::Run($started.Stderr, $MaxOutputChars)
             Stopwatch  = [System.Diagnostics.Stopwatch]::StartNew()
         }
     }
     $null = [PkChildProcessJob]::Assign($proc)
     return @{
         Proc       = $proc
-        StdoutTask = [PkStreamReadTask]::Run($proc.StandardOutput)
-        StderrTask = [PkStreamReadTask]::Run($proc.StandardError)
+        StdoutTask = [PkStreamReadTask]::Run($proc.StandardOutput, $MaxOutputChars)
+        StderrTask = [PkStreamReadTask]::Run($proc.StandardError, $MaxOutputChars)
         Stopwatch  = [System.Diagnostics.Stopwatch]::StartNew()
     }
 }
@@ -1671,6 +1737,21 @@ function Get-PkJobTimeLimit {
     return $limit
 }
 
+function Get-PkJobMaxOutputChars {
+    # A job's output cap in characters: its own MaxOutputChars key if it has
+    # one, else the default. 0 = no cap. Throws on a bad key, as
+    # Get-PkJobTimeLimit does for TimeoutSeconds.
+    param([hashtable]$Job, [int]$DefaultMaxOutputChars = 0)
+    $value = $Job['MaxOutputChars']
+    if ($null -eq $value) { return $DefaultMaxOutputChars }
+    $cap = [long]0
+    $parsed = [long]::TryParse(([string]$value).Trim(), [System.Globalization.NumberStyles]::None, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$cap)
+    if (-not $parsed -or $cap -gt [int]::MaxValue) {
+        throw ("MaxOutputChars must be a whole number of characters, 0 (no cap) or more (got '" + $value + "').")
+    }
+    return [int]$cap
+}
+
 function Stop-PkTimedOutJob {
     # Kills a dispatcher job's program tree once it passes its TimeLimit and
     # sets TimedOut; the job is then finalized like any other. Only a .Proc
@@ -1803,8 +1884,10 @@ function Complete-PkProcess {
     # .PARAMETER Dispose
     # Dispose the process object afterwards.
     # .OUTPUTS
-    # An object with ExitCode, Stdout, Stderr, StreamTimedOut, StreamError and
-    # Duration (how long the program ran, from its start to its exit or kill).
+    # An object with ExitCode, Stdout, Stderr, StreamTimedOut, StreamError,
+    # Duration (how long the program ran, from its start to its exit or kill),
+    # and StdoutDroppedChars and StderrDroppedChars (how many characters
+    # Start-PkProcess's -MaxOutputChars left out of each; 0 with no cap).
 
     # Only -Job by position: otherwise `-Dispose $true` would bind $true to
     # -StreamTimeoutMs (1 ms) and cut the output off without an error.
@@ -1823,7 +1906,8 @@ function Complete-PkProcess {
     if ($StreamTimeoutMs -lt 0) {
         throw ("Complete-PkProcess: -StreamTimeoutMs must be 0 or more (got " + $StreamTimeoutMs + "). It's how long to wait for the output after the program exits, in milliseconds; 0 doesn't wait.")
     }
-    $result = [ordered]@{ ExitCode = $null; Stdout = $null; Stderr = $null; StreamTimedOut = $false; StreamError = $null; Duration = $null }
+    $result = [ordered]@{ ExitCode = $null; Stdout = $null; Stderr = $null; StreamTimedOut = $false; StreamError = $null; Duration = $null
+                          StdoutDroppedChars = [long]0; StderrDroppedChars = [long]0 }
     # A custom starter's job may have no read tasks, and a read can fail.
     # Neither throws: this runs inside JobFinalize, where a throw stops the
     # whole dispatcher.
@@ -1871,6 +1955,8 @@ function Complete-PkProcess {
         if ($null -eq $task) { continue }
         if ($task.Status -eq $ranToCompletion) { $result[$stream] = $task.Result }
         elseif (-not $task.IsCompleted -and $task -is [PkStreamReadTask]) { $result[$stream] = $task.Snapshot() }
+        # After the text is taken, which fixes the count.
+        if ($task -is [PkStreamReadTask]) { $result[$stream + 'DroppedChars'] = $task.DroppedChars }
     }
     $result.ExitCode = $Job['Proc'].ExitCode
     # The program's end, not the output's: before Dispose, which loses it.
@@ -1900,12 +1986,16 @@ function Invoke-PkProcessWithTimeout {
     # Where to run it, as for Start-PkProcess. Default: your current location.
     # .PARAMETER OutputEncoding
     # How to decode its output, as for Start-PkProcess.
+    # .PARAMETER MaxOutputChars
+    # Keep at most this many characters of each output stream, as for
+    # Start-PkProcess (default 0, no cap).
     # .PARAMETER IgnoreAbort
     # Keep going during an abort, for a cleanup or restore step that has to run
     # because of it.
     # .OUTPUTS
-    # An object with ExitCode, Stdout, Stderr, StreamTimedOut, StreamError and
-    # Duration (how long the program ran, from its start to its exit or kill).
+    # Complete-PkProcess's object: ExitCode, Stdout, Stderr, StreamTimedOut,
+    # StreamError, Duration (how long the program ran, from its start to its
+    # exit or kill), StdoutDroppedChars and StderrDroppedChars.
     # .EXAMPLE
     # $r = Invoke-PkProcessWithTimeout -FilePath git.exe -Arguments 'rev-parse HEAD' -TimeoutMs 10000
     param(
@@ -1916,13 +2006,15 @@ function Invoke-PkProcessWithTimeout {
         [int]$StreamTimeoutMs = 15000,
         [string]$WorkingDirectory = "",
         $OutputEncoding = $null,
+        [int]$MaxOutputChars = 0,
         [switch]$IgnoreAbort
     )
     # Checked before starting anything: 0 or less would kill the program at once.
     if ($TimeoutMs -lt 1) { throw ("Invoke-PkProcessWithTimeout: -TimeoutMs must be at least 1 (got " + $TimeoutMs + "). It's the program's time limit in milliseconds.") }
     # Complete-PkProcess makes the same check, but only after the program has run.
     if ($StreamTimeoutMs -lt 0) { throw ("Invoke-PkProcessWithTimeout: -StreamTimeoutMs must be 0 or more (got " + $StreamTimeoutMs + "). It's how long to wait for the output after the program exits, in milliseconds; 0 doesn't wait.") }
-    $job = Start-PkProcessCore -FilePath $FilePath -Arguments $Arguments -WorkingDirectory $WorkingDirectory -OutputEncoding $OutputEncoding -CallerState $PSCmdlet.SessionState
+    if ($MaxOutputChars -lt 0) { throw ("Invoke-PkProcessWithTimeout: -MaxOutputChars must be 0 (no cap) or more (got " + $MaxOutputChars + "). It's how many characters of each output stream to keep.") }
+    $job = Start-PkProcessCore -FilePath $FilePath -Arguments $Arguments -WorkingDirectory $WorkingDirectory -OutputEncoding $OutputEncoding -MaxOutputChars $MaxOutputChars -CallerState $PSCmdlet.SessionState
     try {
         # Short slices, so an abort or cancel is noticed within a moment.
         $waited  = [System.Diagnostics.Stopwatch]::StartNew()
@@ -1973,8 +2065,9 @@ function Invoke-PkProcessDispatch {
     # OutputWaitOver, OutputWaitMs. It also sets Group to
     # the job's group, unless the job already has a Group of its own. The default
     # starter reads FilePath, Arguments (a string as written, or a list quoted one
-    # argument per element), WorkingDirectory and OutputEncoding from the job. A
-    # job's TimeoutSeconds key overrides -TimeoutSeconds.
+    # argument per element), WorkingDirectory, OutputEncoding and MaxOutputChars
+    # from the job. A job's TimeoutSeconds key overrides -TimeoutSeconds, and its
+    # MaxOutputChars key -MaxOutputChars.
     # .PARAMETER GroupProvider
     # { } returning the next group, or $null when there are no more, and
     # outputting nothing else. Return a list as one group with a comma:
@@ -2029,6 +2122,10 @@ function Invoke-PkProcessDispatch {
     # How long the default -JobPollCompleted waits for a job's output after its
     # program exits, in milliseconds (default 15000); 0 or more, and 0 doesn't
     # wait. Complete-PkProcess in -JobFinalize uses it too, unless given its own.
+    # .PARAMETER MaxOutputChars
+    # For the default starter: keep at most this many characters of each job's
+    # output streams, as for Start-PkProcess (default 0, no cap). A job's own
+    # MaxOutputChars key overrides it, and 0 there opts the job out.
     # .OUTPUTS
     # An object with GroupResults, Aborted, ForceKilledCount and
     # JobStarterFailedCount. Each group result has GroupInfo (the group), Completed
@@ -2057,7 +2154,8 @@ function Invoke-PkProcessDispatch {
         [double]$TimeoutSeconds = 0,
         # Complete-PkProcess's and Invoke-PkProcessBatch's -StreamTimeoutMs
         # default to the same 15000: keep the three in step.
-        [int]$StreamTimeoutMs = 15000
+        [int]$StreamTimeoutMs = 15000,
+        [int]$MaxOutputChars = 0
     )
     # pk-prefixed, parameters included: inside a worker runspace the kit isn't
     # a module, so a callback without .GetNewClosure() sees this frame's
@@ -2077,7 +2175,8 @@ function Invoke-PkProcessDispatch {
     $pkGroupReleaseCheck = $GroupReleaseCheck
     $pkTimeoutSeconds = $TimeoutSeconds
     $pkStreamTimeoutMs = $StreamTimeoutMs
-    Remove-Variable -Name GroupProvider, JobBuilder, JobStarter, JobPollCompleted, JobFinalize, JobAbortCleanup, GroupCompleteCallback, MaxConcurrent, PollCallback, CancelToken, AbortTimeoutSeconds, MaxQueueAhead, GroupReleaseCheck, TimeoutSeconds, StreamTimeoutMs -Scope Local
+    $pkMaxOutputChars = $MaxOutputChars
+    Remove-Variable -Name GroupProvider, JobBuilder, JobStarter, JobPollCompleted, JobFinalize, JobAbortCleanup, GroupCompleteCallback, MaxConcurrent, PollCallback, CancelToken, AbortTimeoutSeconds, MaxQueueAhead, GroupReleaseCheck, TimeoutSeconds, StreamTimeoutMs, MaxOutputChars -Scope Local
 
     # 0 or less would never start a job (or pull a group) and spin forever.
     if ($pkMaxConcurrent -isnot [System.Threading.SemaphoreSlim]) {
@@ -2089,8 +2188,8 @@ function Invoke-PkProcessDispatch {
     }
     if ($pkMaxQueueAhead -lt 1) { throw "Invoke-PkProcessDispatch: -MaxQueueAhead must be at least 1." }
     # Invoke-PkProcessBatch makes the same -MaxConcurrent, -TimeoutSeconds,
-    # -AbortTimeoutSeconds and -StreamTimeoutMs checks, so its errors name the
-    # batch: keep the two in step. NaN and +Infinity pass a `-lt 0` test and
+    # -AbortTimeoutSeconds, -StreamTimeoutMs and -MaxOutputChars checks, so its
+    # errors name the batch: keep the two in step. NaN and +Infinity pass a `-lt 0` test and
     # acted as no limit. A job's own TimeoutSeconds key follows the same rule
     # (Get-PkJobTimeLimit).
     if ([double]::IsNaN($pkTimeoutSeconds) -or [double]::IsInfinity($pkTimeoutSeconds) -or $pkTimeoutSeconds -lt 0) {
@@ -2101,6 +2200,9 @@ function Invoke-PkProcessDispatch {
     }
     if ($pkStreamTimeoutMs -lt 0) {
         throw ("Invoke-PkProcessDispatch: -StreamTimeoutMs must be 0 or more (got " + $pkStreamTimeoutMs + "). It's how long to wait for a job's output after its program exits, in milliseconds; 0 doesn't wait.")
+    }
+    if ($pkMaxOutputChars -lt 0) {
+        throw ("Invoke-PkProcessDispatch: -MaxOutputChars must be 0 (no cap) or more (got " + $pkMaxOutputChars + "). It's how many characters of each job's output streams to keep.")
     }
 
     # Size the thread pool up front. For a shared budget, its free slots now
@@ -2114,7 +2216,7 @@ function Invoke-PkProcessDispatch {
         $pkCallerState = $PSCmdlet.SessionState
         $pkJobStarter = {
             param($pkJob)
-            $pkStarted = Start-PkProcessCore -CallerState $pkCallerState -FilePath $pkJob['FilePath'] -Arguments $pkJob['Arguments'] -WorkingDirectory ([string]$pkJob['WorkingDirectory']) -OutputEncoding $pkJob['OutputEncoding']
+            $pkStarted = Start-PkProcessCore -CallerState $pkCallerState -FilePath $pkJob['FilePath'] -Arguments $pkJob['Arguments'] -WorkingDirectory ([string]$pkJob['WorkingDirectory']) -OutputEncoding $pkJob['OutputEncoding'] -MaxOutputChars (Get-PkJobMaxOutputChars -Job $pkJob -DefaultMaxOutputChars $pkMaxOutputChars)
             # Start-PkProcessCore's four keys (it builds them in two places); the
             # batch's starter copies them too: a new key goes in all four.
             $pkJob['Proc'] = $pkStarted.Proc; $pkJob['StdoutTask'] = $pkStarted.StdoutTask; $pkJob['StderrTask'] = $pkStarted.StderrTask
@@ -2684,10 +2786,12 @@ function New-PkBatchResult {
         $Process = $null
     )
     $r = [ordered]@{ Command = $Command; ExitCode = $null; Stdout = $null; Stderr = $null; StreamTimedOut = $false; StreamError = $null
-                     StartError = $null; Aborted = [bool]$Aborted; TimedOut = $TimedOut; Duration = $null }
+                     StartError = $null; Aborted = [bool]$Aborted; TimedOut = $TimedOut; Duration = $null
+                     StdoutDroppedChars = [long]0; StderrDroppedChars = [long]0 }
     if ($null -ne $Completed) {
         $r.ExitCode = $Completed.ExitCode; $r.Stdout = $Completed.Stdout; $r.Stderr = $Completed.Stderr
         $r.StreamTimedOut = $Completed.StreamTimedOut; $r.StreamError = $Completed.StreamError; $r.Duration = $Completed.Duration
+        $r.StdoutDroppedChars = $Completed.StdoutDroppedChars; $r.StderrDroppedChars = $Completed.StderrDroppedChars
     } elseif ($null -ne $Process) {
         $r.Duration = Get-PkProcessDuration -Process $Process
     }
@@ -2742,10 +2846,15 @@ function Invoke-PkProcessBatch {
     # How long to wait for a program's output after it exits, in milliseconds
     # (default 15000); 0 or more, and 0 doesn't wait. Past it, the result has
     # StreamTimedOut = $true and the output that arrived.
+    # .PARAMETER MaxOutputChars
+    # Keep at most this many characters of each program's output streams, as
+    # for Start-PkProcess (default 0, no cap). A command's own MaxOutputChars
+    # key overrides it, and 0 there opts the command out.
     # .OUTPUTS
     # An object with Results, Aborted and ForceKilledCount. Each result has Command,
     # ExitCode, Stdout, Stderr, StreamTimedOut, StreamError, StartError, Aborted,
-    # TimedOut and Duration, in the order the programs finished.
+    # TimedOut, Duration, StdoutDroppedChars and StderrDroppedChars, in the order
+    # the programs finished.
     # .EXAMPLE
     # $commands = foreach ($f in Get-ChildItem *.png) { @{ FilePath = 'cjxl.exe'; Arguments = @($f.FullName, "$($f.FullName).jxl") } }
     # $batch = Invoke-PkRun { Invoke-PkProcessBatch -Commands $commands -MaxConcurrent 6 }
@@ -2764,7 +2873,8 @@ function Invoke-PkProcessBatch {
         $OutputEncoding = $null,
         # Complete-PkProcess's and Invoke-PkProcessDispatch's -StreamTimeoutMs
         # default to the same 15000: keep the three in step.
-        [int]$StreamTimeoutMs = 15000
+        [int]$StreamTimeoutMs = 15000,
+        [int]$MaxOutputChars = 0
     )
     # pk-prefixed, parameters included: inside a worker runspace the kit isn't
     # a module, so a callback without .GetNewClosure() sees this frame's
@@ -2776,11 +2886,12 @@ function Invoke-PkProcessBatch {
     $pkTimeoutSeconds = $TimeoutSeconds
     $pkOutputEncoding = $OutputEncoding
     $pkStreamTimeoutMs = $StreamTimeoutMs
-    Remove-Variable -Name Commands, MaxConcurrent, OnComplete, AbortTimeoutSeconds, TimeoutSeconds, OutputEncoding, StreamTimeoutMs -Scope Local
+    $pkMaxOutputChars = $MaxOutputChars
+    Remove-Variable -Name Commands, MaxConcurrent, OnComplete, AbortTimeoutSeconds, TimeoutSeconds, OutputEncoding, StreamTimeoutMs, MaxOutputChars -Scope Local
 
     # Checked once here, so a bad name fails the call instead of every command.
     $null = Resolve-PkEncoding -Encoding $pkOutputEncoding
-    # Invoke-PkProcessDispatch makes the same four checks; these name the
+    # Invoke-PkProcessDispatch makes the same five checks; these name the
     # batch. Keep the two in step. Get-PkJobTimeLimit checks a job's own
     # TimeoutSeconds key by the same rule.
     if ($pkMaxConcurrent -lt 1) { throw ("Invoke-PkProcessBatch: -MaxConcurrent must be at least 1 (got " + $pkMaxConcurrent + ").") }
@@ -2793,6 +2904,9 @@ function Invoke-PkProcessBatch {
     if ($pkStreamTimeoutMs -lt 0) {
         throw ("Invoke-PkProcessBatch: -StreamTimeoutMs must be 0 or more (got " + $pkStreamTimeoutMs + "). It's how long to wait for a program's output after it exits, in milliseconds; 0 doesn't wait.")
     }
+    if ($pkMaxOutputChars -lt 0) {
+        throw ("Invoke-PkProcessBatch: -MaxOutputChars must be 0 (no cap) or more (got " + $pkMaxOutputChars + "). It's how many characters of each program's output streams to keep.")
+    }
 
     $pkResults = [System.Collections.Generic.List[object]]::new()
     $pkState   = @{ Given = $false }
@@ -2801,6 +2915,7 @@ function Invoke-PkProcessBatch {
     $pkNewBatchResult = ${function:New-PkBatchResult}
     $pkStartProcessCore = ${function:Start-PkProcessCore}
     $pkGetJobTimeLimit = ${function:Get-PkJobTimeLimit}
+    $pkGetJobMaxOutputChars = ${function:Get-PkJobMaxOutputChars}
     $pkGetStartFailureCause = ${function:Get-PkStartFailureCause}
     $pkWriteCallbackLoopWarning = ${function:Write-PkCallbackLoopWarning}
     # Invoke-PkCallback's -PkContext: callbacks that used continue/break are
@@ -2842,11 +2957,12 @@ function Invoke-PkProcessBatch {
             # starter below, so the command would get no result.
             try {
                 $null = & $pkGetJobTimeLimit -Job $pkC
+                $pkCap = & $pkGetJobMaxOutputChars -Job $pkC -DefaultMaxOutputChars $pkMaxOutputChars
             } catch {
                 & $pkReportStartFailure $pkC $_
                 continue
             }
-            $pkJobs.Add(@{ FilePath = $pkC['FilePath']; Arguments = $pkC['Arguments']; WorkingDirectory = [string]$pkC['WorkingDirectory']; OutputEncoding = $pkEncoding; TimeoutSeconds = $pkC['TimeoutSeconds']; Command = $pkC })
+            $pkJobs.Add(@{ FilePath = $pkC['FilePath']; Arguments = $pkC['Arguments']; WorkingDirectory = [string]$pkC['WorkingDirectory']; OutputEncoding = $pkEncoding; TimeoutSeconds = $pkC['TimeoutSeconds']; MaxOutputChars = $pkCap; Command = $pkC })
         }
         return $pkJobs
     }.GetNewClosure()
@@ -2854,7 +2970,7 @@ function Invoke-PkProcessBatch {
     $pkJobStarter = {
         param($pkJob)
         try {
-            $pkStarted = & $pkStartProcessCore -CallerState $pkCallerState -FilePath $pkJob['FilePath'] -Arguments $pkJob['Arguments'] -WorkingDirectory $pkJob['WorkingDirectory'] -OutputEncoding $pkJob['OutputEncoding']
+            $pkStarted = & $pkStartProcessCore -CallerState $pkCallerState -FilePath $pkJob['FilePath'] -Arguments $pkJob['Arguments'] -WorkingDirectory $pkJob['WorkingDirectory'] -OutputEncoding $pkJob['OutputEncoding'] -MaxOutputChars $pkJob['MaxOutputChars']
         } catch {
             $pkJob['StartFailureReported'] = $true
             & $pkReportStartFailure $pkJob['Command'] $_
@@ -2915,7 +3031,7 @@ function Get-PkWorkerSafeFunctionNames {
     return @('Write-PkMessage', 'Test-PkAbortSignal', 'Test-PkCancelRequested', 'Initialize-PkThreadPool', 'Stop-PkProcessTree', 'Stop-PkProcessTreeCore', 'Split-PkTaskkillArguments', 'Stop-PkJobProcesses', 'Get-PkProcessDuration', 'Resolve-PkEncoding',
              'Start-PkProcess', 'Wait-PkProcess', 'Wait-PkRunningJobs', 'Complete-PkProcess', 'Invoke-PkProcessWithTimeout',
              'Invoke-PkProcessDispatch', 'Invoke-PkProcessDispatchCore', 'Invoke-PkProcessBatch',
-             'Register-PkCancellationSource', 'Unregister-PkCancellationSource', 'New-PkBatchResult', 'ConvertTo-PkArgumentString', 'Get-PkForceStopReason', 'Resolve-PkFileSystemPath', 'Add-PkDispatchGroupJobs', 'Start-PkProcessCore', 'Get-PkJobTimeLimit', 'Stop-PkTimedOutJob', 'Get-PkStartFailureCause', 'Resolve-PkArguments', 'Invoke-PkCallback', 'Write-PkCallbackLoopWarning', 'ConvertTo-PkArgumentStringCore')
+             'Register-PkCancellationSource', 'Unregister-PkCancellationSource', 'New-PkBatchResult', 'Get-PkJobMaxOutputChars', 'ConvertTo-PkArgumentString', 'Get-PkForceStopReason', 'Resolve-PkFileSystemPath', 'Add-PkDispatchGroupJobs', 'Start-PkProcessCore', 'Get-PkJobTimeLimit', 'Stop-PkTimedOutJob', 'Get-PkStartFailureCause', 'Resolve-PkArguments', 'Invoke-PkCallback', 'Write-PkCallbackLoopWarning', 'ConvertTo-PkArgumentStringCore')
 }
 
 function Get-PkHandlerParamCount {
