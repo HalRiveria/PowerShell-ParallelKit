@@ -4726,6 +4726,74 @@ try { $bcOk = (Invoke-PkProcessWithTimeout -FilePath $cmdExe -Arguments '/d /c e
 Test-Assert ($bcOk -match '^ok') ("a program runs with -OutputEncoding '65001' ('" + ([string]$bcOk).Trim() + "')")
 Write-Host ""
 
+Write-Host "=== BD: -StreamTimeoutMs on the batch and the dispatcher ===" -ForegroundColor Cyan
+# The wait for held output was fixed at 15 s in both, and since the wait
+# moved into the dispatcher's default poll, a shorter -StreamTimeoutMs passed
+# to Complete-PkProcess in -JobFinalize no longer shortened it. Each held
+# command leaves a ping (-w 4321, BB's helpers) holding its output for 8 s.
+Reset-Harness
+function Invoke-HarnessHeldDispatch {
+    param([int]$StreamTimeoutMs, $FinalizeTimeoutMs)
+    $feed = @{ Given = $false }
+    $got = @{}
+    $jobs = @(New-HarnessHeldCommand -Seconds 8 -Key 'held')
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $null = Invoke-PkProcessDispatch -MaxConcurrent 1 -StreamTimeoutMs $StreamTimeoutMs `
+        -GroupProvider { if ($feed.Given) { return $null }; $feed.Given = $true; return @{ Name = 'held' } }.GetNewClosure() `
+        -JobBuilder { param($g) return $jobs }.GetNewClosure() `
+        -JobFinalize {
+            param($j, $q)
+            if ($null -eq $FinalizeTimeoutMs) { $got.R = Complete-PkProcess -Job $j } else { $got.R = Complete-PkProcess -Job $j -StreamTimeoutMs $FinalizeTimeoutMs }
+        }.GetNewClosure()
+    $sw.Stop()
+    return @{ Result = $got.R; Seconds = [math]::Round($sw.Elapsed.TotalSeconds, 1) }
+}
+try {
+    $bdOut = $null; $bdError = $null
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    try { $bdOut = Invoke-PkProcessBatch -StreamTimeoutMs 1000 -Commands @(New-HarnessHeldCommand -Seconds 8 -Key 'held') } catch { $bdError = [string]$_ }
+    $sw.Stop()
+    $bdR = $null; if ($null -ne $bdOut) { $bdR = @($bdOut.Results)[0] }
+    Test-Assert ($null -ne $bdR -and $bdR.StreamTimedOut -and $bdR.Stdout -match 'held' -and $sw.Elapsed.TotalSeconds -lt 4) ("batch -StreamTimeoutMs 1000: held output is given up on after about a second, with what arrived (" + [math]::Round($sw.Elapsed.TotalSeconds, 1) + " s" + $(if ($bdError) { ", error: " + $bdError }) + ")")
+    Stop-HarnessTaggedPings
+
+    $bdOut = $null; $bdError = $null
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    try { $bdOut = Invoke-PkProcessBatch -StreamTimeoutMs 0 -Commands @(New-HarnessHeldCommand -Seconds 8 -Key 'held') } catch { $bdError = [string]$_ }
+    $sw.Stop()
+    $bdR = $null; if ($null -ne $bdOut) { $bdR = @($bdOut.Results)[0] }
+    Test-Assert ($null -ne $bdR -and $bdR.StreamTimedOut -and $sw.Elapsed.TotalSeconds -lt 3) ("batch -StreamTimeoutMs 0: doesn't wait for held output (" + [math]::Round($sw.Elapsed.TotalSeconds, 1) + " s" + $(if ($bdError) { ", error: " + $bdError }) + ")")
+    Stop-HarnessTaggedPings
+
+    # The dispatcher: Complete-PkProcess with no -StreamTimeoutMs of its own
+    # uses the dispatcher's, so it doesn't wait again; one with its own waits
+    # only the rest.
+    $bdRun = $null; $bdError = $null
+    try { $bdRun = Invoke-HarnessHeldDispatch -StreamTimeoutMs 1000 -FinalizeTimeoutMs $null } catch { $bdError = [string]$_ }
+    Test-Assert ($null -ne $bdRun -and $bdRun.Result.StreamTimedOut -and $bdRun.Result.Stdout -match 'held' -and $bdRun.Seconds -lt 4) ("dispatcher -StreamTimeoutMs 1000: a plain Complete-PkProcess in -JobFinalize doesn't wait a second time (" + $(if ($bdRun) { [string]$bdRun.Seconds + " s" } else { $bdError }) + ")")
+    Stop-HarnessTaggedPings
+    $bdRun = $null; $bdError = $null
+    try { $bdRun = Invoke-HarnessHeldDispatch -StreamTimeoutMs 1000 -FinalizeTimeoutMs 3000 } catch { $bdError = [string]$_ }
+    Test-Assert ($null -ne $bdRun -and $bdRun.Result.StreamTimedOut -and $bdRun.Seconds -ge 2.5 -and $bdRun.Seconds -lt 6) ("dispatcher -StreamTimeoutMs 1000, Complete-PkProcess -StreamTimeoutMs 3000: waits the rest, about 3 s in all (" + $(if ($bdRun) { [string]$bdRun.Seconds + " s" } else { $bdError }) + ")")
+    Stop-HarnessTaggedPings
+
+    # A negative value is refused before anything starts.
+    $bdStarted = @{ Count = 0 }
+    $bdErrors = @()
+    foreach ($bdWhich in 'batch', 'dispatcher') {
+        $bdError = $null
+        try {
+            if ($bdWhich -eq 'batch') { $null = Invoke-PkProcessBatch -StreamTimeoutMs -1 -Commands @(@{ FilePath = $cmdExe; Arguments = '/c exit 0' }) }
+            else { $null = Invoke-PkProcessDispatch -MaxConcurrent 1 -StreamTimeoutMs -1 -GroupProvider { $bdStarted.Count++; return $null }.GetNewClosure() -JobBuilder { param($g) } -JobFinalize { param($j, $q) } }
+        } catch { $bdError = [string]$_ }
+        $bdErrors += $bdError
+    }
+    Test-Assert ($bdErrors[0] -like 'Invoke-PkProcessBatch: -StreamTimeoutMs must be 0 or more (got -1)*' -and $bdErrors[1] -like 'Invoke-PkProcessDispatch: -StreamTimeoutMs must be 0 or more (got -1)*' -and $bdStarted.Count -eq 0) ("-StreamTimeoutMs -1 is refused by both before anything starts (" + ($bdErrors -join ' | ') + ")")
+} finally {
+    Stop-HarnessTaggedPings
+}
+Write-Host ""
+
 Set-PkMessageHandler -Handler $null
 Reset-PkAbortState
 
