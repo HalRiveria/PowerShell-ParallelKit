@@ -1835,12 +1835,15 @@ function Complete-PkProcess {
     # final pass after an abort's wait sets OutputWaitOver: at most 250 ms
     # then, enough for a program that exited just before to have its output
     # read to the end, short enough for a window close.
-    # OutputWaitMs is the dispatcher's -StreamTimeoutMs, used when the caller
-    # passes none of its own.
+    # OutputWaitMs is the dispatcher's -StreamTimeoutMs, set with OutputWait,
+    # and used when the caller passes none of its own.
     $limitMs = $StreamTimeoutMs
-    if (-not $PSBoundParameters.ContainsKey('StreamTimeoutMs') -and $Job['OutputWaitMs'] -is [int]) { $limitMs = $Job['OutputWaitMs'] }
-    $waitMs = $limitMs
-    if ($Job['OutputWait'] -is [System.Diagnostics.Stopwatch]) { $waitMs = [int][Math]::Max(0, $limitMs - $Job['OutputWait'].ElapsedMilliseconds) }
+    if ($Job['OutputWait'] -is [System.Diagnostics.Stopwatch]) {
+        if (-not $PSBoundParameters.ContainsKey('StreamTimeoutMs') -and $Job['OutputWaitMs'] -is [int]) { $limitMs = $Job['OutputWaitMs'] }
+        $waitMs = [int][Math]::Max(0, $limitMs - $Job['OutputWait'].ElapsedMilliseconds)
+    } else {
+        $waitMs = $limitMs
+    }
     if ($Job['OutputWaitOver']) { $waitMs = [Math]::Min($waitMs, 250) }
     if ($tasks.Count -gt 0) {
         try {
@@ -2052,6 +2055,8 @@ function Invoke-PkProcessDispatch {
         [int]$MaxQueueAhead = 3,
         [scriptblock]$GroupReleaseCheck = $null,
         [double]$TimeoutSeconds = 0,
+        # Complete-PkProcess's and Invoke-PkProcessBatch's -StreamTimeoutMs
+        # default to the same 15000: keep the three in step.
         [int]$StreamTimeoutMs = 15000
     )
     # pk-prefixed, parameters included: inside a worker runspace the kit isn't
@@ -2085,8 +2090,9 @@ function Invoke-PkProcessDispatch {
     if ($pkMaxQueueAhead -lt 1) { throw "Invoke-PkProcessDispatch: -MaxQueueAhead must be at least 1." }
     # Invoke-PkProcessBatch makes the same -MaxConcurrent, -TimeoutSeconds,
     # -AbortTimeoutSeconds and -StreamTimeoutMs checks, so its errors name the
-    # batch: keep the two in step. NaN and +Infinity pass a `-lt 0` test and acted as no limit. A job's
-    # own TimeoutSeconds key follows the same rule (Get-PkJobTimeLimit).
+    # batch: keep the two in step. NaN and +Infinity pass a `-lt 0` test and
+    # acted as no limit. A job's own TimeoutSeconds key follows the same rule
+    # (Get-PkJobTimeLimit).
     if ([double]::IsNaN($pkTimeoutSeconds) -or [double]::IsInfinity($pkTimeoutSeconds) -or $pkTimeoutSeconds -lt 0) {
         throw ("Invoke-PkProcessDispatch: -TimeoutSeconds must be a number of seconds, 0 (no limit) or more (got " + $pkTimeoutSeconds + ").")
     }
@@ -2127,9 +2133,9 @@ function Invoke-PkProcessDispatch {
         # job as OutputWaitMs, so a Complete-PkProcess given no -StreamTimeoutMs
         # of its own waits only what's left of it (nothing). After an abort's
         # wait the final pass sets OutputWaitOver: it takes what has arrived.
-        # A closure, for $pkStreamTimeoutMs: a callback here only sees this
-        # frame's variables through dynamic scope, which a user's own
-        # variables could shadow.
+        # A closure, so it carries this call's $pkStreamTimeoutMs itself
+        # rather than finding it by dynamic scope (measured: no slower per
+        # job than the plain block on 5.1 or 7).
         $pkJobPollCompleted = {
             param($pkJob)
             if (-not $pkJob['Proc'].HasExited) { return $false }
@@ -2756,6 +2762,8 @@ function Invoke-PkProcessBatch {
         [int]$AbortTimeoutSeconds = 60,
         [double]$TimeoutSeconds = 0,
         $OutputEncoding = $null,
+        # Complete-PkProcess's and Invoke-PkProcessDispatch's -StreamTimeoutMs
+        # default to the same 15000: keep the three in step.
         [int]$StreamTimeoutMs = 15000
     )
     # pk-prefixed, parameters included: inside a worker runspace the kit isn't

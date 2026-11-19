@@ -4790,6 +4790,38 @@ try {
     Test-Assert ($null -ne $bdRun -and $bdRun.Result.StreamTimedOut -and $bdRun.Seconds -ge 2.5 -and $bdRun.Seconds -lt 6) ("dispatcher -StreamTimeoutMs 1000, Complete-PkProcess -StreamTimeoutMs 3000: waits the rest, about 3 s in all (" + $(if ($bdRun) { [string]$bdRun.Seconds + " s" } else { $bdError }) + ")")
     Stop-HarnessTaggedPings
 
+    # A job -JobFinalize re-queues waits the dispatcher's limit again, from
+    # its own new exit.
+    $bdFeed = @{ Given = $false }
+    $bdGot = [System.Collections.Generic.List[object]]::new()
+    $bdJobs = @(New-HarnessHeldCommand -Seconds 8 -Key 'again')
+    $bdError = $null
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+        $null = Invoke-PkProcessDispatch -MaxConcurrent 1 -StreamTimeoutMs 1000 `
+            -GroupProvider { if ($bdFeed.Given) { return $null }; $bdFeed.Given = $true; return @{ Name = 'again' } }.GetNewClosure() `
+            -JobBuilder { param($g) return $bdJobs }.GetNewClosure() `
+            -JobFinalize { param($j, $q) $bdGot.Add((Complete-PkProcess -Job $j)); if ($bdGot.Count -eq 1) { $q.Enqueue($j) } }.GetNewClosure()
+    } catch { $bdError = [string]$_ }
+    $sw.Stop()
+    $bdBoth = @($bdGot | Where-Object { $_.StreamTimedOut -and $_.Stdout -match 'held' }).Count
+    Test-Assert ($bdGot.Count -eq 2 -and $bdBoth -eq 2 -and $sw.Elapsed.TotalSeconds -lt 5) ("dispatcher -StreamTimeoutMs 1000: a re-queued job is given up on after about a second again (" + $bdBoth + " of " + $bdGot.Count + " runs timed out with their output, " + [math]::Round($sw.Elapsed.TotalSeconds, 1) + " s" + $(if ($bdError) { ", error: " + $bdError }) + ")")
+    Stop-HarnessTaggedPings
+
+    # Inside a worker the kit isn't a module: the default poll still carries
+    # the limit it was given.
+    $bdRes = [System.Collections.Generic.List[object]]::new()
+    $bdOut = Invoke-PkRunspaceJobs -MaxParallel 1 -JobParams @(@{ Cmd = $cmdExe }) -ResultHandler { param($r) $bdRes.Add($r) }.GetNewClosure() -WorkerScript {
+        param($Cmd)
+        $wsw = [System.Diagnostics.Stopwatch]::StartNew()
+        $wb = Invoke-PkProcessBatch -StreamTimeoutMs 1000 -Commands @(@{ FilePath = $Cmd; Arguments = '/d /c echo held& start /b ping -n 9 -w 4321 127.0.0.1 >nul' })
+        $wr = @($wb.Results)[0]
+        [pscustomobject]@{ TimedOut = $wr.StreamTimedOut; Held = ($wr.Stdout -match 'held'); Seconds = [math]::Round($wsw.Elapsed.TotalSeconds, 1) }
+    }
+    $bdW = $null; if ($bdRes.Count -eq 1) { $bdW = $bdRes[0] }
+    Test-Assert ($bdOut.Errors.Count -eq 0 -and $null -ne $bdW -and $bdW.TimedOut -and $bdW.Held -and $bdW.Seconds -lt 4) ("a batch inside a worker honors -StreamTimeoutMs 1000 (" + $(if ($bdW) { [string]$bdW.Seconds + " s" } else { [string]$bdOut.Errors.Count + " errors: " + (@($bdOut.Errors | ForEach-Object { [string]$_.Error }) -join '; ') }) + ")")
+    Stop-HarnessTaggedPings
+
     # A negative value is refused before anything starts.
     $bdStarted = @{ Count = 0 }
     $bdErrors = @()
