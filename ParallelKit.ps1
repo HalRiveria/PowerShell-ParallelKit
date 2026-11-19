@@ -1055,32 +1055,19 @@ function Initialize-PkChildProcessJob {
     return $false
 }
 
-function Initialize-PkThreadPool {
-    # Raises the pool's minimum, since the pool grows slowly past it. This was
-    # for the output reads, two per program; those now run on threads of their
-    # own (PkStreamReadTask), so the kit's own work doesn't depend on it.
-    param([int]$MaxConcurrentProcesses = 0)
-    $clampedProcs = [Math]::Min([Math]::Max($MaxConcurrentProcesses, 0), 16000)
-    $minimumWorkerThreads = [Math]::Max(128, (2 * $clampedProcs) + 32)
-    $worker = 0; $io = 0
-    [System.Threading.ThreadPool]::GetMinThreads([ref]$worker, [ref]$io)
-    [PkState]::ThreadPoolRaised = $true
-    if ($worker -ge $minimumWorkerThreads) { return $true }
-    return [System.Threading.ThreadPool]::SetMinThreads($minimumWorkerThreads, $io)
-}
-
 function Initialize-ParallelKit {
     # .SYNOPSIS
-    # Sets up Ctrl+C handling, child-process cleanup and the thread pool up front. Optional.
+    # Sets up Ctrl+C handling and child-process cleanup up front. Optional.
     # .DESCRIPTION
     # The engines set up what they need on first use anyway. Safe to call more than
     # once. A failed Ctrl+C handler or child-process cleanup also prints a warning.
     # .PARAMETER MaxConcurrentProcesses
-    # How many programs you expect to run at once, used to size the thread pool.
-    # 0 (the default) sizes it for up to about 48.
+    # Not used since 3.4, which leaves the thread pool's settings alone; kept so
+    # existing calls still work.
     # .OUTPUTS
-    # An object with AbortHandler, ChildProcessJob and ThreadPool, each $true if that
-    # part worked; Version, the kit's version; and StartMode, how the kit starts
+    # An object with AbortHandler and ChildProcessJob, each $true if that part
+    # worked; ThreadPool, always $true since 3.4 (kept for scripts that check
+    # it); Version, the kit's version; and StartMode, how the kit starts
     # programs here: CreatedInJob (inside the Job Object, so anything they start
     # is in it too), AddedToJob (started, then added to it just after), or NoJob
     # (no cleanup if PowerShell is killed). A program whose start can't be set up
@@ -1089,7 +1076,10 @@ function Initialize-ParallelKit {
     param([int]$MaxConcurrentProcesses = 0)
     $handlerOk = Register-PkAbortHandler
     $jobOk     = Initialize-PkChildProcessJob
-    $poolOk    = Initialize-PkThreadPool -MaxConcurrentProcesses $MaxConcurrentProcesses
+    # The kit used to raise the thread pool's minimum here, for output reads on
+    # pool threads. Those have threads of their own now (PkStreamReadTask), and
+    # the minimum is a setting the caller's own code shares.
+    $poolOk    = $true
     # The header's Version line: the version PR changes both, and the harness
     # checks they match.
     $version = [version]'3.3'
@@ -1553,7 +1543,6 @@ function Start-PkProcessCore {
     $commandLine = Resolve-PkArguments -Arguments $Arguments -FilePath $FilePath
     # For a caller who never ran Initialize-ParallelKit. No-ops once done.
     if (-not [PkChildProcessJob]::IsInitialized) { $null = [PkChildProcessJob]::Initialize() }
-    if (-not [PkState]::ThreadPoolRaised)        { $null = Initialize-PkThreadPool }
 
     $psi = [System.Diagnostics.ProcessStartInfo]::new()
     $psi.FileName               = $FilePath
@@ -2240,13 +2229,6 @@ function Invoke-PkProcessDispatch {
     if ($pkMaxOutputChars -lt 0) {
         throw ("Invoke-PkProcessDispatch: -MaxOutputChars must be 0 (no cap) or more (got " + $pkMaxOutputChars + "). It's how many characters of each job's output streams to keep.")
     }
-
-    # Size the thread pool up front. For a shared budget, its free slots now
-    # are the best measure of its size.
-    $pkPoolSizeHint = 0
-    if ($pkMaxConcurrent -is [int]) { $pkPoolSizeHint = $pkMaxConcurrent }
-    elseif ($pkMaxConcurrent -is [System.Threading.SemaphoreSlim]) { $pkPoolSizeHint = $pkMaxConcurrent.CurrentCount }
-    $null = Initialize-PkThreadPool -MaxConcurrentProcesses $pkPoolSizeHint
 
     if ($null -eq $pkJobStarter) {
         $pkCallerState = $PSCmdlet.SessionState
@@ -3064,7 +3046,7 @@ function Invoke-PkProcessBatch {
 
 function Get-PkWorkerSafeFunctionNames {
     # Kit functions every worker runspace gets automatically.
-    return @('Write-PkMessage', 'Test-PkAbortSignal', 'Test-PkCancelRequested', 'Initialize-PkThreadPool', 'Stop-PkProcessTree', 'Stop-PkProcessTreeCore', 'Split-PkTaskkillArguments', 'Stop-PkJobProcesses', 'Get-PkProcessDuration', 'Resolve-PkEncoding',
+    return @('Write-PkMessage', 'Test-PkAbortSignal', 'Test-PkCancelRequested', 'Stop-PkProcessTree', 'Stop-PkProcessTreeCore', 'Split-PkTaskkillArguments', 'Stop-PkJobProcesses', 'Get-PkProcessDuration', 'Resolve-PkEncoding',
              'Start-PkProcess', 'Wait-PkProcess', 'Wait-PkRunningJobs', 'Complete-PkProcess', 'Invoke-PkProcessWithTimeout',
              'Invoke-PkProcessDispatch', 'Invoke-PkProcessDispatchCore', 'Invoke-PkProcessBatch',
              'Register-PkCancellationSource', 'Unregister-PkCancellationSource', 'New-PkBatchResult', 'Get-PkJobMaxOutputChars', 'ConvertTo-PkArgumentString', 'Get-PkForceStopReason', 'Resolve-PkFileSystemPath', 'Add-PkDispatchGroupJobs', 'Start-PkProcessCore', 'Get-PkJobTimeLimit', 'Stop-PkTimedOutJob', 'Get-PkStartFailureCause', 'Resolve-PkArguments', 'Invoke-PkCallback', 'Write-PkCallbackLoopWarning', 'ConvertTo-PkArgumentStringCore')

@@ -9,6 +9,9 @@ $ErrorActionPreference = "Stop"
 # The whole suite runs under strict mode: a host project may well use it,
 # and the kit must not depend on lenient hashtable/variable reads.
 Set-StrictMode -Version Latest
+# The thread pool's minimum before the kit loads: the kit leaves it alone.
+$poolMinBefore = 0; $poolIoBefore = 0
+[System.Threading.ThreadPool]::GetMinThreads([ref]$poolMinBefore, [ref]$poolIoBefore)
 . (Join-Path $PSScriptRoot "ParallelKit.ps1")
 
 $script:passCount = 0
@@ -75,10 +78,10 @@ Write-Host "=== A: setup ===" -ForegroundColor Cyan
 $init = Initialize-ParallelKit -MaxConcurrentProcesses 8
 Test-Assert ($init.AbortHandler -eq $true)    "abort handler registers"
 Test-Assert ($init.ChildProcessJob -eq $true) "child-process job object initializes"
-Test-Assert ($init.ThreadPool -eq $true)      "thread pool minimum is raised"
+Test-Assert ($init.ThreadPool -eq $true)      "ThreadPool is still `$true, for scripts that check it"
 $w = 0; $io = 0
 [System.Threading.ThreadPool]::GetMinThreads([ref]$w, [ref]$io)
-Test-Assert ($w -ge 128) "thread pool minimum is at least 128 worker threads"
+Test-Assert ($w -eq $poolMinBefore -and $io -eq $poolIoBefore) ("Initialize-ParallelKit leaves the thread pool's minimum alone (" + $w + "/" + $io + ", was " + $poolMinBefore + "/" + $poolIoBefore + ")")
 Write-Host ""
 
 # ==============================================================================
@@ -854,24 +857,27 @@ $writer.Dispose()
 Test-Assert ($null -eq $scanError) ("scanning a collection other threads are changing doesn't throw (" + $scanError + ")")
 
 # With no Initialize-ParallelKit at all, starting a process sets up the
-# thread pool and the kill-on-close job object. Needs a fresh process.
+# kill-on-close job object, and leaves the thread pool alone. Needs a fresh
+# process.
 $probeScript = Join-Path $env:TEMP ("pk-probe-" + [guid]::NewGuid().ToString("N") + ".ps1")
 $kitPath = Join-Path $PSScriptRoot "ParallelKit.ps1"
 [System.IO.File]::WriteAllText($probeScript, @"
+`$w0 = 0; `$io0 = 0
+[System.Threading.ThreadPool]::GetMinThreads([ref]`$w0, [ref]`$io0)
 . '$kitPath'
 `$before = [PkChildProcessJob]::IsInitialized
 `$j = Start-PkProcess -FilePath '$cmdExe' -Arguments '/c exit 0'
 `$null = Wait-PkProcess -Process `$j.Proc -TimeoutMs 5000
 `$w = 0; `$io = 0
 [System.Threading.ThreadPool]::GetMinThreads([ref]`$w, [ref]`$io)
-Write-Output ("before=" + `$before + " after=" + [PkChildProcessJob]::IsInitialized + " threads=" + `$w)
+Write-Output ("before=" + `$before + " after=" + [PkChildProcessJob]::IsInitialized + " threads=" + `$w + " was=" + `$w0)
 "@)
 $probe = Invoke-PkProcessWithTimeout -FilePath $selfExe -Arguments ('-NoProfile -ExecutionPolicy Bypass -File "' + $probeScript + '"') -TimeoutMs 60000
 [System.IO.File]::Delete($probeScript)
 Test-Assert ($probe.Stdout -match 'before=False after=True') ("starting a process sets up child cleanup by itself (" + ([string]$probe.Stdout).Trim() + ")")
-$probeThreads = 0
-if ($probe.Stdout -match 'threads=(\d+)') { $probeThreads = [int]$Matches[1] }
-Test-Assert ($probeThreads -ge 128) ("and raises the thread pool by itself (minimum " + $probeThreads + ")")
+$probeThreads = -1; $probeWas = -2
+if ($probe.Stdout -match 'threads=(\d+) was=(\d+)') { $probeThreads = [int]$Matches[1]; $probeWas = [int]$Matches[2] }
+Test-Assert ($probeThreads -eq $probeWas) ("and leaves the thread pool's minimum alone (" + $probeThreads + ", was " + $probeWas + ")")
 
 # A script run the way a prompt runs it (& script, or .\script.ps1) holds
 # the kit's functions in its own scope, where a .GetNewClosure() block can't
@@ -914,12 +920,12 @@ $clm = Invoke-PkProcessWithTimeout -FilePath $selfExe -Arguments ('-NoProfile -E
 [System.IO.File]::Delete($clmScript)
 Test-Assert ($clm.Stdout -like '*ConstrainedLanguage mode, but the kit needs FullLanguage*') ("loading in Constrained Language Mode fails with a message naming the problem (" + ([string]$clm.Stdout).Trim() + ")")
 
-# The dispatcher sizes the pool for its own concurrency.
+# The dispatcher leaves the pool alone, whatever its concurrency.
 $feed = @{ Given = $false }
 $null = Invoke-PkProcessDispatch -MaxConcurrent 100 -GroupProvider { return $null } -JobBuilder { param($g) } -JobFinalize { param($j, $p) }
 $w = 0; $io = 0
 [System.Threading.ThreadPool]::GetMinThreads([ref]$w, [ref]$io)
-Test-Assert ($w -ge 232) ("the dispatcher raises the thread pool to fit -MaxConcurrent (minimum " + $w + " for 100 processes)")
+Test-Assert ($w -eq $poolMinBefore) ("the dispatcher leaves the thread pool's minimum alone at -MaxConcurrent 100 (" + $w + ", was " + $poolMinBefore + ")")
 
 # A one-line starter keeps the caller's job fields.
 Reset-Harness
@@ -1102,12 +1108,12 @@ $threw = $false
 try { $null = Invoke-PkRunspaceJobs -MaxParallel 1 -JobParams @(@{ Id = 1 }, $null) -WorkerScript { param($Id) } } catch { $threw = ($_.ToString() -like '*entry 1 is not a hashtable*') }
 Test-Assert $threw "-JobParams with a `$null entry fails the same way"
 
-# A shared budget sizes the thread pool too.
+# So does a shared budget.
 $bigBudget = [System.Threading.SemaphoreSlim]::new(150, 150)
 $null = Invoke-PkProcessDispatch -MaxConcurrent $bigBudget -GroupProvider { return $null } -JobBuilder { param($g) } -JobFinalize { param($j, $p) }
 $w = 0; $io = 0
 [System.Threading.ThreadPool]::GetMinThreads([ref]$w, [ref]$io)
-Test-Assert ($w -ge 332) ("a shared budget of 150 raises the thread pool to fit (minimum " + $w + ")")
+Test-Assert ($w -eq $poolMinBefore) ("and with a shared budget of 150 (" + $w + ", was " + $poolMinBefore + ")")
 $bigBudget.Dispose()
 Write-Host ""
 
