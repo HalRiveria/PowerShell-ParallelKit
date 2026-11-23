@@ -91,6 +91,8 @@ try {
 }
 '@)
 
+# The same sender as ParallelKit.Harness.ps1's PkHarnessSender and
+# Testing/ps7-native's PkPs7NativeSender, cut down to one Ctrl+C.
 $senderScript = Join-Path $dir 'sender.ps1'
 [IO.File]::WriteAllText($senderScript, @'
 param([int]$TargetPid, [string]$LogFile)

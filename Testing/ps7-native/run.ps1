@@ -44,10 +44,13 @@ function Get-Tagged {
     @(Get-CimInstance Win32_Process | Where-Object { $null -ne $_.CommandLine -and $_.CommandLine.Contains($progTag) })
 }
 function Stop-Tagged {
-    foreach ($p in Get-Tagged) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }
-    foreach ($p in @(Get-CimInstance Win32_Process -Filter "Name='PING.EXE'" | Where-Object { $null -ne $_.CommandLine -and $_.CommandLine.Contains("-n $pingCount ") })) {
+    $tagged = @(Get-Tagged)
+    $ids = @($tagged | ForEach-Object { $_.ProcessId })
+    # A tagged cmd.exe's ping has no tag of its own: it's found by its parent, before that goes.
+    foreach ($p in @(Get-CimInstance Win32_Process -Filter "Name='PING.EXE'" | Where-Object { $ids -contains $_.ParentProcessId })) {
         Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
     }
+    foreach ($p in $tagged) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }
 }
 function Wait-Tagged([int]$Count, [int]$Seconds = 30) {
     $deadline = (Get-Date).AddSeconds($Seconds)
@@ -111,6 +114,8 @@ try {
     $p3 = Start-Process $exe -ArgumentList '-NoProfile', '-File', (Get-Quoted $script3), '-Exe', (Get-Quoted $exe), '-Ignore', (Get-Quoted $ignore), '-Log', (Get-Quoted $log), '-Tag', $tag, '-Seconds', $ProgramSeconds -WindowStyle Hidden -PassThru
     $before = Wait-Tagged 3
     Start-Sleep -Seconds 1
+    # The same sender as ParallelKit.Harness.ps1's PkHarnessSender and
+    # Testing/stop-in-call's PkProbeSender, cut down to one Ctrl+C.
     $sender = Join-Path $work 'sender.ps1'
     [IO.File]::WriteAllText($sender, @'
 param([int]$TargetPid)

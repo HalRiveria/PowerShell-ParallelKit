@@ -229,8 +229,9 @@ $tests.Add(@{ Name = 'Process dispatch with groups, Ctrl+C that kills running jo
 
 '@ + $group.Replace($dispatchLine, $abortAfterFive + '$dispatchParams.AbortTimeoutSeconds = 0' + "`r`n" + $dispatchLine) + $abortChecks + @'
 Test-Check ($dispatch.ForceKilledCount -gt 0) "running jobs force-killed ($($dispatch.ForceKilledCount))"
-$left = @(0..5 | Where-Object { Test-Path -LiteralPath (Join-Path $a ("p{0:D2}.jxl" -f $_)) })
-Test-Check ($left.Count -eq 0) "-JobAbortCleanup removed the killed jobs' files ($($left.Count) of 6 left)"
+# A job that finished before the abort replaced its stand-in with real output, which stays.
+$left = @(0..5 | Where-Object { $p = Join-Path $a ("p{0:D2}.jxl" -f $_); (Test-Path -LiteralPath $p) -and (Get-Content -LiteralPath $p -Raw) -match 'STALE' })
+Test-Check ($left.Count -eq 0) "-JobAbortCleanup removed the killed jobs' files ($($left.Count) of 6 stand-ins left)"
 '@ })
 
 # Behind the README's 5.1 note in "Errors and crashed workers". Not an example.

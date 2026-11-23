@@ -293,7 +293,7 @@ A program can be done while its output isn't: whatever it started can hold its o
 ```mermaid
 flowchart TD
   Q["Queued: waiting for a slot"] -->|"abort before it starts"| A["Aborted, no Duration (dispatcher: JobAbortCleanup)"]
-  Q -->|"slot free"| S["Created suspended inside the Job Object, then resumed"]
+  Q -->|"slot free"| S["Started inside the Job Object (see StartMode)"]
   S -->|"can't start"| E["StartError: no Duration"]
   S --> R["Running: Duration counts from here"]
   R -->|"exits"| D["Program done: Duration stops"]
@@ -602,7 +602,7 @@ Other pieces: `Request-PkAbort` triggers the same abort from code. `Test-PkAbort
 - Run it in a PowerShell console window or an editor's terminal (graceful Ctrl+C tested in Windows Terminal, Visual Studio's built-in terminal and VS Code's terminal, including the PowerShell extension's). The Windows PowerShell ISE isn't supported: tested there, the kit loads and runs, but the ISE has no console, so Ctrl+C stops the script outright, with no graceful drain and no cleanup callbacks.
 - It needs FullLanguage mode, since it compiles a little C# with `Add-Type` when loaded. On a machine locked down to Constrained Language Mode (usually by AppLocker or Windows Defender Application Control), loading it fails with a message saying so. Some endpoint security products also flag scripts that compile code calling Windows APIs at runtime; if yours blocks the kit, that's the likely reason.
 - After changing `ParallelKit.ps1` itself, start a new PowerShell window. A session keeps the kit's compiled parts until it closes; the kit tells you if it finds an older copy loaded.
-- Only one outer `Invoke-PkRun` abort scope can exist per PowerShell process. Nested calls reuse the existing scope. Multiple dispatchers can run concurrently where supported; they share the process-wide abort state and can share a `SemaphoreSlim` to enforce a combined concurrency limit.
+- One `Invoke-PkRun` at a time per PowerShell process: a call made while one is already running, nested or from another runspace, just runs inside it. Several dispatchers can run at once inside one run (one per runspace job, say); they share its abort state and can share a `SemaphoreSlim` to enforce a combined concurrency limit.
 - A worker stuck inside a long .NET call can't be interrupted. Force-stop stops waiting for it and returns. The worker is NOT killed: once that call returns it can carry on to the end of its script. Before any step that can't be undone (deleting a source file, say), have the worker check `Test-PkCancelRequested` and skip the step if it's true.
 - Programs run hidden, and there's no way to send them input. A program that stops to ask a question will sit there until it's killed.
 - A program's output is collected in memory and handed over when it exits; there's no live line-by-line output. A program that prints gigabytes will use that much memory, unless `-MaxOutputChars` caps what's kept. A batch keeps every result, output included, until it returns, which adds up over thousands of chatty programs. If you only need the output in `-OnComplete`, drop it there with `$result.Stdout = $null; $result.Stderr = $null` and it's freed as the batch goes.
@@ -621,7 +621,7 @@ powershell -NoProfile -File .\ParallelKit.Harness.ps1
 
 It takes about four and a half minutes. It prints a `[PASS]`/`[FAIL]` line per check and exits 0 only if everything passed. A few checks send real Ctrl+C, Ctrl+Break and window-close events to child PowerShell processes in hidden consoles of their own, never to yours. Where a machine can't deliver those, they print `[SKIP]` with the reason instead; set `PK_HARNESS_NO_SKIP=1` to count skips as failures. A few `message handler failed` lines in the output are expected: some checks break the message handler on purpose to test the fallback.
 
-GitHub runs the same harness on Windows PowerShell 5.1 and on PowerShell 7 for every pull request and every change to `main`. The harness is the only thing GitHub runs: the scripts in `Testing/` below are run by hand.
+GitHub runs the same harness on Windows PowerShell 5.1 and on PowerShell 7 for every pull request and every change to `main`. The harness is the only test GitHub runs: the scripts in `Testing/` below are run by hand.
 
 `Testing/` holds the longer stress tests and checks behind some of what this README says. They aren't part of the test suite and aren't needed to use the kit:
 
