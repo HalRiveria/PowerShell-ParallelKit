@@ -1667,6 +1667,8 @@ foreach ($i in 1..60) { Start-Sleep -Seconds 1 }
 Write-ChildLog "END"
 '@)
 
+# The same sender as Testing/stop-in-call's PkProbeSender and Testing/ps7-native's
+# PkPs7NativeSender, which are cut down to one Ctrl+C.
 [System.IO.File]::WriteAllText($senderScript, @'
 param([int]$TargetPid, [int]$EventType, [string]$LogFile)
 Add-Type -TypeDefinition @"
