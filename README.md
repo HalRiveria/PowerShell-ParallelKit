@@ -619,7 +619,7 @@ powershell -NoProfile -File .\ParallelKit.Harness.ps1
 <details>
 <summary>What it prints, and the stress tests in Testing/</summary>
 
-It takes about three and a half minutes. It prints a `[PASS]`/`[FAIL]` line per check and exits 0 only if everything passed. A few checks send real Ctrl+C, Ctrl+Break and window-close events to child PowerShell processes in hidden consoles of their own, never to yours. Where a machine can't deliver those, they print `[SKIP]` with the reason instead; set `PK_HARNESS_NO_SKIP=1` to count skips as failures. A few `message handler failed` lines in the output are expected: some checks break the message handler on purpose to test the fallback.
+It takes about four and a half minutes. It prints a `[PASS]`/`[FAIL]` line per check and exits 0 only if everything passed. A few checks send real Ctrl+C, Ctrl+Break and window-close events to child PowerShell processes in hidden consoles of their own, never to yours. Where a machine can't deliver those, they print `[SKIP]` with the reason instead; set `PK_HARNESS_NO_SKIP=1` to count skips as failures. A few `message handler failed` lines in the output are expected: some checks break the message handler on purpose to test the fallback.
 
 GitHub runs the same harness on Windows PowerShell 5.1 and on PowerShell 7 for every pull request and every change to `main`. The harness is the only thing GitHub runs: the scripts in `Testing/` below are run by hand.
 
