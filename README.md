@@ -194,14 +194,25 @@ $commands = foreach ($f in Get-ChildItem *.png) {
     @{ FilePath = 'cjxl.exe'; Arguments = @($f.FullName, "$($f.FullName).jxl"); Source = $f }
 }
 $batchParams = @{
-    Commands      = $commands
-    MaxConcurrent = 6
-    OnComplete    = {
+    Commands       = $commands
+    MaxConcurrent  = 6
+    TimeoutSeconds = 300      # kill a program still running after 5 minutes
+    MaxOutputChars = 100000   # keep at most this much of each program's stdout and stderr
+    OnComplete     = {
         param($command, $result)
         if ($result.ExitCode -ne 0) { Write-PkMessage "FAILED: $($command.Source.Name)" -Level Error }
     }
 }
 $batch = Invoke-PkRun { Invoke-PkProcessBatch @batchParams }
+
+# -OnComplete only sees programs that ran. The results cover every command.
+foreach ($r in $batch.Results | Where-Object { $_.StartError -or $_.TimedOut -or $_.Aborted -or $_.ExitCode -ne 0 }) {
+    $why = if ($r.StartError) { "couldn't start: $($r.StartError)" }
+           elseif ($r.TimedOut) { 'ran past its time limit' }
+           elseif ($r.Aborted) { 'stopped by an abort' }
+           else { "exit code $($r.ExitCode)" }
+    Write-PkMessage "$($r.Command.Source.Name): $why" -Level Warn
+}
 ```
 
 Long parameter lists in these examples use splatting (`@batchParams`) instead of trailing backticks: it's easier to read, and a stray space after a backtick can't break it.
