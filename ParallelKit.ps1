@@ -2,7 +2,7 @@
 # graceful Ctrl+C/window-close handling for Windows PowerShell 5.1 and
 # PowerShell 7.
 #
-# Version 3.4 - https://github.com/HalRiveria/PowerShell-ParallelKit
+# Version 3.4.1 - https://github.com/HalRiveria/PowerShell-ParallelKit
 # (Initialize-ParallelKit reports the version too: change both together.)
 # Copyright (c) 2026 HalRiveria. MIT License: keep this notice with any copy;
 # the full text is in LICENSE in the repository.
@@ -1226,7 +1226,7 @@ function Initialize-ParallelKit {
     $poolOk    = $true
     # The header's Version line: the version PR changes both, and the harness
     # checks they match.
-    $version = [version]'3.4'
+    $version = [version]'3.4.1'
     return [pscustomobject][ordered]@{ AbortHandler = $handlerOk; ChildProcessJob = $jobOk; ThreadPool = $poolOk; Version = $version; StartMode = [PkChildProcessJob]::StartMode }
 }
 

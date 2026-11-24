@@ -4372,7 +4372,7 @@ foreach ($l in $rdLeft) { Stop-Process -Id $l.ProcessId -Force -ErrorAction Sile
 Test-Assert ($rdError -like '*could not start*' -and $rdLeft.Count -eq 0) ("a program whose output readers fail to build is ended and the start reported as failed (" + $rdLeft.Count + " left running, error: " + $rdError + ")")
 
 # Initialize-ParallelKit reports the kit's version and how it starts programs.
-$ipHeader = [regex]::Match([System.IO.File]::ReadAllText((Join-Path $PSScriptRoot 'ParallelKit.ps1')), '(?m)^# Version (\d+\.\d+)').Groups[1].Value
+$ipHeader = [regex]::Match([System.IO.File]::ReadAllText((Join-Path $PSScriptRoot 'ParallelKit.ps1')), '(?m)^# Version (\d+\.\d+(?:\.\d+)?)\b').Groups[1].Value
 $ipError = $null; $ip = $null; $ipAdded = $null
 try {
     $ip = Initialize-ParallelKit
