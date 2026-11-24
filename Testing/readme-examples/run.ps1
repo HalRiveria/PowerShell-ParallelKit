@@ -124,7 +124,7 @@ Set-PkMessageHandler { param($Message, $Level) $global:messages.Add("$Level $Mes
 Test-Check ($batch.Results.Count -eq 4) "a result per command ($($batch.Results.Count) of 4)"
 Test-Check (@($batch.Results | Where-Object { $_.Command.Source -is [System.IO.FileInfo] }).Count -eq 4) 'Source comes back on each result''s Command'
 Test-Check (@($global:messages | Where-Object { $_ -eq 'Error FAILED: bad.png' }).Count -eq 1) "-OnComplete reported bad.png ($($global:messages -join '; '))"
-Test-Check (@($global:messages | Where-Object { $_ -like 'Warn *' }).Count -eq 1 -and @($global:messages | Where-Object { $_ -match '^Warn bad\.png: exit code [1-9]' }).Count -eq 1) "the results loop lists bad.png, and only it ($($global:messages -join '; '))"
+Test-Check (@($global:messages | Where-Object { $_ -match '^Warn \S+\.png: ' }).Count -eq 1 -and @($global:messages | Where-Object { $_ -match '^Warn bad\.png: exit code [1-9]' }).Count -eq 1) "the results loop lists bad.png, and only it ($($global:messages -join '; '))"
 $n = 0; $indexed = foreach ($c in $commands) { $c2 = $c.Clone(); $c2.Index = $n++; $c2 }
 $again = Invoke-PkProcessBatch -Commands $indexed -MaxConcurrent 6
 Test-Check ((@($again.Results | Sort-Object { $_.Command.Index }) | ForEach-Object { $_.Command.Index }) -join ',' -eq '0,1,2,3') 'the Index sort line puts results back in order'

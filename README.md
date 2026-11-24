@@ -205,7 +205,7 @@ $batchParams = @{
 }
 $batch = Invoke-PkRun { Invoke-PkProcessBatch @batchParams }
 
-# -OnComplete only sees programs that ran. The results cover every command.
+# A summary at the end. -OnComplete only sees programs that ran; the results cover every command.
 foreach ($r in $batch.Results | Where-Object { $_.StartError -or $_.TimedOut -or $_.Aborted -or $_.ExitCode -ne 0 }) {
     $why = if ($r.StartError) { "couldn't start: $($r.StartError)" }
            elseif ($r.TimedOut) { 'ran past its time limit' }
@@ -745,7 +745,7 @@ Additions, changes, fixes, and other things that have been evaluated and decline
 - **Built-in structured logging (JSON Lines, lifecycle events).** `Set-PkMessageHandler` receives every message the kit writes, with its level, `-OnComplete` and `-ResultHandler` see each result, and `-JobFinalize` each finished job, so you can write whatever format you need from there. An event for every job, built in, would slow the engines on Windows PowerShell 5.1.
 - **Signing the release.** That needs a paid code-signing certificate. If your machines require signed scripts (`AllSigned`), sign the file with a certificate they trust, as [Setup](#setup) says.
 - **Separate checksums or build provenance.** The release asset is `ParallelKit.ps1` itself, attached straight from the tagged source with no build step, and GitHub shows a SHA-256 digest for it on the release page. Compare it with `Get-FileHash .\ParallelKit.ps1`.
-- **Avoiding the private part of .NET the kit uses.** To create a program inside the Job Object, the kit briefly makes its output pipes inheritable, and holds .NET's own process-start lock meanwhile so that no other program started in PowerShell at that moment picks them up. That lock isn't public. If a future .NET moves it, the kit doesn't fail: it starts programs the older way, warns once, and `Initialize-ParallelKit` reports `StartMode` `AddedToJob` (see [Process-tree cleanup limitations](#process-tree-cleanup-limitations)). Doing without the lock would mean always using that older way, or risking output held open by an unrelated program.
+- **Avoiding the private part of .NET the kit uses.** To create a program inside the Job Object, the kit briefly makes its output pipes inheritable, and holds .NET's own process-start lock meanwhile so that no other program PowerShell or .NET starts at that moment picks them up. That lock isn't public. If a future .NET moves it, the kit doesn't fail: it starts programs the older way, warns once, and `Initialize-ParallelKit` reports `StartMode` `AddedToJob` (see [Process-tree cleanup limitations](#process-tree-cleanup-limitations)). Doing without the lock would mean always using that older way, or risking output held open by an unrelated program.
 - **Fractional abort and drain timeouts.** `-AbortTimeoutSeconds` and `-DrainTimeoutSeconds` are whole seconds; 2.5 is rounded to a whole number. `-TimeoutSeconds`, the time limit on a program, does take fractions.
 
 </details>
