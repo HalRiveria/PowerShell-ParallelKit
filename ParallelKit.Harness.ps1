@@ -5101,6 +5101,13 @@ try {
 $bgAssign = @($script:messages | Where-Object { $_.Level -eq 'Warn' })
 Test-Assert ($bgAssign.Count -eq 1 -and $bgAssign[0].Message -like "*wouldn't add a program*Win32 error 5*" -and ($bgExits -join ',') -eq '0,0') ("a running program Windows won't add to the Job Object warns once, naming the error, and still runs (" + $bgAssign.Count + " warning(s), exits " + ($bgExits -join ',') + ")")
 [PkChildProcessJob]::TestResetJobWarnings()
+# The reason comes from the call itself, also when the process can't be
+# read at all (a disposed Process object throws on its handle).
+$bgGone = Start-PkProcess -FilePath $cmdExe -Arguments '/d /c exit 0'
+$null = Complete-PkProcess $bgGone -Dispose
+$bgWhy = $null
+$bgAssigned = [PkChildProcessJob]::Assign($bgGone['Proc'], [ref]$bgWhy)
+Test-Assert (-not $bgAssigned -and -not [string]::IsNullOrEmpty($bgWhy) -and $bgWhy -notlike 'Win32 error*') ("a process that can't be read isn't added, and the reason says what was thrown (" + $bgWhy + ")")
 
 # .NET's start lock not found, as a future .NET that moved it would bring.
 Reset-Harness

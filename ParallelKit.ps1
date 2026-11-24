@@ -575,11 +575,27 @@ public static class PkChildProcessJob
     // job (Windows nests it); without one, a kill uses taskkill.
     public static bool Assign(System.Diagnostics.Process process)
     {
-        if (_job == IntPtr.Zero || process == null) { return false; }
-        if (TestFailAssign) { LastError = 5; return false; }
+        string reason;
+        return Assign(process, out reason);
+    }
+
+    // The same, saying why it failed ("Win32 error 5", or what was thrown);
+    // null when it worked. Per call: LastError is shared, and another
+    // thread's start can change it before the caller reads it.
+    public static bool Assign(System.Diagnostics.Process process, out string reason)
+    {
+        reason = null;
+        if (_job == IntPtr.Zero || process == null) { reason = "no Job Object"; return false; }
+        if (TestFailAssign) { LastError = 5; reason = "Win32 error 5"; return false; }
         try
         {
-            if (!AssignProcessToJobObject(_job, process.Handle)) { LastError = Marshal.GetLastWin32Error(); return false; }
+            if (!AssignProcessToJobObject(_job, process.Handle))
+            {
+                int e = Marshal.GetLastWin32Error();
+                LastError = e;
+                reason = "Win32 error " + e;
+                return false;
+            }
             if (!TestNoTreeJob)
             {
                 IntPtr treeJob = CreateJobObject(IntPtr.Zero, null);
@@ -590,7 +606,7 @@ public static class PkChildProcessJob
             }
             return true;
         }
-        catch { return false; }
+        catch (Exception ex) { reason = ex.Message; return false; }   // a process whose handle can't be read: say what was thrown
     }
 
     // ---- Starting a program inside the job from its first instruction ----
@@ -1745,8 +1761,9 @@ function Start-PkProcessCore {
     # Windows also refuses a program that has already exited (error 5), as
     # quick ones often have by now: only one still running is a real gap.
     # With no job at all, the setup above has warned already.
-    if (-not [PkChildProcessJob]::Assign($proc) -and [PkChildProcessJob]::IsInitialized -and -not $proc.HasExited -and [PkChildProcessJob]::ClaimAssignWarning()) {
-        Write-PkMessage ("[WARNING] Windows wouldn't add a program to the kit's Job Object (process " + $proc.Id + ", " + $psi.FileName + ", Win32 error " + [PkChildProcessJob]::LastError + "). It isn't cleaned up if PowerShell is killed outright, and killing it reaches what it started only through taskkill. Shown once.") -Level Warn
+    $assignWhy = $null
+    if (-not [PkChildProcessJob]::Assign($proc, [ref]$assignWhy) -and [PkChildProcessJob]::IsInitialized -and -not $proc.HasExited -and [PkChildProcessJob]::ClaimAssignWarning()) {
+        Write-PkMessage ("[WARNING] Windows wouldn't add a program to the kit's Job Object (process " + $proc.Id + ", " + $psi.FileName + ": " + $assignWhy + "). It isn't cleaned up if PowerShell is killed outright, and killing it reaches what it started only through taskkill. Shown once.") -Level Warn
     }
     return @{
         Proc       = $proc
