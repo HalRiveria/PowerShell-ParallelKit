@@ -16,7 +16,7 @@ The kit is built to be reliable first and fast second. The aim is that a long ru
 
 Developed with assistance from Claude Code. The implementation, test harness, and development history are available for inspection. I encourage independent review and testing.
 
-**Contents:** [Process-tree cleanup limitations](#process-tree-cleanup-limitations) · [Quick start](#quick-start) · [Who it's for](#who-its-for) · [Which function](#which-function) · [Setup](#setup) · [How it fits together](#how-it-fits-together) · [Run a list of programs](#run-a-list-of-programs) · [Process results](#process-results) · [Run PowerShell code in parallel](#run-powershell-code-in-parallel) · [The two rules for worker code](#the-two-rules-for-worker-code) · [Process dispatch with groups](#process-dispatch-with-groups) · [Single processes](#single-processes) · [Messages](#messages) · [Abort](#abort) · [Choosing limits](#choosing-limits) · [Limits](#limits) · [Testing](#testing) · [FAQ](#faq)
+**Contents:** [Process-tree cleanup limitations](#process-tree-cleanup-limitations) · [Quick start](#quick-start) · [Who it's for](#who-its-for) · [Which function](#which-function) · [Setup](#setup) · [How it fits together](#how-it-fits-together) · [Run a list of programs](#run-a-list-of-programs) · [Process results](#process-results) · [Run PowerShell code in parallel](#run-powershell-code-in-parallel) · [The two rules for worker code](#the-two-rules-for-worker-code) · [Process dispatch with groups](#process-dispatch-with-groups) · [Single processes](#single-processes) · [Messages](#messages) · [Abort](#abort) · [Choosing limits](#choosing-limits) · [Limits](#limits) · [Testing](#testing) · [FAQ](#faq) · [Not planned](#not-planned)
 
 ## Process-tree cleanup limitations
 
@@ -716,6 +716,26 @@ Start from the CPU core count and measure. [Choosing limits](#choosing-limits) h
 <summary>Can I pipe into it?</summary>
 
 No. The engines take a list of hashtables (`-Commands`, `-JobParams`) rather than pipeline input, because each job needs several named values and the kit wants the whole list (or a provider for it) before it starts. Build the list with `foreach`, as the examples do: `$commands = foreach ($f in Get-ChildItem *.png) { @{ FilePath = ...; Arguments = ... } }`.
+
+</details>
+
+## Not planned
+
+Additions, changes, fixes, and other things that have been evaluated and declined. If one of these gets in your way, open an [issue](https://github.com/HalRiveria/PowerShell-ParallelKit/issues) and say what you're trying to do.
+
+<details>
+<summary>The list</summary>
+
+- **Stopping a batch after the first program that can't start** (`-StopOnStartError`). Every command is still tried and gets its own `StartError`, and a failure that repeats for the same program prints once in full, then once more at the end with a count, so a missing program doesn't flood the console. To stop early, check for it yourself before the batch: `Get-Command tool.exe -ErrorAction Stop`.
+- **Output modes such as `-KeepOutput None|Stderr|All`.** `-MaxOutputChars` caps how much of each stream is kept, and setting `$result.Stdout = $null; $result.Stderr = $null` in `-OnComplete` frees a finished program's output as the batch goes. To throw a stream away completely, redirect it in the command itself (`cmd /c tool.exe 2>nul`).
+- **Writing output past the `-MaxOutputChars` cap to a file.** The kit can't know where you'd want those files or when they're safe to delete. If you need all of a program's output, redirect it in the command (`cmd /c tool.exe > out.txt 2>&1`) or use the program's own output option.
+- **More fields on results, such as `Index`, `Status`, `JobId` or batch totals.** Any key you put on a command comes back on its result's `Command`, so `Index = $n` lets you sort on it: `$batch.Results | Sort-Object { $_.Command.Index }`. A `Status` field would only repeat `ExitCode`, `StartError`, `TimedOut` and `Aborted`, and what counts as failure is up to you: some programs exit nonzero on success.
+- **Renaming parameters or result fields.** A rename would break existing scripts. Where the engines' names differ, both work on every engine: `-MaxParallel` and `-MaxConcurrent`, `-DrainTimeoutSeconds` and `-AbortTimeoutSeconds`. Result fields have no aliases, since an alias would show up as a second column in `Format-Table`, `Export-Csv` and JSON.
+- **Built-in structured logging (JSON Lines, lifecycle events).** `Set-PkMessageHandler` receives every message the kit writes, with its level, `-OnComplete` and `-ResultHandler` see each result, and `-JobFinalize` each finished job, so you can write whatever format you need from there. An event for every job, built in, would slow the engines on Windows PowerShell 5.1.
+- **Signing the release.** That needs a paid code-signing certificate. If your machines require signed scripts (`AllSigned`), sign the file with a certificate they trust, as [Setup](#setup) says.
+- **Separate checksums or build provenance.** The release asset is `ParallelKit.ps1` itself, attached straight from the tagged source with no build step, and GitHub shows a SHA-256 digest for it on the release page. Compare it with `Get-FileHash .\ParallelKit.ps1`.
+- **Avoiding the private part of .NET the kit uses.** To create a program inside the Job Object, the kit briefly makes its output pipes inheritable, and holds .NET's own process-start lock meanwhile so that no other program started in PowerShell at that moment picks them up. That lock isn't public. If a future .NET moves it, the kit doesn't fail: it starts programs the older way, warns once, and `Initialize-ParallelKit` reports `StartMode` `AddedToJob` (see [Process-tree cleanup limitations](#process-tree-cleanup-limitations)). Doing without the lock would mean always using that older way, or risking output held open by an unrelated program.
+- **Fractional abort and drain timeouts.** `-AbortTimeoutSeconds` and `-DrainTimeoutSeconds` are whole seconds; 2.5 is rounded to a whole number. `-TimeoutSeconds`, the time limit on a program, does take fractions.
 
 </details>
 
