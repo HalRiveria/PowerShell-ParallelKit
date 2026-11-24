@@ -5063,6 +5063,60 @@ try {
 }
 Write-Host ""
 
+Write-Host "=== BG: a missing Job Object, a refused program or a missing start lock is reported ===" -ForegroundColor Cyan
+# Each costs the cleanup of programs left running if PowerShell is killed,
+# so each warns, once a session, whichever path set things up.
+Reset-Harness
+
+# The Job Object set up by a program's start, when nothing set it up first:
+# in a fresh PowerShell, since this one's is set up already.
+$bgInitScript = Join-Path $env:TEMP ("pk-bg-init-" + [guid]::NewGuid().ToString("N") + ".ps1")
+[System.IO.File]::WriteAllText($bgInitScript, @"
+. '$kitPath'
+`$bgWarn = [System.Collections.Generic.List[string]]::new()
+Set-PkMessageHandler { param(`$Message, `$Level) if (`$Level -eq 'Warn') { `$bgWarn.Add(`$Message) } }.GetNewClosure()
+[PkChildProcessJob]::TestFailInit = `$true
+`$bgExits = foreach (`$i in 1..2) { (Invoke-PkProcessWithTimeout -FilePath '$cmdExe' -Arguments '/d /c exit 4').ExitCode }
+Write-Output ('EXITS=' + (`$bgExits -join ',') + ' MODE=' + [PkChildProcessJob]::StartMode + ' WARNS=' + `$bgWarn.Count)
+foreach (`$w in `$bgWarn) { Write-Output ('WARN: ' + `$w) }
+"@)
+$bgInit = Invoke-PkProcessWithTimeout -FilePath $selfExe -Arguments ('-NoProfile -ExecutionPolicy Bypass -File "' + $bgInitScript + '"') -TimeoutMs 60000
+[System.IO.File]::Delete($bgInitScript)
+$bgInitOut = [string]$bgInit.Stdout
+Test-Assert ($bgInitOut -like '*EXITS=4,4 MODE=NoJob WARNS=1*' -and $bgInitOut -like '*WARN: *child-process cleanup*') ("a Job Object that a program's start can't set up warns once, and programs still run (" + $bgInitOut.Trim() + ")")
+
+# A running program Windows won't add to the Job Object, on the
+# Process.Start path.
+Reset-Harness
+[PkChildProcessJob]::TestResetJobWarnings()
+$bgExits = @()
+[PkChildProcessJob]::TestUseProcessStart = $true
+[PkChildProcessJob]::TestFailAssign = $true
+try {
+    foreach ($i in 1..2) { $bgExits += (Complete-PkProcess (Start-PkProcess -FilePath $pingExe -Arguments '-n 2 127.0.0.1') -Dispose).ExitCode }
+} finally {
+    [PkChildProcessJob]::TestFailAssign = $false
+    [PkChildProcessJob]::TestUseProcessStart = $false
+}
+$bgAssign = @($script:messages | Where-Object { $_.Level -eq 'Warn' })
+Test-Assert ($bgAssign.Count -eq 1 -and $bgAssign[0].Message -like "*wouldn't add a program*Win32 error 5*" -and ($bgExits -join ',') -eq '0,0') ("a running program Windows won't add to the Job Object warns once, naming the error, and still runs (" + $bgAssign.Count + " warning(s), exits " + ($bgExits -join ',') + ")")
+[PkChildProcessJob]::TestResetJobWarnings()
+
+# .NET's start lock not found, as a future .NET that moved it would bring.
+Reset-Harness
+[PkChildProcessJob]::TestResetFallbackWarning()
+$bgMode = $null; $bgExits = @()
+[PkChildProcessJob]::TestNoStartLock = $true
+try {
+    $bgMode = [PkChildProcessJob]::StartMode
+    foreach ($i in 1..2) { $bgExits += (Complete-PkProcess (Start-PkProcess -FilePath $cmdExe -Arguments '/d /c exit 2') -Dispose).ExitCode }
+} finally { [PkChildProcessJob]::TestNoStartLock = $false }
+$bgLock = @($script:messages | Where-Object { $_.Level -eq 'Warn' })
+Test-Assert ($bgMode -eq 'AddedToJob' -and $bgLock.Count -eq 1 -and $bgLock[0].Message -like "*process-start lock isn't where*" -and ($bgExits -join ',') -eq '2,2' -and [PkChildProcessJob]::StartMode -eq 'CreatedInJob') ("without .NET's start lock, StartMode is AddedToJob and the fallback warns once (" + $bgMode + ", " + $bgLock.Count + " warning(s), exits " + ($bgExits -join ',') + ")")
+[PkChildProcessJob]::TestResetFallbackWarning()
+Reset-Harness
+Write-Host ""
+
 Set-PkMessageHandler -Handler $null
 Reset-PkAbortState
 

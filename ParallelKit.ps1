@@ -163,7 +163,7 @@ public static class PkState
 
     // Bump this, and the check after the type definitions, whenever any C#
     // in this file changes: a session keeps the types it compiled first.
-    public const int TypesVersion = 11;
+    public const int TypesVersion = 12;
 
     // Locked: Register-/Unregister-PkCancellationSource are callable from
     // worker runspaces, and List<T> is not safe for concurrent writers.
@@ -536,11 +536,17 @@ public static class PkChildProcessJob
     public static bool IsInitialized { get { return _job != IntPtr.Zero; } }
     public static int LastError { get; private set; }
 
+    // Harness only: make Initialize, or Assign, fail as if Windows refused
+    // (error 5), to test their warnings.
+    public static bool TestFailInit = false;
+    public static bool TestFailAssign = false;
+
     public static bool Initialize()
     {
         lock (_lock)
         {
             if (_job != IntPtr.Zero) { return true; }
+            if (TestFailInit) { LastError = 5; return false; }
             IntPtr job = CreateJobObject(IntPtr.Zero, null);
             if (job == IntPtr.Zero) { LastError = Marshal.GetLastWin32Error(); return false; }
 
@@ -570,6 +576,7 @@ public static class PkChildProcessJob
     public static bool Assign(System.Diagnostics.Process process)
     {
         if (_job == IntPtr.Zero || process == null) { return false; }
+        if (TestFailAssign) { LastError = 5; return false; }
         try
         {
             if (!AssignProcessToJobObject(_job, process.Handle)) { LastError = Marshal.GetLastWin32Error(); return false; }
@@ -736,10 +743,15 @@ public static class PkChildProcessJob
     private static StartLock _startLock;
     private static bool _startLockLooked;
 
+    // Harness only: act as if .NET's start lock weren't found, to test the
+    // warning a .NET that moved it would bring.
+    public static bool TestNoStartLock = false;
+
     private static StartLock GetStartLock()
     {
         lock (_lock)
         {
+            if (TestNoStartLock) { return null; }
             if (_startLockLooked) { return _startLock; }
             _startLockLooked = true;
             // .NET Framework: s_CreateProcessLock. .NET (Core) on Windows: s_createProcessLock.
@@ -804,6 +816,12 @@ public static class PkChildProcessJob
     private static int _fallbackWarned = 0;
     public static bool ClaimFallbackWarning() { return Interlocked.Exchange(ref _fallbackWarned, 1) == 0; }
     public static void TestResetFallbackWarning() { Interlocked.Exchange(ref _fallbackWarned, 0); }
+    // The same, once each, for a Job Object that couldn't be set up when
+    // first needed, and for a running program Windows wouldn't add to it.
+    private static int _initWarned = 0, _assignWarned = 0;
+    public static bool ClaimInitWarning() { return Interlocked.Exchange(ref _initWarned, 1) == 0; }
+    public static bool ClaimAssignWarning() { return Interlocked.Exchange(ref _assignWarned, 1) == 0; }
+    public static void TestResetJobWarnings() { Interlocked.Exchange(ref _initWarned, 0); Interlocked.Exchange(ref _assignWarned, 0); }
 
     private static StringBuilder BuildCommandLine(string fileName, string arguments)
     {
@@ -1005,7 +1023,7 @@ public static class PkChildProcessJob
 # A session that loaded an older copy keeps its compiled types. Say so,
 # rather than fail later with a missing-method error. Keep this number in
 # sync with [PkState]::TypesVersion.
-if ((& { try { [PkState]::TypesVersion } catch { 0 } }) -ne 11) {
+if ((& { try { [PkState]::TypesVersion } catch { 0 } }) -ne 12) {
     throw "ParallelKit: this PowerShell session already loaded an older version of the kit, and its compiled parts can't be swapped out. Close this window and start a new one."
 }
 
@@ -1154,8 +1172,14 @@ function Register-PkAbortHandler {
 }
 
 function Initialize-PkChildProcessJob {
+    # -Once: warn only the first time it fails in this session. For the
+    # setup a start does when nothing set the job up first, which retries on
+    # every start after a failure. Write-PkMessage: a start can be in a worker.
+    param([switch]$Once)
     if ([PkChildProcessJob]::Initialize()) { return $true }
-    Invoke-PkMessageHandler -Level Warn -Message ("[WARNING] Could not set up child-process cleanup (Win32 error " + [PkChildProcessJob]::LastError + ") - if this window is force-closed mid-run, a running child process may be left behind and need ending in Task Manager.")
+    if (-not $Once -or [PkChildProcessJob]::ClaimInitWarning()) {
+        Write-PkMessage -Level Warn -Message ("[WARNING] Could not set up child-process cleanup (Win32 error " + [PkChildProcessJob]::LastError + ") - if this window is force-closed mid-run, a running child process may be left behind and need ending in Task Manager.")
+    }
     return $false
 }
 
@@ -1645,8 +1669,9 @@ function Start-PkProcessCore {
     )
     $encoding = Resolve-PkEncoding -Encoding $OutputEncoding
     $commandLine = Resolve-PkArguments -Arguments $Arguments -FilePath $FilePath
-    # For a caller who never ran Initialize-ParallelKit. No-ops once done.
-    if (-not [PkChildProcessJob]::IsInitialized) { $null = [PkChildProcessJob]::Initialize() }
+    # For a caller who never ran Initialize-ParallelKit. No-ops once done;
+    # a failure warns once, as Initialize-ParallelKit would.
+    if (-not [PkChildProcessJob]::IsInitialized) { $null = Initialize-PkChildProcessJob -Once }
 
     $psi = [System.Diagnostics.ProcessStartInfo]::new()
     $psi.FileName               = $FilePath
@@ -1717,7 +1742,12 @@ function Start-PkProcessCore {
             Stopwatch  = [System.Diagnostics.Stopwatch]::StartNew()
         }
     }
-    $null = [PkChildProcessJob]::Assign($proc)
+    # Windows also refuses a program that has already exited (error 5), as
+    # quick ones often have by now: only one still running is a real gap.
+    # With no job at all, the setup above has warned already.
+    if (-not [PkChildProcessJob]::Assign($proc) -and [PkChildProcessJob]::IsInitialized -and -not $proc.HasExited -and [PkChildProcessJob]::ClaimAssignWarning()) {
+        Write-PkMessage ("[WARNING] Windows wouldn't add a program to the kit's Job Object (process " + $proc.Id + ", " + $psi.FileName + ", Win32 error " + [PkChildProcessJob]::LastError + "). It isn't cleaned up if PowerShell is killed outright, and killing it reaches what it started only through taskkill. Shown once.") -Level Warn
+    }
     return @{
         Proc       = $proc
         StdoutTask = [PkStreamReadTask]::Run($proc.StandardOutput, $MaxOutputChars)
@@ -3163,7 +3193,7 @@ function Invoke-PkProcessBatch {
 
 function Get-PkWorkerSafeFunctionNames {
     # Kit functions every worker runspace gets automatically.
-    return @('Write-PkMessage', 'Test-PkAbortSignal', 'Test-PkCancelRequested', 'Stop-PkProcessTree', 'Stop-PkProcessTreeCore', 'Split-PkTaskkillArguments', 'Stop-PkJobProcesses', 'Get-PkProcessDuration', 'Resolve-PkEncoding',
+    return @('Write-PkMessage', 'Test-PkAbortSignal', 'Test-PkCancelRequested', 'Initialize-PkChildProcessJob', 'Stop-PkProcessTree', 'Stop-PkProcessTreeCore', 'Split-PkTaskkillArguments', 'Stop-PkJobProcesses', 'Get-PkProcessDuration', 'Resolve-PkEncoding',
              'Start-PkProcess', 'Wait-PkProcess', 'Wait-PkRunningJobs', 'Complete-PkProcess', 'Invoke-PkProcessWithTimeout',
              'Invoke-PkProcessDispatch', 'Invoke-PkProcessDispatchCore', 'Invoke-PkProcessBatch',
              'Register-PkCancellationSource', 'Unregister-PkCancellationSource', 'New-PkBatchResult', 'Get-PkJobMaxOutputChars', 'ConvertTo-PkArgumentString', 'Get-PkForceStopReason', 'Resolve-PkFileSystemPath', 'Add-PkDispatchGroupJobs', 'Start-PkProcessCore', 'Get-PkJobTimeLimit', 'Stop-PkTimedOutJob', 'Get-PkStartFailureCause', 'Resolve-PkArguments', 'Invoke-PkCallback', 'Write-PkCallbackLoopWarning', 'ConvertTo-PkArgumentStringCore')

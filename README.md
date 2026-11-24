@@ -25,8 +25,8 @@ ParallelKit uses Windows Job Objects to clean up programs and their descendants.
 <details>
 <summary>The three cases</summary>
 
-- **`AddedToJob`.** Creating a program inside the Job Object relies on a private part of .NET. Where the kit can't do that, it starts the program and adds it to the Job Object just after, and warns once. A child the program starts in that moment can escape.
-- **`NoJob`.** If Windows won't give the kit a Job Object at all, it warns, and programs left running when PowerShell is killed stay running.
+- **`AddedToJob`.** Creating a program inside the Job Object relies on a private part of .NET. Where the kit can't do that, it starts the program and adds it to the Job Object just after, and warns once. A child the program starts in that moment can escape. If Windows refuses to add a program that's still running, the kit warns once more, naming the process: that program isn't cleaned up if PowerShell is killed.
+- **`NoJob`.** If Windows won't give the kit a Job Object at all, it warns (once, when the first program's start is what sets it up), and programs left running when PowerShell is killed stay running.
 - **Killing a program's tree** (a time limit, an abort's force-stop, `Stop-PkProcessTree`). A program the kit started is killed through a Job Object of its own, along with everything it started. One without that job (with `NoJob`, or where Windows refused it) goes to `taskkill /T` instead, and if `taskkill` can't start, fails or hangs, only the program itself is killed. Its children then run until PowerShell exits, or past that with `NoJob`.
 
 </details>
